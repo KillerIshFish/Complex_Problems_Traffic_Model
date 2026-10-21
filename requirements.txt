@@ -1,6 +1,5 @@
-highway-env==1.12.1
-gymnasium==1.4.0
 numpy==2.5.4
 pygame-ce==2.5.8
 pandas==3.0.6
 matplotlib==3.11.2
+pytest==9.1.1
