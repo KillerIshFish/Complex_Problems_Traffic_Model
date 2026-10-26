@@ -4,50 +4,87 @@ Run ``python -m roundabout_sim`` (``--help`` lists one flag per model
 parameter, e.g. ``--density 80 --n_lanes 4``). The left view draws the ring
 at true scale; the panel on the right changes parameters while the model
 runs; the live charts (the last 10 minutes) track speed, congestion over
-time, stop-and-go, flux and how the cars congregate, and the space-time
-diagram shows phantom jams as stripes running backwards against the traffic.
+time, stop-and-go, flux and how the cars congregate (in open traffic mode
+also the cars on the ring, the queues and the entry delay), and the
+space-time diagram shows phantom jams as stripes running backwards against
+the traffic.
 
 Mouse: click a car to make it brake, drag sliders, hover anything (charts,
 readouts, controls) for help, scroll the parameter list with the wheel.
 Keys: Space pause, R reset (new seed), B brake a random car, +/- sim speed,
 C cycle car colours, S save a screenshot to results/, D save the chart data
 (CSV, plus the settings, the live changes and an equivalent experiments
-command), Esc quit.
+command), F5 save the state (results/state_<time>.npz), F9 carry on from the
+most recent one, X random settings (Shift+X: only the tab shown), V open the
+sweep viewer with the current settings, Esc quit.
+
+Presets: the Presets tab starts real-world settings (:mod:`roundabout_sim.presets`:
+ring-road experiments, design-guide roundabouts, the Place Charles de Gaulle)
+and shows each one's description, notes and sources; ``--preset NAME`` and
+``--random SEED`` start with a preset or random settings, ``--list-presets``
+lists the presets.
+
+Sessions: closing the window (or Esc) saves the simulation, its charts and the
+view (tab, scroll, sim speed, colour modes, paused) to results/session/, and
+the next launch carries on there. ``--fresh`` ignores the saved session,
+``--no-autosave`` does not save one, ``--state PATH`` carries on from a saved
+state file, and model settings given as flags (``--preset`` and ``--random``
+too) start a new simulation with them (the view settings still restore). See :mod:`roundabout_sim.state` for
+the file format.
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
 import math
 import os
+import re
+import subprocess
 import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
 import pygame
 
-from roundabout_sim import metrics, palette
-from roundabout_sim.config import PARAM_BY_NAME, PARAMS, ParamSpec, SimConfig, coerce
-from roundabout_sim.engine import MAX_DECEL, MAX_QUEUE, RESUME_FRACTION, SLOW_FRACTION, TWO_PI, RingSim
+from roundabout_sim import cli, metrics, palette, presets, state
+from roundabout_sim.config import (NEEDS_NONZERO, PARAM_BY_NAME, PARAMS, ParamSpec, SimConfig, coerce,
+                                   inactive_reason, same_value)
+from roundabout_sim.engine import (MAX_DECEL, MAX_QUEUE, RESUME_FRACTION, SLOW_FRACTION, TRUCK_ACCEL_FACTOR,
+                                   TRUCK_HEADWAY_FACTOR, TRUCK_SPEED_FACTOR, TRUCK_WIDTH, TWO_PI, RingSim,
+                                   StateError)
+from roundabout_sim.textfmt import (DISPLAY_DIGITS, decimals, format_number, plural,  # noqa: F401 (also app's API)
+                                    value_text)
+from roundabout_sim.ui import (FONT_FACE, MIN_WINDOW, STATUS_LINES, Fonts, Messages, clamp_resize,  # noqa: F401
+                               dpi_aware, draw_tab, ellipsize, finite_runs, nice_step, open_window, row_rects,
+                               status_lines, tick_text, wrap_lines)
 
 FPS_CAP = 60
 SAMPLE_INTERVAL = 0.5  # [s] of simulated time between chart samples
 SPACETIME_REFRESH = 0.1  # [s] of wall time between rebuilds of the space-time image
 HISTORY = 600.0  # [s] of chart history kept (10 minutes)
 MIN_SPAN = 60.0  # [s] shortest time axis on the charts
-MIN_WINDOW = (1100, 700)
 RATE_WARMUP = 10.0  # [s] rolling rates (over metrics.RATE_WINDOW) are too noisy to chart before this
 ROLLING = ("detector_flux", "stops_per_car_min")  # chart series that are rolling rates
 SPACETIME_SHARE = 0.34  # of the chart column's height
-FONT_FACE = "segoeui,helveticaneue,arial"
+QUEUE_MIN_PX = 4.0  # [px] of stub per queued car below which a queue cannot be counted by eye (gets a tag)
+BEND_POINTS = 5  # points along each side of a truck drawn bent along its lane (22 m on a 20 m ring: ~0.2 m off)
+# Saved sessions: <results>/session/ holds the full state and a readable summary (settings and view).
+SESSION_DIR, SESSION_STATE, SESSION_FILE = "session", "state.npz", "session.json"
+SESSION_FORMAT = "roundabout_sim session"
+STATE_FILES = "state_*.npz"  # states saved with F5, in the results folder (F9 loads the most recent)
+STATE_NAME = re.compile(r"state_(\d{8}_\d{6})(?:-(\d+))?\.npz")  # their names: timestamp, counter
+SWEEP_LOG = "sweep_viewer.log"  # in the results folder: what a sweep viewer started with V writes to stderr
+CONFIG_FIELDS = tuple(f.name for f in fields(SimConfig) if f.name != "seed")
 WINDOW = f"{metrics.RATE_WINDOW:g} s"
 UI = palette.UI
 EMPTY = UI["surface"]  # space-time bins without cars
 GROUPS = tuple(dict.fromkeys(p.group for p in PARAMS))
+PRESETS_TAB = "Presets"  # the tab of the real-world presets and random settings (no parameter group)
+TABS = (PRESETS_TAB, *GROUPS)
 
 # Viewer settings use the same spec type as model parameters, so they get the
 # same widgets; group "View" keeps them out of the model's tabs.
@@ -56,7 +93,7 @@ VIEW_PARAMS = {p.name: p for p in (
               "Simulation steps (of dt each) per drawn frame. Keys + and -."),
     ParamSpec("colour_mode", "Car colour", 0, 0, 0, "", "View",
               "speed: own speed / free speed; desired: driver's desired speed (slow to fast); "
-              "lane: which lane. Key C.", choices=("speed", "desired", "lane")),
+              "lane: which lane; type: car or truck. Key C.", choices=("speed", "desired", "lane", "type")),
     ParamSpec("spacetime_mode", "Space-time colour", 0, 0, 0, "", "View",
               "speed: mean speed at each angle / the cars' mean free speed; occupancy: share of lane "
               f"covered in each of the {metrics.SECTORS} sectors.", choices=("speed", "occupancy")),
@@ -73,19 +110,56 @@ BUTTONS = (
     ("csv", "Save CSV", f"Save the chart data ({HISTORY_TEXT}, a row every {SAMPLE_INTERVAL:g} s) as CSV into the "
                         "results folder, with a settings file listing the settings, the live parameter changes "
                         "and the equivalent experiments command (D)."),
+    ("save_state", "Save state", "Save the whole simulation with its charts and markers into the results folder "
+                                 "(state_<date>_<time>.npz), to carry on from later: Load state or F9 picks the "
+                                 "most recent (F5)."),
+    ("load_state", "Load state", "Carry on from the most recently saved state in the results folder (state_*.npz): "
+                                 "its simulation, charts and markers; the view stays as it is (F9). A damaged or "
+                                 "incompatible file restarts with the settings it holds."),
+    ("sweep", "Sweep viewer", "Open the sweep viewer in a window of its own, with the current settings as the base "
+                              "of its new sweeps (saved as sweep_base_<date>_<time>.json in the results folder), to "
+                              "run and browse sweeps of 1-3 settings (V)."),
+    # On the Presets tab:
+    ("apply_preset", "Apply preset", "Start the preset chosen above: the model defaults with its settings (taken from "
+                                     "a published experiment, a design guide or traffic counts), keeping the seed. "
+                                     "Rebuilds the roundabout and clears the charts; the tabs then change it as usual. "
+                                     "On the command line: --preset NAME."),
+    ("randomize", "Randomize all (X)", "Give every setting a plausible random value: real-world ranges, linked as on "
+                                       "real roundabouts (the radius follows the lanes, the demand the capacity, ...). "
+                                       "Each press draws a fresh seed, shown in the help box and kept with the "
+                                       "settings: --random SEED starts with the same ones (X). Shift+X randomizes only "
+                                       "the settings of the tab shown."),
 )
-BUTTON_ROWS = (("pause", "step", "reset", "brake"), ("clear", "screenshot", "csv"))
+BUTTON_ROWS = (("pause", "step", "reset", "brake"), ("clear", "screenshot", "csv"),
+               ("save_state", "load_state", "sweep"))
+# The button at the end of each parameter tab (Shift+X).
+RANDOM_TAB_HELP = ("Give the {group} settings plausible random values, linked to the current settings of the other "
+                   "tabs, with a fresh seed shown in the help box (Shift+X). Randomize all (X) draws every setting.")
+PRESET_HELP = ("Preset {i} of {n}: {title}. {description}{source} Click the title or the arrows for another; Apply "
+               "preset starts it (details below).")
+PRESET_TEXT_HELP = ("{title}: what it is, its settings (by parameter name, as --set takes them), the notes (caveats, "
+                    "and what check runs of this model give) and the sources. The wheel scrolls the list.")
+ORIGIN_HELP = ("Where the running settings come from: the preset applied or the random settings drawn (with their "
+               "seed), and which settings were changed since. Saved with the settings (D) and the session.")
 
 DEFAULT_HINT = ("Click a car to make it brake.  Space pause  ·  R reset  ·  B brake  ·  "
-                "+/- speed  ·  C colours  ·  S screenshot  ·  D data (CSV)  ·  Esc quit")
+                "+/- speed  ·  C colours  ·  S screenshot  ·  D data (CSV)  ·  F5 save state  ·  "
+                "F9 load state  ·  X random settings (Shift+X: this tab)  ·  V sweep viewer  ·  Esc quit")
+AUTOSAVE_HINT = f"{DEFAULT_HINT} (saves the session, which the next launch resumes)"
 
 # Tooltips of the parameter tabs (groups from config.PARAMS; others get a generic one).
 TAB_HELP = {
-    "Road": "Show the road parameters; changing them rebuilds the roundabout.",
+    "Road": "Show the road parameters: the layout (changing it rebuilds the roundabout) and the road condition.",
     "Traffic": "Show the traffic parameters: density, exits and entering.",
-    "Drivers": "Show the driver parameters: speeds, reactions, following and noise.",
+    "Demand": "Show the demand parameters: a closed ring of cars or open arrivals at the entrances, how many "
+              "arrive and when, and how long the queues can grow.",
+    "Vehicles": "Show the vehicle parameters: the share and length of trucks (changing them rebuilds the "
+                "roundabout).",
+    "Drivers": "Show the driver parameters: speeds, reactions, following and noise, and how much drivers differ.",
     "Lane chg": "Show the lane-changing parameters.",
     "Start": "Show the initial-state parameters: how the cars are spaced at the start.",
+    PRESETS_TAB: "Show the presets: settings of real roundabouts and ring-road experiments, with their sources and "
+                 "notes, and random settings.",
 }
 
 
@@ -93,9 +167,19 @@ def tab_help(group: str) -> str:
     return TAB_HELP.get(group, f"Show the {group.lower()} parameters.")
 
 
+TYPE_COLOURS = (palette.SERIES[0], palette.SERIES[1])  # car, truck ("type" car colours)
+TRUCK_TEXT = (f"Trucks are drawn to scale, {TRUCK_WIDTH:g} m wide; they accelerate at {TRUCK_ACCEL_FACTOR:g}× a car's "
+              f"rate, want {TRUCK_SPEED_FACTOR:g}× their driver's desired speed and keep a "
+              f"{TRUCK_HEADWAY_FACTOR:g}× longer time gap.")
+
+
 def control_help(spec: ParamSpec) -> str:
     """Help shown for a slider or choice."""
-    note = " Changing it rebuilds the roundabout and clears the charts." if spec.reset else ""
+    note = ""
+    if spec.reset:
+        other = NEEDS_NONZERO.get(spec.name)
+        when = f" (while {PARAM_BY_NAME[other[0]].label} is above 0)" if other else ""
+        note = f" Changing it rebuilds the roundabout and clears the charts{when}."
     return f"{spec.label}: {spec.help}{note}"
 
 
@@ -125,7 +209,8 @@ CLUSTERING_HELP = (f"Spread of the car counts over 6-{metrics.SECTORS} sectors (
 ORDER_HELP = ("Order: 0 = cars balanced around the ring, 1 = all on one side. Randomly placed cars give about "
               f"√(π/4N) (the dashed 'random' line), so only order well above it (over {ONE_SIDED:g}×) is real "
               "one-sidedness; the arrow in the view then points to where the cars bunch.")
-SPACING_HELP = ("Gini coefficient of the road each car has (gap ahead + its length): 0 = shared evenly, about "
+SPACING_HELP = ("Gini coefficient of the road each car has (gap ahead + the mean vehicle length, so a mix of cars "
+                "and trucks alone does not raise it): 0 = shared evenly, about "
                 "0.35 = random gaps, towards 1 = packed queues or platoons with empty road between. Shows "
                 "uneven starts and platoons; not a jam detector.")
 STOPS_HELP = (f"Stop-and-go, a measure of instability: stops per car per minute over the last {WINDOW} (a car "
@@ -137,7 +222,14 @@ JAMS_HELP = ("Jams (queues of 2+ jammed cars in a lane) by what the front car is
              "in). A wave set off at an exit travels back with ordinary followers at its front, so following "
              "is only an upper bound on natural (phantom) jams; to see what the arms cause, compare with "
              "Exit chance = 0.")
-EXTRA_HELP = {"jams": JAMS_HELP, "bunching": ORDER_HELP}  # hover help of the header readouts
+LOS_TEXT = metrics.los_text()
+ENTRY_DELAY_HELP = (f"Mean queue wait of the cars that entered over the last {WINDOW} (joining the queue to "
+                    "entering the ring; not the full HCM control delay), with an HCM-style level of service: "
+                    f"{LOS_TEXT}, and in open mode F whenever an entrance got more arrivals than it could let in "
+                    f"over the last {metrics.VC_WINDOW / 60:g} min (v/c > 1).")
+DELAY_HELP = (f"Entry delay: {ENTRY_DELAY_HELP} v/c: demand / capacity of the busiest entrance (its arrivals "
+              "over its entry rate while it had a queue). Longest queue: cars at the longest one now.")
+EXTRA_HELP = {"jams": JAMS_HELP, "bunching": ORDER_HELP, "delay": DELAY_HELP}  # hover help of the header readouts
 
 CHARTS = (
     ChartSpec("Mean speed [m/s]", (Series("mean_speed", "actual"), Series("mean_free_speed", "desired")),
@@ -161,24 +253,41 @@ CHARTS = (
               "Do the cars congregate? Spacing (Gini): 0 = even, about 0.35 = random gaps, towards 1 = packed "
               "queues or platoons. Order: 0 = balanced around the ring, 1 = all on one side; dashed = what "
               "randomly placed cars give, so only order well above it is real one-sidedness (the arrow in "
-              "the view then points there).", extra="bunching"),
+              "the view then points there).", extra="bunching", max_top=1.0),
+)
+# Extra charts in open mode, where the number of cars varies.
+OPEN_CHARTS = (
+    ChartSpec("Cars and queues [veh]", (Series("cars", "on ring"), Series("queued", "queued")), "{:.0f}", 10.0,
+              "Open mode: cars on the ring and cars waiting at all the entrances. Arrivals add cars and exits "
+              "take them away, so the number on the ring drifts with the demand; the queues grow when the "
+              "entries cannot keep up. The header gives the entry delay and its level of service (hover it).",
+              extra="delay"),
 )
 SPACETIME_HELP = ("Space-time diagram: time runs right, angle around the ring up (driving direction). "
                   "Cars trace rising lines; jams are stripes sloping down as they travel backwards. "
                   "Speed: mean speed / the cars' mean free speed. Ticks mark the arms; red rings mark "
                   "braked cars.")
-VIEW_HELP = ("Click a car to make it brake hard for 3 s. The inner band shades each sector by how much "
-             "lane it has covered; the arrow points to where the cars bunch when they are clearly more "
-             "one-sided than random (longer = more one-sided).")
-STATUS_LINES = (6, 10)  # fewest / most lines of the help box: it grows to fit the longest help text
+VIEW_HELP = ("Click a car to make it brake hard for 3 s; hover one for its details. The inner band shades each "
+             "sector by how much lane it has covered; the arrow points to where the cars bunch when they are "
+             "clearly more one-sided than random (longer = more one-sided). Queued cars wait on the entry stubs "
+             "(hover a queue's count for more). Trucks are drawn longer and wider. In open mode the header "
+             "gives the demand per entrance in veh/h.")
+QUEUE_TAG_HELP = ("Queue: cars waiting at this entrance. The stub shows only as many as fit (on a big ring they "
+                  "are too small to count), so longer queues get this count. Red and marked full: the queue has "
+                  "reached Max queue and turns further arrivals away (Blocked).")
 
 STAT_HELP = {
     "Sim time": "Simulated time since the last reset or rebuild.",
     "Cars on ring": "Cars on the ring now / the number the density setting asks for.",
+    "Cars on ring (open)": "Cars on the ring now. In open mode the number varies: cars arrive at random "
+                           "(Entrance chance) and leave for good (Exit chance); Density set only the start.",
     "Queued to enter": f"Cars waiting at the entrances (at most {MAX_QUEUE} each; further replacements for "
                        "leavers are slotted straight into the ring).",
+    "Queued to enter (open)": "Cars waiting at all the entrances now, and (max) at the longest queue (at most Max "
+                              "queue each; arrivals that find it full are turned away as blocked).",
     "Density": "Cars on the ring per km of lane.",
-    "Area covered": "Share of the road surface (all lanes) covered by cars.",
+    "Area covered": "Share of the road surface (all lanes) covered by vehicles.",
+    "Trucks": f"Trucks on the ring now, their share of the vehicles and their mean speed. {TRUCK_TEXT}",
     "Mean speed": "Mean speed of the cars on the ring.",
     "Mean free speed": "Mean speed the drivers on the ring want to go: their desired speed, capped by "
                        "comfortable cornering on their lane.",
@@ -197,9 +306,10 @@ STAT_HELP = {
     "Speed deficit": "1 − total speed / total free speed of the cars on the ring (0 = free flow, "
                      "100 % = standstill).",
     "Harsh braking (episodes/min)": f"Harsh-braking episodes per minute over the last {WINDOW}: the driver model "
-                                    f"asking for more than {MAX_DECEL:g} m/s² (an over-reaction after a late or "
-                                    "delayed response), or the no-overlap constraint stopping a car harder. "
-                                    "Grows with shorter reaction distance, longer reaction time and density.",
+                                    f"asking for more than the braking limit ({MAX_DECEL:g} m/s² on a dry road, "
+                                    "less on wet, snowy or icy ones; an over-reaction after a late or delayed "
+                                    "response), or the no-overlap constraint stopping a car harder. Grows with "
+                                    "shorter reaction distance, longer reaction time, density and a slippery road.",
     "Spacing (Gini)": SPACING_HELP,
     "Clustering": CLUSTERING_HELP,
     "Order": f"Order parameter now, and what randomly placed cars would give. {ORDER_HELP.removeprefix('Order: ')}",
@@ -208,17 +318,34 @@ STAT_HELP = {
     "Missed exits": "Leavers that reached their exit on an inner lane and had to go round again "
                     "(since the reset).",
     "Mean trip time": f"Mean time on the ring of the cars that left over the last {WINDOW}.",
+    "Entry delay": ENTRY_DELAY_HELP,
+    "Arrivals": f"Cars arriving at the entrances per minute, over the last {WINDOW}: at random, blocked ones "
+                "included. Their mean is the Entrance chance × 60 per entrance, shaped by the demand profile.",
+    "Entries": f"Cars entering the ring from the queues per minute, over the last {WINDOW}. While it stays below "
+               "Arrivals − Blocked the queues are growing.",
+    "Blocked": f"Arrivals per minute, over the last {WINDOW}, that found their queue full (Max queue) and were "
+               "turned away: spill-back onto the approach roads.",
     "Lane": "Mean speed and number of cars in this lane (lane 1 is the inner lane).",
 }
 
 
+def preset_help(name: str) -> str:
+    """Help of the preset selector while it shows preset ``name``."""
+    p, names = presets.get(name), presets.names()
+    return PRESET_HELP.format(i=names.index(p.name) + 1, n=len(names), title=p.title, description=p.description,
+                              source=f" Source: {p.cite}." if p.cite else "")
+
+
 def help_texts() -> list[str]:
     """Every fixed help text the status box can show (it is sized to fit the longest)."""
-    texts = [help_text for _, _, help_text in BUTTONS] + [tab_help(group) for group in GROUPS]
+    texts = [help_text for _, _, help_text in BUTTONS] + [tab_help(group) for group in TABS]
+    texts += [RANDOM_TAB_HELP.format(group=group) for group in GROUPS] + [ORIGIN_HELP]
+    texts += [preset_help(name) for name in presets.names()]
+    texts += [PRESET_TEXT_HELP.format(title=p.title) for p in presets.PRESETS.values()]
     texts += [control_help(spec) for spec in (*PARAMS, *VIEW_PARAMS.values())]
-    texts += [spec.help for spec in CHARTS] + list(EXTRA_HELP.values())
+    texts += [spec.help for spec in (*CHARTS, *OPEN_CHARTS)] + list(EXTRA_HELP.values())
     texts += [f"{'Lane 8 outer' if label == 'Lane' else label}: {text}" for label, text in STAT_HELP.items()]
-    return texts + [SPACETIME_HELP, VIEW_HELP, DEFAULT_HINT]
+    return texts + [SPACETIME_HELP, VIEW_HELP, QUEUE_TAG_HELP, DEFAULT_HINT, AUTOSAVE_HINT]
 
 
 @dataclass(frozen=True)
@@ -241,17 +368,71 @@ def mix(a, b, t: float) -> tuple[int, int, int]:
     return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
 
 
+DIM_ACCENT = mix(UI["accent"], UI["raised"], 0.6)  # selection of a control that does nothing right now
+
+
 def one_sided(order: float, baseline: float) -> bool:
     """True when the order parameter is clearly above what randomly placed cars give."""
     base = baseline if np.isfinite(baseline) else 0.0
     return bool(order > max(0.05, ONE_SIDED * base))
 
 
-def value_text(value) -> str:
-    """A setting as the experiments CLI takes it (``--set name=value``)."""
-    if isinstance(value, float):
-        return format(value, ".10g")
-    return str(value)
+# Where the running settings came from (the viewer keeps it with the session and the saved settings): a
+# preset, {"preset": name, "values": its settings}, or random settings, {"random": seed (the latest),
+# "groups": the tabs drawn or None for all, "seeds": for some tabs, each one's seed (draws of other tabs
+# on top of each other add up), "values": the values drawn, "given": for all tabs, the settings given with
+# --random rather than drawn, "base": for some tabs, the preset or full random draw they were drawn on, if
+# any}. "values" (with the base's) tells which settings were changed since.
+def preset_origin(name: str) -> dict:
+    cfg = presets.apply(name)
+    return {"preset": presets.get(name).name, "values": {n: getattr(cfg, n) for n in CONFIG_FIELDS}}
+
+
+def random_origin(seed: int, groups, values: dict, base: dict | None = None, seeds: dict | None = None,
+                  given=()) -> dict:
+    """Random settings drawn with ``seed``: of every tab (``groups`` None; ``given``: the settings given
+    with --random rather than drawn, which ``values`` holds too) or of the tabs ``groups`` (``seeds``:
+    each tab's own seed where earlier draws are merged in, else ``seed``; ``base``: the preset or full
+    random draw they were drawn on)."""
+    full = groups is None
+    return {"random": int(seed), "groups": None if full else list(groups),
+            "seeds": None if full else {g: int((seeds or {}).get(g, seed)) for g in groups},
+            "values": dict(values), "given": list(given) if full else [], "base": None if full else base}
+
+
+def _whole(value) -> bool:
+    """A seed as JSON gives it back: a whole number >= 0."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def valid_origin(origin, nested: bool = False) -> dict | None:
+    """An origin as read back from a saved state (any version), or None if it is not a valid one."""
+    if not isinstance(origin, dict):
+        return None
+    if isinstance(origin.get("preset"), str):
+        return preset_origin(origin["preset"]) if origin["preset"] in presets.PRESETS else None
+    seed, groups, raw = origin.get("random"), origin.get("groups"), origin.get("values")
+    if not _whole(seed):
+        return None
+    if groups is not None and not (isinstance(groups, list) and groups and all(g in GROUPS for g in groups)):
+        return None
+    base = None if nested else valid_origin(origin.get("base"), nested=True)  # (one level deep)
+    seeds = origin.get("seeds") if isinstance(origin.get("seeds"), dict) else {}
+    seeds = {g: s for g, s in seeds.items() if g in (groups or ()) and _whole(s)}
+    given = origin.get("given") if isinstance(origin.get("given"), list) else []
+    given = [n for n in given if isinstance(n, str) and n in CONFIG_FIELDS]
+    values = {}
+    for name, value in (raw.items() if isinstance(raw, dict) else ()):
+        if name not in CONFIG_FIELDS:
+            continue  # a setting this version does not know: left out
+        try:
+            value = coerce(name, value)  # (JSON keeps an infinite density as "inf")
+            SimConfig().updated(**{name: value})
+        except (TypeError, ValueError, OverflowError):
+            continue
+        values[name] = value
+    return random_origin(seed, groups, values, base if base is None or base.get("groups") is None else None,
+                         seeds, [n for n in given if n in values])
 
 
 def occupancy_rgb(frac) -> np.ndarray:
@@ -259,10 +440,10 @@ def occupancy_rgb(frac) -> np.ndarray:
     return palette.sequential_rgb(frac, dark=True)
 
 
-def finite_runs(valid: np.ndarray) -> list[tuple[int, int]]:
-    """(start, stop) index ranges of the runs of True in a boolean array."""
-    edges = np.flatnonzero(np.diff(np.concatenate(([0], valid.astype(np.int8), [0]))))
-    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+def jam_cover(sim: RingSim) -> float:
+    """Share of a lane its vehicles cover at jam density (vehicles of the mean length): the top of
+    the occupancy scale."""
+    return sim.mean_length / (sim.mean_length + sim.cfg.min_gap)
 
 
 def speed_colours(speed: np.ndarray, free: float) -> np.ndarray:
@@ -270,12 +451,6 @@ def speed_colours(speed: np.ndarray, free: float) -> np.ndarray:
     empty = np.isnan(speed)
     rgb = palette.speed_rgb(np.where(empty, 0.0, speed) / max(free, 0.1))
     return np.where(empty[:, None], np.array(EMPTY), rgb).astype(np.uint8)
-
-
-def nice_step(span: float, target: int) -> float:
-    raw = max(span, 1e-9) / max(target, 1)
-    mag = 10.0 ** math.floor(math.log10(raw))
-    return next(m * mag for m in (1, 2, 2.5, 5, 10) if raw <= m * mag * 1.0001)
 
 
 def anchor_out(a: float) -> str:
@@ -288,80 +463,25 @@ def anchor_out(a: float) -> str:
     return "mid" + (v or h) if (v or h) else "center"
 
 
-def decimals(step: float) -> int:
-    return 0 if step >= 1 else len(f"{step:g}".split(".")[1])
-
-
 def format_value(spec: ParamSpec, value) -> str:
     if spec.choices:
         return str(value)
-    return f"{value:.{decimals(spec.step)}f}"
+    return format_number(value, spec.step)
 
 
 # ---------------------------------------------------------------- helpers
-class Fonts:
-    """System fonts at one UI scale, with a cache of rendered strings."""
-
-    def __init__(self, scale: float):
-        self.scale = scale
-        px = lambda size: max(10, round(size * scale))  # noqa: E731
-        self.fonts = {
-            "title": pygame.font.SysFont(FONT_FACE, px(18), bold=True),
-            "base": pygame.font.SysFont(FONT_FACE, px(14)),
-            "small": pygame.font.SysFont(FONT_FACE, px(12)),
-        }
-        self._cache: dict[tuple, pygame.Surface] = {}
-
-    def render(self, text: str, font: str = "base", colour=UI["text"]) -> pygame.Surface:
-        key = (text, font, colour)
-        surf = self._cache.get(key)
-        if surf is None:
-            if len(self._cache) > 4000:
-                self._cache.clear()
-            surf = self._cache[key] = self.fonts[font].render(text, True, colour)
-        return surf
-
-    def blit(self, target: pygame.Surface, text: str, pos, font: str = "base", colour=UI["text"],
-             anchor: str = "topleft") -> pygame.Rect:
-        surf = self.render(text, font, colour)
-        rect = surf.get_rect(**{anchor: (round(pos[0]), round(pos[1]))})
-        target.blit(surf, rect)
-        return rect
-
-    def width(self, text: str, font: str = "base") -> int:
-        return self.fonts[font].size(text)[0]
-
-    def line(self, font: str = "base") -> int:
-        return self.fonts[font].get_linesize()
-
-    def wrap(self, text: str, width: int, font: str = "small") -> list[str]:
-        lines, current = [], ""
-        for word in text.split(" "):
-            trial = f"{current} {word}".strip()
-            if current and self.width(trial, font) > width:
-                lines.append(current)
-                current = word
-            else:
-                current = trial
-            while len(current) > 1 and self.width(current, font) > width:  # a word longer than a line (a path)
-                n = len(current) - 1
-                while n > 1 and self.width(current[:n], font) > width:
-                    n -= 1
-                lines.append(current[:n])
-                current = current[n:]
-        return lines + [current] if current else lines
-
-
 @dataclass
 class Widget:
-    kind: str  # "button", "slider", "choice" or "tab"
+    kind: str  # "button", "slider", "choice", "tab", "cycler" (◀ preset ▶), "text" or "info" (drawn live)
     name: str  # action, parameter or group name
     rect: pygame.Rect  # hover area
     spec: ParamSpec | None = None
     help: str = ""
     track: pygame.Rect | None = None  # slider track
-    options: list[pygame.Rect] = field(default_factory=list)  # choice buttons
+    options: list[pygame.Rect] = field(default_factory=list)  # choice buttons; a cycler's arrows
     scrolls: bool = False  # lives in the scrollable parameter list
+    label: str = ""  # a button's caption
+    lines: list[tuple[int, str, tuple]] = field(default_factory=list)  # a text block: (y offset, text, colour)
 
 
 @dataclass
@@ -377,7 +497,7 @@ class History:
     KEYS = ("time", "mean_speed", "mean_free_speed", "flux", "detector_flux", "stops_per_car_min",
             "jam_fraction", "speed_deficit", "n_jams", "jams_following", "jams_merge", "jams_exit",
             "jams_entry", "jams_other", "clustering", "order_param", "order_angle", "order_baseline",
-            "spacing_gini")
+            "spacing_gini", "cars", "queued", "longest_queue", "mean_entry_delay", "entry_vc")
 
     def __init__(self, maxlen: int):
         self.maxlen = maxlen
@@ -436,13 +556,15 @@ class RingView:
         self.r_edge = float(sim.r_out + self.lw / 2)
         self.stub = float(np.clip(0.22 * self.r_edge, 12.0, 40.0)) if sim.n_arms else 0.0
         # Room outside the road for the queue counts and the detector label.
-        margin = max(2.6 * fonts.line("small"), fonts.width("detector", "small") + 10)
+        margin = max(2.6 * fonts.line("small"), fonts.width("detector", "small") + 10,
+                     fonts.width("888 full", "small") + 14 if sim.open_demand else 0)
         self.k = max((rect.w / 2 - margin) / (self.r_edge + self.stub), 0.05)  # [px/m]
         self.cx, self.cy = rect.centerx, rect.centery
         # An arm's exit and entry lanes sit this far either side of its axis.
         self.arm_offset = float(sim.r_out * np.sin(sim.entry_angle[0] - sim.arm_angle[0])) if sim.n_arms else 0.0
         self.layer = self._draw_road(sim, fonts)
         self._sector_geometry()
+        self.tag_rects: list[pygame.Rect] = []  # queue count tags as last drawn (hover help)
 
     def to_world(self, px: float, py: float) -> tuple[float, float]:
         return (px - self.cx) / self.k, -(py - self.cy) / self.k
@@ -461,7 +583,7 @@ class RingView:
         pt = lambda r, lat, a: self.point(r, lat, a, local=True)  # noqa: E731
         edge = UI["road_edge"]
         dash = mix(edge, UI["road"], 0.4)
-        half_w = self.arm_offset + lw / 2
+        half_w = self.arm_half_width(sim)
         r_end = self.r_edge + self.stub
         for a in sim.arm_angle:
             pygame.draw.polygon(surf, UI["road"], [pt(sim.r_out, -half_w, a), pt(r_end, -half_w, a),
@@ -499,7 +621,15 @@ class RingView:
 
         det = sim.detector_angle
         pygame.draw.line(surf, UI["text2"], pt(self.r_in, 0, det), pt(self.r_edge, 0, det), 2)
-        fonts.blit(surf, "detector", pt(self.r_edge + 4 / k, 0, det), "small", UI["muted"], anchor_out(det))
+        # Its label beside the road, or past the arms' ends where the arms beside it would cover it.
+        label = fonts.render("detector", "small", UI["muted"])
+        for r in (self.r_edge + 4 / k, r_end + 4 / k):
+            x, y = pt(r, 0, det)
+            box = label.get_rect(**{anchor_out(det): (round(x), round(y))})
+            if not self._on_arms(box.inflate(8, 4), sim, half_w):  # (clear of them by a few pixels)
+                break
+        surf.blit(label, box)
+        self.detector_box = box  # (in the layer's coordinates)
         inner_px = self.r_in * k
         if inner_px > 6 * fonts.line("small"):  # angle labels on the island, to read the space-time axis
             r = (inner_px - 0.16 * inner_px - 6) / k
@@ -507,6 +637,23 @@ class RingView:
                 a = math.radians(deg)
                 fonts.blit(surf, f"{deg}°", pt(r, 0, a), "small", UI["muted"], anchor_out(a + math.pi))
         return surf
+
+    def arm_half_width(self, sim: RingSim) -> float:
+        """[m] Half the width of an arm as drawn: its exit and entry lanes, narrowed where more arms than
+        fit crowd a small ring (12 arms on a 10 m ring), so that neighbouring arms meet at the ring's edge
+        at most, never overlap."""
+        half_w = self.arm_offset + self.lw / 2
+        return min(half_w, self.r_edge * math.sin(math.pi / sim.n_arms)) if sim.n_arms > 1 else half_w
+
+    def _on_arms(self, box: pygame.Rect, sim: RingSim, half_w: float) -> bool:
+        """Whether the road layer's ``box`` (px) overlaps an arm outside the ring (sampled on a grid)."""
+        if not sim.n_arms:
+            return False
+        gx, gy = np.meshgrid(np.linspace(box.left, box.right, 7), np.linspace(box.top, box.bottom, 3))
+        wx, wy = (gx.ravel() - self.rect.w / 2) / self.k, -(gy.ravel() - self.rect.h / 2) / self.k
+        a = np.asarray(sim.arm_angle)[:, None]
+        along, lat = wx * np.cos(a) + wy * np.sin(a), -wx * np.sin(a) + wy * np.cos(a)
+        return bool(((along >= self.r_in) & (along <= self.r_edge + self.stub) & (np.abs(lat) <= half_w)).any())
 
     def _edge_runs(self, arms: np.ndarray, gap: float) -> list[list[tuple[float, float]]]:
         """Outer road edge as polylines, broken where the arms join."""
@@ -547,75 +694,125 @@ class RingView:
             inner = zip(self.cx + self.band_inner * np.cos(a[::-1]), self.cy - self.band_inner * np.sin(a[::-1]))
             self.sectors.append(list(outer) + list(inner))
 
-    def car_polygons(self, x, y, heading, length: float, width: float, pad_px: float = 0.0) -> np.ndarray:
-        """(n, 4, 2) screen corners of oriented rectangles centred on world points."""
+    def car_polygons(self, x, y, heading, length, width, pad_px: float = 0.0) -> np.ndarray:
+        """(n, 4, 2) screen corners of oriented rectangles centred on world points (``length``
+        and ``width`` [m] one for all or one per rectangle)."""
         k = self.k
         sx, sy = self.cx + x * k, self.cy - y * k
         c, s = np.cos(heading), np.sin(heading)
-        hl = max(length * k, 2.0) / 2 + pad_px
-        hw = max(width * k, 1.2) / 2 + pad_px
+        hl = np.maximum(np.asarray(length) * k, 2.0) / 2 + pad_px
+        hw = np.maximum(np.asarray(width) * k, 1.2) / 2 + pad_px
         fx, fy = c * hl, -s * hl  # forward, screen y points down
         nx, ny = -s * hw, -c * hw  # left of forward
         corners = [(sx + fx + nx, sy + fy + ny), (sx + fx - nx, sy + fy - ny),
                    (sx - fx - nx, sy - fy - ny), (sx - fx + nx, sy - fy + ny)]
         return np.stack([np.stack(p, axis=-1) for p in corners], axis=1)
 
+    def ring_polygons(self, snap: dict, sel=None, pad_px: float = 0.0) -> list:
+        """Screen polygons (lists of points) of the vehicles ``sel`` (a mask or indices; default
+        all) of a :meth:`RingSim.cars` snapshot.
+
+        Cars are :meth:`car_polygons` rectangles. Trucks bend along their lane
+        (BEND_POINTS along each side): a long truck drawn straight on a tight
+        ring would stick out of its lane over the next one or the verge.
+        """
+        sel = slice(None) if sel is None else sel
+        x, y, heading = snap["x"][sel], snap["y"][sel], snap["heading"][sel]
+        length, width, truck = snap["length"][sel], snap["width"][sel], snap["truck"][sel]
+        polys = self.car_polygons(x, y, heading, length, width, pad_px).tolist()
+        if truck.any():
+            k = self.k
+            r, theta = np.hypot(x[truck], y[truck]), snap["theta"][sel][truck]
+            tilt = (theta + np.pi / 2 - heading[truck] + np.pi) % TWO_PI - np.pi  # outwards during a lane change
+            hl = (np.maximum(length[truck] * k, 2.0) / 2 + pad_px) / k  # [m] as car_polygons, at least 2 x 1.2 px
+            hw = (np.maximum(width[truck] * k, 1.2) / 2 + pad_px) / k
+            along = np.linspace(-1.0, 1.0, BEND_POINTS) * hl[:, None]
+            # Round the outline: the left side back to front, then the right side front to back.
+            s = np.concatenate((along, along[:, ::-1]), axis=1)
+            q = np.concatenate((np.repeat(hw[:, None], BEND_POINTS, 1), np.repeat(-hw[:, None], BEND_POINTS, 1)), 1)
+            c, sn = np.cos(tilt)[:, None], np.sin(tilt)[:, None]
+            arc = s * c + q * sn  # [m] along the lane from the centre
+            out = s * sn - q * c  # [m] outwards from the lane's centreline (left of the heading = inwards)
+            rr, a = r[:, None] + out, theta[:, None] + arc / r[:, None]
+            bent = np.stack((self.cx + rr * np.cos(a) * k, self.cy - rr * np.sin(a) * k), axis=-1)
+            for i, poly in zip(np.flatnonzero(truck), bent.tolist()):
+                polys[i] = poly
+        return polys
+
     def draw(self, screen: pygame.Surface, sim: RingSim, snap: dict, colours: np.ndarray,
              fonts: Fonts, row: dict, hovered: int | None) -> None:
-        cfg = sim.cfg
         screen.blit(self.layer, self.rect)
         self._draw_queues(screen, sim, fonts)
 
-        jam_cover = cfg.car_length / (cfg.car_length + cfg.min_gap)
-        occ = occupancy_rgb(metrics.sector_occupancy(sim) / jam_cover).astype(int).tolist()
+        occ = occupancy_rgb(metrics.sector_occupancy(sim) / jam_cover(sim)).astype(int).tolist()
         for poly, colour in zip(self.sectors, occ):
             pygame.draw.polygon(screen, colour, poly)
         self._draw_order_arrow(screen, row)
 
         if snap["slot"].size:
-            self._draw_cars(screen, snap, colours, cfg)
+            self._draw_cars(screen, snap, colours)
             braking = snap["braking"]
             if braking.any():
-                rings = self.car_polygons(snap["x"][braking], snap["y"][braking], snap["heading"][braking],
-                                          cfg.car_length, cfg.car_width, pad_px=2.0)
-                for poly in rings.tolist():
+                for poly in self.ring_polygons(snap, braking, pad_px=2.0):
                     pygame.draw.polygon(screen, palette.CRITICAL, poly, 2)
             if hovered is not None:
                 i = np.flatnonzero(snap["slot"] == hovered)
                 if i.size:
-                    poly = self.car_polygons(snap["x"][i], snap["y"][i], snap["heading"][i],
-                                             cfg.car_length, cfg.car_width, pad_px=1.5)[0]
-                    pygame.draw.polygon(screen, UI["text"], poly.tolist(), 1)
+                    pygame.draw.polygon(screen, UI["text"], self.ring_polygons(snap, i, pad_px=1.5)[0], 1)
 
-    def _draw_cars(self, screen: pygame.Surface, snap: dict, colours: np.ndarray, cfg: SimConfig) -> None:
-        """One filled, oriented rectangle per car (at least 2 x 1.2 px, so tiny cars stay visible).
+    def _draw_cars(self, screen: pygame.Surface, snap: dict, colours: np.ndarray) -> None:
+        """One filled, oriented rectangle per vehicle at its own length and width (at least
+        2 x 1.2 px, so tiny cars stay visible), trucks bent along their lane.
 
         Cheap enough for the biggest rings: ~2000 cars take about 1.5 ms, less
         than a numpy pixel splat of the same cars measured.
         """
-        polys = self.car_polygons(snap["x"], snap["y"], snap["heading"], cfg.car_length, cfg.car_width)
-        for poly, colour in zip(polys.tolist(), colours.tolist()):
+        for poly, colour in zip(self.ring_polygons(snap), colours.tolist()):
             pygame.draw.polygon(screen, colour, poly)
 
     def _draw_queues(self, screen: pygame.Surface, sim: RingSim, fonts: Fonts) -> None:
+        """Queued vehicles on each entry stub, trucks at their length. A queue longer than the stub,
+        or any queue when the cars are too small to count (big rings), gets its count at the stub's
+        end on a raised tag (red and marked "full" once it is at the limit and turns arrivals away);
+        ``tag_rects`` keeps the tags for their hover help."""
         cfg = sim.cfg
-        pitch = cfg.car_length + cfg.min_gap
-        fit = max(int((self.stub - 1.0) // pitch), 0)
-        xs, ys, hs = [], [], []
-        for a, q in zip(sim.arm_angle, sim.queue):
-            shown = min(int(q), fit)
-            r = self.r_edge + 1.0 + cfg.car_length / 2 + pitch * np.arange(shown)
+        countable = (cfg.car_length + cfg.min_gap) * self.k >= QUEUE_MIN_PX
+        xs, ys, hs, kinds, tags = [], [], [], [], []
+        for arm, (a, q) in enumerate(zip(sim.arm_angle, sim.queue)):
+            q = int(q)
+            # Oldest first from the road outwards; (a queue edited by hand may lack the types: cars).
+            trucks = np.zeros(q, dtype=bool)
+            types = list(sim.queue_trucks[arm])[:q]
+            trucks[:len(types)] = types
+            length = np.where(trucks, cfg.truck_length, cfg.car_length)
+            ends = np.cumsum(length + cfg.min_gap)  # [m] past the first one's front, each one's end + its gap
+            shown = int(np.sum(ends <= self.stub - 1.0))
+            r = self.r_edge + 1.0 + ends[:shown] - cfg.min_gap - length[:shown] / 2
             xs.append(r * np.cos(a) - self.arm_offset * np.sin(a))
             ys.append(r * np.sin(a) + self.arm_offset * np.cos(a))
             hs.append(np.full(shown, a + np.pi))
-            if q > fit:
-                fonts.blit(screen, str(int(q)), self.point(self.r_edge + self.stub + 3 / self.k, self.arm_offset, a),
-                           "small", UI["text2"], anchor_out(a))
+            kinds.append(trucks[:shown])
+            if q > shown or (q > 0 and not countable):
+                tags.append((a, q))
         if xs and sum(len(x) for x in xs):
+            trucks = np.concatenate(kinds)
             polys = self.car_polygons(np.concatenate(xs), np.concatenate(ys), np.concatenate(hs),
-                                      cfg.car_length, cfg.car_width)
+                                      np.where(trucks, cfg.truck_length, cfg.car_length),
+                                      np.where(trucks, TRUCK_WIDTH, cfg.car_width))
             for poly in polys.tolist():
-                pygame.draw.polygon(screen, UI["muted"], poly)
+                pygame.draw.polygon(screen, UI["text2"], poly)  # light enough to see on the grey stub
+        self.tag_rects = []
+        for a, q in tags:
+            full = sim.open_demand and q >= sim.queue_limit
+            colour = palette.CRITICAL if full else UI["text"]
+            text = fonts.render(f"{q} full" if full else str(q), "small", colour)
+            pos = self.point(self.r_edge + self.stub + 4 / self.k, self.arm_offset, a)
+            box = text.get_rect(**{anchor_out(a): (round(pos[0]), round(pos[1]))})
+            pygame.draw.rect(screen, UI["raised"], box.inflate(6, 2), border_radius=3)
+            if full:
+                pygame.draw.rect(screen, colour, box.inflate(6, 2), 1, border_radius=3)
+            screen.blit(text, box)
+            self.tag_rects.append(box.inflate(8, 4))
 
     def _draw_order_arrow(self, screen: pygame.Surface, row: dict) -> None:
         order = row.get("order_param", 0.0)
@@ -634,21 +831,39 @@ class RingView:
         pygame.draw.circle(screen, UI["text2"], (self.cx, self.cy), 2)
 
 
+def _saved_pairs(items, kind: type) -> list[tuple[float, object]]:
+    """(time, value) pairs as a saved state keeps them (chart markers, braked cars): the
+    well-formed ones of ``items`` with each value as ``kind``; anything else is skipped."""
+    pairs = []
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, list) and len(item) == 2 and isinstance(item[0], (int, float)) \
+                and isinstance(item[1], (str if kind is str else (int, float))):
+            pairs.append((float(item[0]), kind(item[1])))
+    return pairs
+
+
 # ------------------------------------------------------------------ app
-class App:
+class App(Messages):
     """Pygame window: ring view, stats, live charts and the control panel."""
 
     def __init__(self, config: SimConfig | None = None, size: tuple[int, int] | None = None,
-                 results_dir: str | Path = "results"):
-        _dpi_aware()
+                 results_dir: str | Path = "results", autosave: bool = False, resume: str | Path | None = None,
+                 restore_view: bool = False, origin: dict | None = None):
+        """``autosave``: on quit, save the session (the simulation, its charts and the view) to
+        <results_dir>/session/. ``resume``: "session" carries on from that saved session, a path
+        from that saved state file; ``config`` is then only the fallback when there is nothing to
+        resume (a file that cannot be restored gives its valid settings on top of it).
+        ``restore_view``: also restore the saved session's view settings (tab, scroll, sim speed,
+        colour modes, paused). The defaults keep no session at all. ``origin``: where ``config``
+        comes from (:func:`preset_origin`, :func:`random_origin`; the command line's --preset /
+        --random), for a new simulation (a resumed one has its own)."""
+        dpi_aware()
         os.environ.setdefault("SDL_VIDEO_CENTERED", "1")
         pygame.init()
         pygame.display.set_caption("Roundabout traffic model")
-        self.screen = pygame.display.set_mode(size or _initial_size(), pygame.RESIZABLE)
-        self.sim = RingSim(config)
-        self.rec = metrics.Recorder(self.sim, SAMPLE_INTERVAL, maxlen=int(HISTORY / SAMPLE_INTERVAL))
-        self.hist = History(self.rec.maxlen)
+        self.screen = open_window(size)
         self.results_dir = Path(results_dir)
+        self.autosave = autosave
         self.clock = pygame.time.Clock()
         self.paused = False
         self.steps_per_frame = 1
@@ -661,7 +876,7 @@ class App:
         self.mouse = (-1, -1)
         self.markers: deque[tuple[float, str]] = deque()  # (time, "Density 50→80")
         self.brakes: deque[tuple[float, float]] = deque()  # (time, angle) of perturbed cars
-        self.message = ("", 0.0)
+        self._init_messages()
         self.work_ms: deque[float] = deque(maxlen=240)  # update + draw time per frame
         self.fonts: Fonts | None = None
         self.ring: RingView | None = None
@@ -670,10 +885,73 @@ class App:
         self._status_fit: tuple[tuple, int] = ((), STATUS_LINES[0])  # (font scale, width), lines
         self._gradients: dict[tuple, pygame.Surface] = {}
         self._st_cache: tuple | None = None
-        self._generation = self.sim.generation  # bumped by every reset / rebuild
+        self.origin: dict | None = None  # where the running settings come from (preset_origin / random_origin)
+        self.preset_choice = "default"  # the preset the Presets tab shows
+        self._found: tuple[SimConfig | None, str | None] = (None, None)  # (settings, the preset they are)
+        self._text_cache: tuple | None = None  # a preset's text wrapped for the Presets tab
+        self.sweep_viewers: list[subprocess.Popen] = []  # sweep viewers started with V, still open
+        session = self._read_session() if restore_view or resume == "session" else {}
+        sim, saved, note = None, None, ""
+        if resume is not None:
+            sim, saved, config, note = self._resume(resume, session, config)
+        note += self._install(sim or RingSim(config), saved, origin=None if sim else valid_origin(origin))
+        if not note and self.origin is not None:  # --preset / --random: say what is running
+            more = ("its description, notes and sources are on the Presets tab" if "preset" in self.origin else
+                    "X draws others, Shift+X only those of the tab shown")
+            note = f"Started from {self.origin_text()}: {more}."
+        if restore_view:  # the view saved with the state, then the session's on top (each invalid value is skipped)
+            for view in (saved.app.get("view") if saved else None, session.get("view")):
+                self._apply_view(view)
+        if note:
+            self._say(note, 10.0, pin=True)  # shown even with the mouse resting on the view
+        self.layout()
+
+    def _install(self, sim: RingSim, saved: state.SavedState | None = None, origin: dict | None = None) -> str:
+        """Run ``sim`` with fresh charts, or with the charts, markers, braked cars and the settings'
+        origin saved in ``saved`` (else ``origin``). Returns a note for the status line if those
+        could not be restored."""
+        self.sim = sim
+        self.rec = metrics.Recorder(sim, SAMPLE_INTERVAL, maxlen=int(HISTORY / SAMPLE_INTERVAL))
+        self.hist = History(self.rec.maxlen)
+        self.markers.clear()
+        self.brakes.clear()
+        self._generation = sim.generation  # bumped by every reset / rebuild
+        self.origin = origin
+        note, free = "", None
+        if saved is not None:
+            note = self._restore_charts(saved.part("rec"))
+            extras = saved.app
+            self.markers.extend(_saved_pairs(extras.get("markers"), str))
+            self.brakes.extend(_saved_pairs(extras.get("brakes"), float))
+            free = extras.get("history_free")
+            self.origin = valid_origin(extras.get("origin"))
+        self.preset_choice = (self.origin or {}).get("preset") or self.found_preset() or self.preset_choice
         self.rec.update()
         self.hist.pull(self.rec)
-        self.layout()
+        if isinstance(free, (int, float)) and math.isfinite(free) and free > 0:
+            self.hist._free = float(free)  # the space-time colours' reference speed, as when it was saved
+        return note
+
+    def _restore_charts(self, rec_state: dict | None) -> str:
+        """Fill the new, empty recorder and History with saved chart samples. Returns a note for the
+        status line if they could not be restored (the charts then start afresh)."""
+        if rec_state is None:
+            return ""
+        try:
+            # The viewer reads every metric of a sample by name (charts, stats card) and draws one
+            # sample per SAMPLE_INTERVAL, so the saved samples must have both. (The metrics are those
+            # of a snapshot of a copy: taking one refreshes the simulation's lane index, which would
+            # change how the resumed run carries on.)
+            metric_names = metrics.snapshot(RingSim.from_state(self.sim.state_dict())).keys()
+            self.rec.load_state(rec_state, interval=SAMPLE_INTERVAL, numbers=metric_names)
+            self.rec.update()
+            self.hist.pull(self.rec)
+        except Exception as e:  # whatever else is wrong with them, the simulation still carries on
+            self.rec.clear()
+            self.hist.clear()
+            reason = str(e) if isinstance(e, StateError) else f"{type(e).__name__}: {e}"
+            return f" Its charts could not be restored ({reason})."
+        return ""
 
     # ------------------------------------------------------------ layout
     def layout(self) -> None:
@@ -701,6 +979,11 @@ class App:
     def _latest_row(self) -> dict:
         return self.rec.rows[-1] if self.rec.rows else metrics.snapshot(self.sim)
 
+    @property
+    def charts(self) -> tuple[ChartSpec, ...]:
+        """The line charts for the current traffic mode (open mode adds cars and queues)."""
+        return CHARTS + OPEN_CHARTS if self.sim.open_demand else CHARTS
+
     def _stats_height(self) -> int:
         """Height the stats card needs for two legend lines and its columns of readouts."""
         f = self.fonts
@@ -714,20 +997,22 @@ class App:
         others keep its tick marks. Plot areas get equal heights.
         """
         f, s, r, m = self.fonts, self.s, self.charts_rect, self.gap
+        charts = self._laid_out = self.charts
         pad = round(8 * s)
-        st_h = int(r.h * SPACETIME_SHARE)
         cols = 2 if r.w >= 900 * s else 1
-        rows = math.ceil(len(CHARTS) / cols)
+        rows = math.ceil(len(charts) / cols)
+        # Beyond five rows of line charts (open mode) the space-time card gives up some of its share.
+        st_h = int(r.h * SPACETIME_SHARE * min(1.0, 5 / rows))
         card_w = (r.w - (cols - 1) * m) / cols
         y_label = f.width("000.0", "small") + round(6 * s)
         x_band = f.line("small") + 2
         tick_band = round(4 * s)
         cells = []  # (row, col, columns spanned): an odd last chart spans the row
-        for i in range(len(CHARTS)):
+        for i in range(len(charts)):
             row, col = divmod(i, cols)
-            cells.append((row, col, cols if i == len(CHARTS) - 1 and len(CHARTS) % cols else 1))
+            cells.append((row, col, cols if i == len(charts) - 1 and len(charts) % cols else 1))
         widths = [round(span * card_w + (span - 1) * m) for _, _, span in cells]
-        two = [self._header_width(spec) > w - 2 * pad for spec, w in zip(CHARTS, widths)]
+        two = [self._header_width(spec) > w - 2 * pad for spec, w in zip(charts, widths)]
         header = [f.line("base") * (1 + any(t for (rw, _, _), t in zip(cells, two) if rw == row)) + round(6 * s)
                   for row in range(rows)]
         fixed = rows * 2 * pad + sum(header) + x_band + (rows - 1) * (tick_band + m)
@@ -745,7 +1030,7 @@ class App:
                 card = pygame.Rect(round(r.x + col * (card_w + m)), y, widths[i], card_h)
                 plot = pygame.Rect(card.x + pad + y_label, card.y + pad + header[row],
                                    card.w - 2 * pad - y_label, max(card_h - 2 * pad - header[row] - band, 10))
-                self.chart_cards.append((CHARTS[i], card, plot, two[i], last))
+                self.chart_cards.append((charts[i], card, plot, two[i], last))
             y += card_h + m
         card = pygame.Rect(r.x, r.bottom - st_h, r.w, st_h)
         y_label = f.width("360°", "small") + f.line("small") + round(8 * s)
@@ -773,9 +1058,26 @@ class App:
             width += f.width("00.00")
         if spec.extra:
             sample = dict(n_jams=88, jams_following=88, jams_merge=8, jams_exit=8, jams_entry=8, jams_other=8,
-                          order_param=0.5, order_angle=math.radians(355), order_baseline=0.05)
+                          order_param=0.5, order_angle=math.radians(355), order_baseline=0.05,
+                          mean_entry_delay=88.8, longest_queue=188, entry_vc=8.88)
             width += f.width(self._extra_texts(spec.extra, sample)[-1], "small") + round(12 * self.s)
         return width
+
+    def _button_h(self) -> int:
+        return self.fonts.line("base") + round(8 * self.s)
+
+    def _button(self, name: str, rect: pygame.Rect, scrolls: bool = False, label: str = "",
+                help_text: str = "") -> Widget:
+        """A button widget: ``name`` from BUTTONS (its caption and help) unless both are given."""
+        _, caption, text = next((b for b in BUTTONS if b[0] == name), (name, name, ""))
+        widget = Widget("button", name, rect, help=help_text or text, scrolls=scrolls, label=label or caption)
+        self.panel_widgets.append(widget)
+        return widget
+
+    def _button_row(self, names: list[str], x: int, y: int, w: int, scrolls: bool = False) -> None:
+        """Buttons sharing out the width ``w`` in one row."""
+        for name, rect in zip(names, row_rects(x, y, w, self._button_h(), len(names), round(6 * self.s))):
+            self._button(name, rect, scrolls)
 
     def _layout_panel(self) -> None:
         f, s, r = self.fonts, self.s, self.panel_rect
@@ -784,42 +1086,141 @@ class App:
         y = r.y + p + f.line("title") + f.line("small") + round(10 * s)
         self.panel_widgets: list[Widget] = []
         gap = round(6 * s)
-        bh = f.line("base") + round(8 * s)
-        helps = {name: help_text for name, _, help_text in BUTTONS}
+        bh = self._button_h()
         for row, names in enumerate(BUTTON_ROWS):  # each row shares out the full width
-            bw = (w - (len(names) - 1) * gap) / len(names)
-            for col, name in enumerate(names):
-                left, right = round(x + col * (bw + gap)), round(x + col * (bw + gap) + bw)
-                rect = pygame.Rect(left, y + row * (bh + gap), right - left, bh)
-                self.panel_widgets.append(Widget("button", name, rect, help=helps[name]))
+            self._button_row(names, x, y + row * (bh + gap), w)
         y += len(BUTTON_ROWS) * (bh + gap) - gap + round(14 * s)
         for spec in (VIEW_PARAMS["steps_per_frame"], VIEW_PARAMS["colour_mode"]):
             y = self._add_control(spec, x, y, w, scrolls=False)
         y += round(4 * s)
-        th = f.line("base") + round(8 * s)
-        tw = w / len(GROUPS)
-        for i, group in enumerate(GROUPS):
-            rect = pygame.Rect(round(x + i * tw), y, round(tw), th)
-            self.panel_widgets.append(Widget("tab", group, rect, help=tab_help(group)))
-        y += th + round(10 * s)
+        y = self._layout_tabs(x, y, w) + round(10 * s)
         self.status_lines = self._status_lines(w)
         status_h = self.status_lines * f.line("small") + round(12 * s)
         self.status_rect = pygame.Rect(x, r.bottom - p - status_h, w, status_h)
         self.content_rect = pygame.Rect(r.x, y, r.w, self.status_rect.y - round(8 * s) - y)
-        specs = [spec for spec in PARAMS if spec.group == self.group]
-        self.content_h = sum(self._control_height(spec) for spec in specs)
+        # The tab's list: rows of (height, place(x, y, w)), laid out once the scroll is known.
+        rows = self._preset_rows(w) if self.group == PRESETS_TAB else self._group_rows()
+        self.content_h = sum(h for h, _ in rows)
         self.scroll = int(np.clip(self.scroll, 0, max(0, self.content_h - self.content_rect.h)))
         y -= self.scroll
-        for spec in specs:
-            y = self._add_control(spec, x, y, w, scrolls=True)
+        for h, place in rows:
+            place(x, y, w)
+            y += h
+
+    def _group_rows(self) -> list[tuple[int, Callable]]:
+        """A parameter tab: its controls, then a button that randomizes them (Shift+X)."""
+        rows = [(self._control_height(spec), lambda x, y, w, spec=spec: self._add_control(spec, x, y, w, True))
+                for spec in PARAMS if spec.group == self.group]
+        pad = round(6 * self.s)
+
+        def randomize(x, y, w):
+            self._button("randomize_tab", pygame.Rect(x, y + pad, w, self._button_h()), scrolls=True,
+                         label=f"Randomize {self.group} (Shift+X)",
+                         help_text=RANDOM_TAB_HELP.format(group=self.group))
+        return rows + [(self._button_h() + 3 * pad, randomize)]
+
+    def _preset_rows(self, w: int) -> list[tuple[int, Callable]]:
+        """The Presets tab: the preset selector (◀ title ▶), which preset it is, Apply preset and
+        Randomize all, where the running settings come from, then the chosen preset's description,
+        settings, notes and sources (presets.describe)."""
+        f, s = self.fonts, self.s
+        bh, small, pad = self._button_h(), f.line("small"), round(6 * s)
+        name = self.preset_choice
+
+        def cycler(x, y, w):
+            arrows = [pygame.Rect(x, y, bh, bh), pygame.Rect(x + w - bh, y, bh, bh)]
+            self.panel_widgets.append(Widget("cycler", "preset", pygame.Rect(x, y, w, bh), help=preset_help(name),
+                                             options=arrows, scrolls=True))
+
+        def info(which: str, height: int, help_text: str):
+            return lambda x, y, w: self.panel_widgets.append(
+                Widget("info", which, pygame.Rect(x, y, w, height), help=help_text, scrolls=True))
+
+        def text(x, y, w):
+            self.panel_widgets.append(Widget("text", "preset_text", pygame.Rect(x, y, w, block_h), scrolls=True,
+                                             help=PRESET_TEXT_HELP.format(title=presets.get(name).title),
+                                             lines=lines))
+
+        lines, block_h = self._preset_text(name, w)
+        origin_h = len(f.wrap(self._origin_line(), w)) * small  # all of it: the changed settings come last
+        return [(bh + round(2 * s), cycler),
+                (small + 2 * pad, info("caption", small, preset_help(name))),
+                (bh + 2 * pad, lambda x, y, w: self._button_row(["apply_preset", "randomize"], x, y, w, True)),
+                (origin_h + 2 * pad, info("origin", origin_h, ORIGIN_HELP)),
+                (block_h + 2 * pad, text)]
+
+    def _origin_line(self) -> str:
+        """The Presets tab's line saying where the running settings come from."""
+        origin = self.origin_text() or ("the model defaults" if self.found_preset() == "default" else
+                                        "settings of your own (no preset or random settings)")
+        return f"Running: {origin}."
+
+    def _caption(self, width: int) -> str:
+        """The line under the preset selector: which preset of how many, its --preset name and whether it
+        is running (changed since), shortened by leaving out the less important parts to fit ``width``."""
+        names = presets.names()
+        running = (self._origin() or {}).get("preset") == self.preset_choice
+        status = "running, changed" if running and self.changed_since() else "running" if running else ""
+        which = f"{names.index(self.preset_choice) + 1} of {len(names)}"
+        texts = [f"{which}  ·  --preset {self.preset_choice}", f"{which}  ·  {self.preset_choice}", which]
+        texts = [t + (f"  ·  {status}" if status else "") for t in texts]
+        return next((t for t in texts if self.fonts.width(t, "small") <= width), texts[-1])
+
+    def _preset_text(self, name: str, w: int) -> tuple[list[tuple[int, str, tuple]], int]:
+        """Preset ``name``'s :func:`presets.describe` text wrapped to ``w`` px: (y offset, line, colour)
+        per line, and the block's height. Cached per preset, width and font scale."""
+        key = (name, w, self.fonts.scale)
+        if self._text_cache and self._text_cache[0] == key:
+            return self._text_cache[1]
+        f, lh, gap = self.fonts, self.fonts.line("small"), round(5 * self.s)
+        out, y = [], 0
+        paragraphs = presets.describe(name).splitlines()[1:]  # (the title is on the selector)
+        for i, paragraph in enumerate(paragraphs):
+            colour = UI["text"] if i == 0 else UI["muted"] if paragraph.startswith(("Sources", "- ")) else UI["text2"]
+            if i and not paragraph.startswith("- "):
+                y += gap
+            for line in f.wrap(paragraph, w):
+                out.append((y, line, colour))
+                y += lh
+        self._text_cache = (key, (out, y))
+        return out, y
+
+    def _layout_tabs(self, x: int, y: int, w: int) -> int:
+        """The Presets tab and one tab per parameter group, in rows that share out the width: equal
+        widths while every label fits, else widths sized to the labels; tabs that still do not fit
+        wrap onto another row, as evenly shared between the rows as the labels allow. Returns the y
+        just below the tabs."""
+        f, s = self.fonts, self.s
+        th = f.line("base") + round(8 * s)
+        need = [f.width(group, "small") + round(10 * s) for group in TABS]
+        rows: list[list[int]] = [[]]
+        for i, width in enumerate(need):
+            if rows[-1] and sum(need[j] for j in rows[-1]) + width > w:
+                rows.append([])
+            rows[-1].append(i)
+        if len(rows) > 1:  # the same number of rows, filled evenly (first rows one tab more), if that fits
+            per, more = divmod(len(TABS), len(rows))
+            cuts = np.cumsum([0] + [per + (r < more) for r in range(len(rows))])
+            even = [list(range(a, b)) for a, b in zip(cuts[:-1], cuts[1:])]
+            if all(sum(need[i] for i in row) <= w for row in even):
+                rows = even
+        for row in rows:
+            if max(need[i] for i in row) * len(row) <= w:
+                widths = [w / len(row)] * len(row)
+            else:
+                spare = (w - sum(need[i] for i in row)) / len(row)
+                widths = [need[i] + spare for i in row]
+            left = float(x)
+            for i, width in zip(row, widths):
+                rect = pygame.Rect(round(left), y, round(left + width) - round(left), th)
+                self.panel_widgets.append(Widget("tab", TABS[i], rect, help=tab_help(TABS[i])))
+                left += width
+            y += th
+        return y
 
     def _status_lines(self, width: int) -> int:
-        """Lines the help box needs so that the longest help text fits ``width`` (cached per
-        font scale and width; within STATUS_LINES)."""
-        key = (self.fonts.scale, width)
-        if self._status_fit[0] != key:
-            need = max(len(self.fonts.wrap(text, width)) for text in help_texts())
-            self._status_fit = (key, int(np.clip(need, *STATUS_LINES)))
+        """Lines the help box needs so that the longest help text fits ``width`` (see ui.status_lines)."""
+        self._status_fit = status_lines(self.fonts, width, help_texts, self._status_fit)
         return self._status_fit[1]
 
     def _control_height(self, spec: ParamSpec) -> int:
@@ -864,9 +1265,16 @@ class App:
         if value != getattr(self.sim.cfg, name) and self.sim.set(**{name: value}):
             self._clear_history()
 
-    def _mark(self, spec: ParamSpec, old, new) -> None:
+    def _marker(self, spec: ParamSpec, old, new) -> tuple[float, str] | None:
+        """The chart marker for changing ``spec`` from ``old`` to ``new`` now (None: it gets none)."""
         if spec.group != "View" and old != new:
-            self.markers.append((self.sim.time, f"{spec.label} {format_value(spec, old)}→{format_value(spec, new)}"))
+            return self.sim.time, f"{spec.label} {format_value(spec, old)}→{format_value(spec, new)}"
+        return None
+
+    def _mark(self, spec: ParamSpec, old, new) -> None:
+        marker = self._marker(spec, old, new)
+        if marker is not None:
+            self.markers.append(marker)
 
     def _clear_history(self) -> None:
         """Start the charts afresh (needed after a rebuild: the time restarts at 0)."""
@@ -879,7 +1287,8 @@ class App:
         self._st_cache = None
         self.rec.update()
         self.hist.pull(self.rec)
-        if self.stats_rect.h < self._stats_height():  # more lanes need more stat rows
+        # More lanes (or open mode) need more stat rows; a new traffic mode another set of charts.
+        if self.stats_rect.h < self._stats_height() or self._laid_out != self.charts:
             self.layout()
 
     def _follow_rebuilds(self) -> None:
@@ -911,23 +1320,28 @@ class App:
             self.screenshot()
         elif name == "csv":
             self.save_data()
+        elif name == "save_state":
+            self.save_state()
+        elif name == "load_state":
+            self.load_state()
+        elif name == "sweep":
+            self.open_sweep_viewer()
+        elif name == "apply_preset":
+            self.apply_preset()
+        elif name == "randomize":
+            self.randomize()
+        elif name == "randomize_tab":
+            self.randomize_tab()
 
     def _record_brake(self, slot: int | None) -> None:
         """Remember where and when a car was made to brake, for the space-time diagram."""
         if slot is not None:
             self.brakes.append((self.sim.time, float(self.sim.theta[slot])))
 
-    def _new_paths(self, *suffixes: str) -> list[Path]:
-        """results/roundabout_<timestamp><suffix> for each suffix, none of them taken yet
-        (saving twice in the same second adds -1, -2, ...)."""
-        self.results_dir.mkdir(parents=True, exist_ok=True)
-        stem = time.strftime("roundabout_%Y%m%d_%H%M%S")
-        n = 0
-        while True:
-            paths = [self.results_dir / f"{stem}{'-' + str(n) if n else ''}{suffix}" for suffix in suffixes]
-            if not any(p.exists() for p in paths):
-                return paths
-            n += 1
+    def _new_paths(self, *suffixes: str, stem: str = "roundabout", folder: Path | None = None) -> list[Path]:
+        """results/<stem>_<timestamp><suffix> (or in ``folder``) for each suffix, none of them taken
+        yet (state.new_paths)."""
+        return state.new_paths(self.results_dir if folder is None else folder, stem, *suffixes)
 
     def screenshot(self) -> Path:
         path, = self._new_paths(".png")
@@ -981,8 +1395,22 @@ class App:
                   "  order_param         0 = balanced around the ring, 1 = all on one side; order_baseline is what",
                   "                      randomly placed cars give (only well above it is real one-sidedness)",
                   "  flux, occupancy     cars per second past a point (all lanes); share of the road covered",
+                  "  cars, queued        cars on the ring; waiting at all entrances (longest_queue: at the longest)",
+                  "  arrivals_per_min    cars arriving at the entrances, entries_per_min entering the ring and",
+                  f"                      blocked_per_min turned away by a full queue (open mode), over {WINDOW}",
+                  f"  mean_entry_delay    queue wait of the cars that entered over {WINDOW} [s]; only the queue",
+                  "                      wait, not the full HCM control delay",
+                  f"  entry_vc            open mode: demand / capacity of the busiest entrance over the last "
+                  f"{metrics.VC_WINDOW:g} s;",
+                  "                      above 1 it gets more arrivals than it can let in (level of service F)",
+                  "  throughput_per_h    cars leaving the ring per hour; demand_per_min what open mode asks for",
+                  "  trucks              trucks on the ring; truck_speed, car_speed: mean speed of the trucks and",
+                  "                      of the other vehicles (empty without them)",
                   "",
                   f"settings at the time of saving (seed {sim.seed})"]
+        origin = self.origin_text()
+        if origin:
+            lines.append(f"  from {origin}")
         for name, value in values.items():
             if name == "seed":
                 continue
@@ -994,14 +1422,381 @@ class App:
         if self.brakes:
             lines += ["", "cars you made brake (time, angle)"]
             lines += [f"  {when:8.1f} s  {math.degrees(angle):.0f}°" for when, angle in self.brakes]
-        defaults = {f.name: getattr(SimConfig(), f.name) for f in fields(SimConfig) if f.name != "seed"}
+        base, reference = self._command_base()
         changed = [f"--set {name}={value_text(value)}" for name, value in values.items()
-                   if name in defaults and value != defaults[name]]
-        command = " ".join(["python -m roundabout_sim.experiments run", f"--seed {sim.seed}",
+                   if name in reference and not same_value(value, reference[name])]
+        command = " ".join(["python -m roundabout_sim.experiments run", *base, f"--seed {sim.seed}",
                             *([f"--duration {value_text(round(sim.time, 6))}"] if sim.time > 0 else []), *changed])
-        lines += ["", "equivalent command: the final settings from t = 0 (settings not listed are at their",
-                  "defaults; live changes and braked cars are not replayed)", f"  {command}", ""]
+        unlisted = {"--preset": "as the preset sets them", "--random": "as --random draws them"}.get(
+            base[0] if base else "", "at their defaults")
+        lines += ["", f"equivalent command: the final settings from t = 0 (settings not listed are {unlisted};",
+                  "live changes and braked cars are not replayed)", f"  {command}", ""]
         return "\n".join(lines)
+
+    def _command_base(self) -> tuple[list[str], dict]:
+        """The experiments flags that start from the running settings' origin (--preset NAME, or
+        --random SEED when it and --set give exactly the running settings, as experiments links the
+        random draws to settings given with it) and the settings they give; else none and the defaults."""
+        defaults = {n: getattr(SimConfig(), n) for n in CONFIG_FIELDS}
+        origin = self._origin()
+        if origin is not None and origin.get("base") is not None:  # some tabs drawn on a preset or a full draw
+            origin = origin["base"]
+        if origin is not None and "preset" in origin:
+            return ["--preset", origin["preset"]], dict(origin["values"])
+        if origin is not None and origin["groups"] is None:
+            seed, current = origin["random"], {n: getattr(self.sim.cfg, n) for n in CONFIG_FIELDS}
+            drawn = {**defaults, **presets.random_changes(seed)}
+            given = {n: v for n, v in current.items() if not same_value(v, drawn[n])}
+            again = {**defaults, **presets.random_changes(seed, fixed=given), **given}
+            if all(same_value(again[n], current[n]) for n in CONFIG_FIELDS):
+                return ["--random", str(seed)], drawn
+        return [], defaults
+
+    # ------------------------------------------------------- saved states
+    def _say(self, text: str, seconds: float = 6.0, pin: bool = False) -> None:
+        """Show ``text`` in the help box for a while; ``pin``: ahead of the hover help (see ui.Messages)."""
+        self.message = (text, time.monotonic() + seconds)
+        if pin:
+            self._pin()
+
+    @property
+    def session_dir(self) -> Path:
+        return self.results_dir / SESSION_DIR
+
+    def view_settings(self) -> dict:
+        """The view settings a session keeps (restored by ``restore_view``)."""
+        return {"group": self.group, "scroll": int(self.scroll), "steps_per_frame": int(self.steps_per_frame),
+                "colour_mode": self.colour_mode, "spacetime_mode": self.spacetime_mode, "paused": bool(self.paused)}
+
+    def _apply_view(self, view) -> None:
+        """Restore saved view settings; each one missing or invalid keeps its current value."""
+        if not isinstance(view, dict):
+            return
+        if view.get("group") in TABS:
+            self.group = view["group"]
+        whole = {name: value for name, value in view.items() if isinstance(value, int) and not isinstance(value, bool)}
+        if whole.get("scroll", -1) >= 0:
+            self.scroll = whole["scroll"]  # (the layout clamps it to the list)
+        speed = VIEW_PARAMS["steps_per_frame"]
+        if speed.lo <= whole.get("steps_per_frame", 0) <= speed.hi:
+            self.steps_per_frame = whole["steps_per_frame"]
+        for name in ("colour_mode", "spacetime_mode"):
+            if view.get(name) in VIEW_PARAMS[name].choices:
+                setattr(self, name, view[name])
+        if isinstance(view.get("paused"), bool):
+            self.paused = view["paused"]
+
+    def _saved_extras(self) -> dict:
+        """What a saved state keeps for the viewer besides the simulation and its chart samples."""
+        markers = list(self.markers)
+        d = self.drag
+        if d is not None and not d.widget.spec.reset:  # a live change still being dragged: as if let go now
+            markers += [m for m in (self._marker(d.widget.spec, d.start, d.value),) if m is not None]
+        return {"markers": [[when, label] for when, label in markers],
+                "brakes": [[when, angle] for when, angle in self.brakes],
+                "history_free": float(self.hist._free), "view": self.view_settings(), "origin": self.origin}
+
+    def _read_session(self) -> dict:
+        """The saved session's summary (settings and view), {} if there is none or it cannot be read."""
+        try:
+            summary = state.read_json(self.session_dir / SESSION_FILE)
+        except StateError:
+            return {}
+        return summary if summary.get("format") == SESSION_FORMAT else {}
+
+    def _resume(self, resume: str | Path, session: dict, config: SimConfig | None
+                ) -> tuple[RingSim | None, state.SavedState | None, SimConfig | None, str]:
+        """(simulation, saved state, settings for a new simulation, status note) for ``resume``: the
+        saved simulation, or none and the valid settings of a file that cannot be restored (else
+        ``config``). Never raises for a missing, damaged or incompatible file."""
+        own = resume == "session"
+        path = self.session_dir / SESSION_STATE if own else Path(resume)
+        what = "the saved session" if own else str(path)
+        if own and not path.exists() and not session:
+            return None, None, config, ""  # nothing saved yet
+        try:
+            saved = state.load(path)
+            sim = saved.simulation()
+        except Exception as e:  # whatever is wrong with the file, the viewer starts
+            reason = str(e) if isinstance(e, StateError) else f"{type(e).__name__}: {e}"
+            settings = (session.get("settings") if own else None) or state.saved_settings(path)
+            kept = self._set_aside(path) if own and self.autosave and path.exists() else ""
+            if not isinstance(settings, dict):
+                which = "default" if config in (None, SimConfig()) else "given"
+                return (None, None, config,
+                        f"Could not resume {what}: {reason}. Started with the {which} settings.{kept}")
+            config, skipped = state.valid_settings(settings, config)
+            left = f" except {', '.join(skipped)}" if skipped else ""
+            return None, None, config, \
+                f"Could not resume {what}: {reason}. Started afresh with its settings{left}.{kept}"
+        how = " Start with --fresh to ignore it." if own else ""
+        return sim, saved, config, f"Resumed {what} at t = {sim.time:.1f} s (saved {saved.saved}).{how}"
+
+    def _set_aside(self, path: Path) -> str:
+        """Move a saved session that could not be resumed (one from a newer version, say, or read
+        while another program held it) out of the way of the autosave on quit, which would replace
+        it: to session/not_resumed_<date>_<time>.npz. Returns a note saying where it went; if it
+        cannot be moved, this run saves no session, so the old one stays as it is."""
+        try:
+            target, = self._new_paths(".npz", stem="not_resumed", folder=path.parent)
+            os.replace(path, target)
+        except OSError:
+            self.autosave = False
+            return " Quitting will not replace that session."
+        return f" That session is kept as {target}."
+
+    def save_session(self) -> Path | None:
+        """Save the session to <results_dir>/session/ (on quit): the full state (simulation, charts,
+        markers, view) in state.npz and the settings and view, readable, in session.json. Returns the
+        folder, or None if it could not be written (the window is closing: the reason goes to stderr)."""
+        folder = self.session_dir
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            saved = state.save(folder / SESSION_STATE, self.sim, self.rec, self._saved_extras())
+            state.write_json(folder / SESSION_FILE, {
+                "format": SESSION_FORMAT, "version": state.FORMAT_VERSION, "saved": saved.saved,
+                "state": SESSION_STATE, "time": self.sim.time, "settings": state.settings_of(self.sim),
+                "origin": self.origin_text() or None, "view": self.view_settings()})
+        except (OSError, TypeError, ValueError) as e:  # (the window still closes)
+            print(f"Could not save the session to {folder}: {e}", file=sys.stderr)
+            return None
+        return folder
+
+    def save_state(self) -> Path | None:
+        """Save the simulation, its charts and markers as results/state_<date>_<time>.npz (F5)."""
+        try:
+            path, = self._new_paths(".npz", stem="state")
+            state.save(path, self.sim, self.rec, self._saved_extras())
+        except (OSError, TypeError, ValueError) as e:  # (the viewer carries on)
+            self._say(f"Could not save the state: {e}")
+            return None
+        self._say(f"Saved state {path} (simulation, charts and markers): F9 carries on from the most recent.")
+        return path
+
+    def latest_state(self) -> Path | None:
+        """The most recently saved state_*.npz in the results folder, if any."""
+        def saved_at(path: Path) -> tuple[int, str, int, str]:
+            # Saves within one tick of a coarse file clock (FAT: 2 s) have the same time: then the
+            # name's timestamp and counter (state_<date>_<time>-1, -2, ...) tell which came last.
+            name = STATE_NAME.fullmatch(path.name)
+            order = (name[1], int(name[2] or 0), path.name) if name else ("", 0, path.name)
+            try:
+                return path.stat().st_mtime_ns, *order
+            except OSError:
+                return -1, *order
+        return max((p for p in self.results_dir.glob(STATE_FILES) if p.is_file()), key=saved_at, default=None)
+
+    def load_state(self, path: str | Path | None = None) -> bool:
+        """Carry on from a saved state file (default: the most recent in the results folder; F9): its
+        simulation, charts, markers and braked cars, keeping the view. A file that cannot be restored
+        restarts with the valid settings it holds, or changes nothing. True if it was restored."""
+        path = Path(path) if path is not None else self.latest_state()
+        if path is None:
+            self._say(f"No saved state ({STATE_FILES}) in {self.results_dir}: F5 or Save state saves one.")
+            return False
+        self.drag = self.pressed = None
+        try:
+            saved = state.load(path)
+            sim = saved.simulation()
+        except Exception as e:  # whatever is wrong with the file, the viewer keeps running
+            reason = str(e) if isinstance(e, StateError) else f"{type(e).__name__}: {e}"
+            settings = state.saved_settings(path)
+            if settings is None:
+                self._say(f"Could not load {path.name}: {reason}. Nothing changed.", 10.0)
+                return False
+            config, skipped = state.valid_settings(settings)
+            self._install(RingSim(config))
+            self.layout()
+            left = f" except {', '.join(skipped)}" if skipped else ""
+            self._say(f"Could not load {path.name}: {reason}. Started afresh with its settings{left}.", 10.0)
+            return False
+        note = self._install(sim, saved)
+        self.layout()
+        self._say(f"Loaded {path.name} at t = {sim.time:.1f} s (saved {saved.saved}).{note}", 8.0)
+        return True
+
+    # ------------------------------------------- presets and random settings
+    def found_preset(self) -> str | None:
+        """The preset the running settings are (whatever the seed; presets.find), None if none is,
+        cached per settings object (every change makes a new one)."""
+        cfg = self.sim.cfg
+        if self._found[0] is not cfg:
+            self._found = (cfg, presets.find(cfg))
+        return self._found[1]
+
+    def _origin(self) -> dict | None:
+        """``origin``, or the preset the settings are (other than the defaults) when none is known."""
+        if self.origin is not None:
+            return self.origin
+        found = self.found_preset()
+        return preset_origin(found) if found not in (None, "default") else None
+
+    def changed_since(self) -> list[str]:
+        """Labels of the settings changed since the preset or random settings were applied."""
+        origin = self._origin() or {}
+        values = {**(origin.get("base") or {}).get("values", {}), **origin.get("values", {})}
+        cfg = self.sim.cfg
+        return [PARAM_BY_NAME[n].label if n in PARAM_BY_NAME else n
+                for n, v in values.items() if not same_value(getattr(cfg, n), v)]
+
+    @staticmethod
+    def _named(labels: list[str]) -> str:
+        """Setting labels in a sentence: the first three, then how many more."""
+        return ", ".join(labels[:3]) + (f" and {len(labels) - 3} more" if len(labels) > 3 else "")
+
+    @staticmethod
+    def _origin_what(origin: dict, short: bool) -> str:
+        """An origin in words: "preset etoile (Place Charles de Gaulle)", "random settings, seed 4821",
+        "random settings, seed 40 (given: Density)", "preset etoile (...) with random Drivers settings,
+        seed 77", "random Road settings, seed 5, and Drivers settings, seed 9" (short: the title, "random,
+        seed 4821", "random, seed 40, Density given", "Place Charles de Gaulle, random Drivers",
+        "random Road, Drivers, seeds 5, 9")."""
+        if "preset" in origin:
+            title = presets.get(origin["preset"]).title
+            return title if short else f"preset {origin['preset']} ({title})"
+        seed = origin["random"]
+        if origin["groups"] is None:
+            given = App._named([PARAM_BY_NAME[n].label if n in PARAM_BY_NAME else n
+                                for n in origin.get("given") or ()])
+            if short:
+                return f"random, seed {seed}" + (f", {given} given" if given else "")
+            return f"random settings, seed {seed}" + (f" (given: {given})" if given else "")
+        draws: dict[int, list[str]] = {}  # seed -> the tabs drawn with it, in the order drawn
+        for group in origin["groups"]:
+            draws.setdefault((origin.get("seeds") or {}).get(group, seed), []).append(group)
+        base = origin.get("base")
+        if short:
+            tabs = ", ".join(origin["groups"])
+            if base is not None:
+                return f"{App._origin_what(base, True)}, random {tabs}"
+            return f"random {tabs}, seed{'s' if len(draws) > 1 else ''} {', '.join(map(str, draws))}"
+        parts = [f"{', '.join(tabs)} settings, seed {s}" for s, tabs in draws.items()]
+        drawn = "random " + (parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])}, and {parts[-1]}")
+        return f"{App._origin_what(base, False)} with {drawn}" if base is not None else drawn
+
+    def origin_text(self, short: bool = False) -> str:
+        """Where the running settings come from, e.g. "preset etoile (Place Charles de Gaulle)" or
+        "random settings, seed 4821", with the settings changed since; "" if they are one's own (or
+        the defaults). ``short``: for the view's header ("Place Charles de Gaulle (changed)")."""
+        origin = self._origin()
+        if origin is None:
+            return ""
+        what = self._origin_what(origin, short)
+        changed = self.changed_since()
+        if short or not changed:
+            return what + (" (changed)" if changed else "")
+        return f"{what}, then {self._named(changed)} changed"
+
+    def cycle_preset(self, step: int) -> None:
+        """Show the next (``step`` 1) or previous (-1) preset in the Presets tab (not applied yet)."""
+        names = presets.names()
+        self.preset_choice = names[(names.index(self.preset_choice) + step) % len(names)]
+        self._layout_panel()
+
+    def apply_preset(self, name: str | None = None) -> None:
+        """Start preset ``name`` (default: the one the Presets tab shows): the defaults with its settings
+        and the running seed (presets.apply), always rebuilt, with a chart marker and a status message."""
+        p = presets.get(name or self.preset_choice)
+        cfg = presets.apply(p.name, self.sim.cfg)
+        self.drag = self.pressed = None
+        changes = {n: getattr(cfg, n) for n in CONFIG_FIELDS if getattr(cfg, n) != getattr(self.sim.cfg, n)}
+        self.sim.reset(seed=self.sim.seed, **changes)  # a fresh start even when no setting changes
+        self._clear_history()
+        self.origin, self.preset_choice = preset_origin(p.name), p.name
+        self.markers.append((self.sim.time, f"Preset {p.title}"))
+        self._layout_panel()
+        self._say(f"Preset {p.title} ({p.name}): rebuilt with its settings, seed {self.sim.seed}. Its notes and "
+                  "sources are on the Presets tab; D saves the settings with its name.", 8.0)
+
+    @staticmethod
+    def drawn_origin(seed: int, groups: list[str] | None, changes: dict, previous: dict | None) -> dict:
+        """The origin after drawing ``changes`` for the tabs ``groups`` (None: all) with ``seed`` while
+        the settings come from ``previous``. A draw of some tabs keeps a preset or a full draw as its
+        base, and joins earlier draws of other tabs, so that each one's seed stays named (a tab drawn
+        again replaces its earlier draw)."""
+        if groups is None or previous is None:
+            return random_origin(seed, groups, changes)
+        if "preset" in previous or previous["groups"] is None:
+            return random_origin(seed, groups, changes, previous)
+        kept = [g for g in previous["groups"] if g not in groups]
+        values = {n: v for n, v in previous["values"].items()
+                  if n not in PARAM_BY_NAME or PARAM_BY_NAME[n].group not in groups}
+        seeds = {**{g: (previous.get("seeds") or {}).get(g, previous["random"]) for g in kept},
+                 **{g: seed for g in groups}}
+        return random_origin(seed, kept + list(groups), {**values, **changes}, previous.get("base"), seeds)
+
+    def randomize(self, groups: list[str] | None = None) -> int:
+        """Plausible random values (presets.random_changes) for every setting, or for those of the tabs
+        ``groups`` only, linked to the current settings of the others, drawn with a fresh seed
+        (presets.new_seed) that the status message shows and the settings keep. Rebuilds when a
+        rebuilding setting changes (keeping the simulation's seed), else changes the drivers live;
+        either way a chart marker names it. Returns the seed."""
+        seed = presets.new_seed()
+        changes = presets.random_changes(seed, groups, base=self.sim.cfg)
+        self.drag = self.pressed = None
+        previous = self._origin()
+        changed = [n for n, v in changes.items() if not same_value(getattr(self.sim.cfg, n), v)]
+        rebuilt = self.sim.set(**changes)
+        if rebuilt:
+            self._clear_history()
+        what = "Random settings" if groups is None else f"Random {', '.join(groups)} settings"
+        self.markers.append((self.sim.time, f"{what}, seed {seed}"))
+        self.origin = self.drawn_origin(seed, groups, changes, previous)
+        self._layout_panel()
+        how = "rebuilt" if rebuilt else "changed live"
+        again = (f"python -m roundabout_sim --random {seed} starts with them" if groups is None else
+                 "linked to the settings of the other tabs")
+        self._say(f"{what}, seed {seed}: {len(changed)} of {len(changes)} changed, {how} ({again}). "
+                  f"{'X' if groups is None else 'Shift+X'} again draws others.", 8.0)
+        return seed
+
+    def randomize_tab(self) -> int | None:
+        """Randomize the settings of the tab shown (Shift+X); the Presets tab has none."""
+        if self.group == PRESETS_TAB:
+            self._say("Shift+X randomizes the settings of the tab shown: choose a parameter tab first (X or "
+                      "Randomize all draws every setting).")
+            return None
+        return self.randomize([self.group])
+
+    # ------------------------------------------------------- sweep viewer
+    def open_sweep_viewer(self) -> subprocess.Popen | None:
+        """Start the sweep viewer (V) in a process of its own, not waited for, with the current settings
+        as the base of its new sweeps: a flat {parameter: value, "seed": ...} JSON file in the results
+        folder (sweep_base_<date>_<time>.json). What it writes to stderr goes to SWEEP_LOG."""
+        try:
+            path, = self._new_paths(".json", stem="sweep_base")
+            state.write_json(path, state.settings_of(self.sim))
+        except (OSError, TypeError, ValueError) as e:
+            self._say(f"Could not save the settings for the sweep viewer: {e}")
+            return None
+        argv = [sys.executable, "-m", "roundabout_sim.sweep_viewer", "--base-settings", str(path.resolve()),
+                "--results", str(self.results_dir.resolve())]
+        log = self.results_dir / SWEEP_LOG
+        try:
+            with open(log, "a", encoding="utf-8") as err:
+                err.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')}: {cli.shell_line(argv)}\n")
+                err.flush()
+                # (No console window of its own on Windows; elsewhere it outlives a viewer stopped with Ctrl+C.)
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+                                        **cli.child_process({"PYGAME_HIDE_SUPPORT_PROMPT": "1"}))
+        except OSError as e:
+            self._say(f"Could not start the sweep viewer: {e}")
+            return None
+        self.sweep_viewers.append(proc)
+        self._say(f"Opening the sweep viewer: its new sweeps start from these settings (seed {self.sim.seed}), "
+                  f"saved as {path.name}. Set up a sweep on its New sweep tab.", 8.0)
+        return proc
+
+    def _check_sweep_viewers(self) -> None:
+        """Say so when a sweep viewer started with V stopped with an error (its messages are in SWEEP_LOG)."""
+        for proc in list(self.sweep_viewers):
+            code = proc.poll()
+            if code is None:
+                continue
+            self.sweep_viewers.remove(proc)
+            if code:
+                self._say(f"The sweep viewer stopped with an error (exit code {code}); what it printed is in "
+                          f"{self.results_dir / SWEEP_LOG}.", 10.0, pin=True)
 
     # ------------------------------------------------------------ events
     def handle(self, e: pygame.event.Event) -> bool:
@@ -1009,16 +1804,12 @@ class App:
         if e.type == pygame.QUIT:
             return False
         if e.type == pygame.VIDEORESIZE:
-            # Never smaller than MIN_WINDOW (unless the screen itself is smaller).
-            desk = (pygame.display.get_desktop_sizes() or [MIN_WINDOW])[0]
-            size = (max(e.size[0], min(MIN_WINDOW[0], desk[0])), max(e.size[1], min(MIN_WINDOW[1], desk[1])))
-            if self.screen.get_size() != size:  # clamped, injected, or a driver that did not resize
-                self.screen = pygame.display.set_mode(size, pygame.RESIZABLE)
+            self.screen = clamp_resize(self.screen, e.size)
             self.layout()
-        elif e.type == pygame.KEYDOWN:
-            return self._key(e.key)
+        elif e.type == pygame.KEYDOWN:  # a message the key gives shows wherever the mouse rests
+            return self._by_key(lambda: self._key(e.key, getattr(e, "mod", 0)))
         elif e.type == pygame.MOUSEMOTION:
-            self.mouse = e.pos
+            self._motion(e.pos, self.widget_at(e.pos))
             if self.drag:
                 self._drag_to(e.pos[0])
         elif e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
@@ -1032,7 +1823,7 @@ class App:
             self._layout_panel()
         return True
 
-    def _key(self, key: int) -> bool:
+    def _key(self, key: int, mod: int = 0) -> bool:
         if key == pygame.K_ESCAPE:
             return False
         if key == pygame.K_SPACE:
@@ -1052,6 +1843,16 @@ class App:
             self.screenshot()
         elif key == pygame.K_d:
             self.save_data()
+        elif key == pygame.K_F5:
+            self.save_state()
+        elif key == pygame.K_F9:
+            self.load_state()
+        elif key == pygame.K_x and mod & pygame.KMOD_SHIFT:
+            self.randomize_tab()
+        elif key == pygame.K_x:
+            self.randomize()
+        elif key == pygame.K_v:
+            self.open_sweep_viewer()
         return True
 
     def _visible(self, w: Widget, pos) -> bool:
@@ -1077,11 +1878,13 @@ class App:
                 start = self.value(w.name)
                 self.drag = Drag(w, start, start)
                 self._drag_to(pos[0])
-        elif w.kind == "choice":
+        elif w.kind in ("choice", "cycler"):
             hit = next((i for i, o in enumerate(w.options) if o.collidepoint(pos)), None)
+            if hit is None and w.kind == "cycler":
+                hit = 1  # the title itself steps forward (as in the sweep viewer)
             if hit is not None:
                 self.pressed = (w, hit)
-        else:
+        elif w.kind == "button":
             self.pressed = (w, 0)
 
     def _drag_to(self, x: int) -> None:
@@ -1110,8 +1913,13 @@ class App:
         w, i = self.pressed
         self.pressed = None
         if w.kind == "button" and w.rect.collidepoint(pos):
+            self._clicked_on(w)  # a message it gives shows while the mouse stays on it
             self.action(w.name)
+        elif w.kind == "cycler" and w.rect.collidepoint(pos):  # (let go on it: the arrow or title pressed)
+            self._clicked_on(w)
+            self.cycle_preset(1 if i else -1)
         elif w.kind == "choice" and w.options[i].collidepoint(pos):
+            self._clicked_on(w)
             old, new = self.value(w.name), w.spec.choices[i]
             self.apply(w.name, new)
             if not w.spec.reset:
@@ -1141,11 +1949,14 @@ class App:
             pygame.display.flip()
             self.work_ms.append(1000.0 * (time.perf_counter() - start))
             self.clock.tick(FPS_CAP)
+        if self.autosave:  # quit with Esc or by closing the window: the next launch carries on here
+            self.save_session()
         pygame.quit()
 
     # ------------------------------------------------------------ drawing
     def draw(self) -> None:
         self._follow_rebuilds()
+        self._check_sweep_viewers()
         self.screen.fill(UI["surface"])
         row = self._latest_row()
         self._draw_view(row)
@@ -1159,6 +1970,8 @@ class App:
     def _car_colours(self, snap: dict) -> np.ndarray:
         if self.colour_mode == "lane":
             return np.array(palette.SERIES)[snap["lane"] % len(palette.SERIES)]
+        if self.colour_mode == "type":
+            return np.array(TYPE_COLOURS)[snap["truck"].astype(int)]
         if self.colour_mode == "desired":
             # Temperament z sets the desired speed; with no spread every driver is the same.
             spread = 1.0 if self.sim.cfg.speed_std > 0 else 0.0
@@ -1176,21 +1989,47 @@ class App:
         self.ring.draw(self.screen, sim, snap, self._car_colours(snap), f, row, hovered)
         pad = round(10 * self.s)
         x, y = self.view_rect.x + pad, self.view_rect.y + pad
-        f.blit(self.screen, f"{sim.n_lanes} lane{'s' if sim.n_lanes > 1 else ''}  ·  "
-                            f"{sim.n_arms or 'no'} entrance{'s' if sim.n_arms != 1 else ''}/exit"
-                            f"{'s' if sim.n_arms != 1 else ''}  ·  radius {cfg.radius:g} m",
-               (x, y), "small", UI["muted"])
+        road = (f"{sim.n_lanes} lane{'s' if sim.n_lanes > 1 else ''}  ·  "
+                f"{sim.n_arms or 'no'} entrance{'s' if sim.n_arms != 1 else ''}/exit"
+                f"{'s' if sim.n_arms != 1 else ''}  ·  radius {cfg.radius:g} m")
+        mix = "".join([f"  ·  {100 * cfg.truck_share:g} % trucks"] * (cfg.truck_share > 0)
+                      + [f"  ·  {cfg.road_condition} road"] * (cfg.road_condition != "dry"))
+        room = self.view_rect.w - 2 * pad - (f.width("PAUSED", "base") + pad if self.paused else 0)
+        origin = self.origin_text(short=True)  # the preset's title, or the random settings' seed
+        firsts = dict.fromkeys((f"{origin}  ·  " if origin else "", ""))
+        header = next((first + road + m + d for first in firsts for m in dict.fromkeys((mix, ""))
+                       for d in self._demand_texts() if f.width(first + road + m + d, "small") <= room), road)
+        f.blit(self.screen, header, (x, y), "small", UI["muted"])
         if self.paused:
             f.blit(self.screen, "PAUSED", (self.view_rect.right - pad, y), "base", UI["text"], "topright")
         if hovered is not None:
             self._car_tooltip(hovered)
         self.screen.set_clip(None)
 
+    def _demand_texts(self) -> list[str]:
+        """The open-mode demand for the view header, longest first (the longest that fits is shown)."""
+        sim, cfg = self.sim, self.sim.cfg
+        if not sim.open_demand:
+            return [""]
+        if not sim.n_arms:
+            return ["  ·  open", ""]
+        rate, peak, uneven = 3600 * cfg.entry_rate, cfg.demand_profile == "peak", cfg.demand_imbalance > 0
+        if not (peak or uneven):
+            return [f"  ·  open: {rate:.0f} veh/h at each entrance", f"  ·  open: {rate:.0f} veh/h each",
+                    "  ·  open", ""]
+        main = rate * float(sim.demand_weight.max())  # the main road's mean
+        detail = ", ".join([f"main road {main:.0f}"] * uneven + ["peak profile"] * peak)
+        short = ", ".join([f"main {main:.0f}"] * uneven + ["peak"] * peak)
+        return [f"  ·  open: {rate:.0f} veh/h per entrance on average ({detail})",
+                f"  ·  open: {rate:.0f} veh/h mean ({short})", f"  ·  open: {rate:.0f} veh/h mean", "  ·  open", ""]
+
     def _car_tooltip(self, slot: int) -> None:
         sim, f, s = self.sim, self.fonts, self.s
         v0 = float(sim.desired_speed(np.array([slot]))[0])
-        lines = [f"car {sim.uid[slot]}  ·  lane {sim.lane[slot] + 1}",
-                 f"{sim.v[slot]:.1f} m/s of {v0:.1f} desired"]
+        kind = "truck" if sim.truck[slot] else "car"
+        lines = [f"{kind} {sim.uid[slot]}  ·  lane {sim.lane[slot] + 1}  ·  {sim.length[slot]:g} m long",
+                 f"{sim.v[slot]:.1f} m/s of {v0:.1f} desired",
+                 f"time gap {sim.headway[slot]:.2f} s  ·  reaction {sim.delay[slot] * sim.cfg.dt:.1f} s"]
         if np.isfinite(sim.exit_at[slot]):
             moving_out = bool(sim.must_move_out(np.array([slot]))[0])
             lines.append(f"exits in {(sim.exit_at[slot] - sim.travel[slot]) * sim.r_out:.0f} m"
@@ -1226,13 +2065,15 @@ class App:
         elif self.colour_mode == "desired":
             car = [("text", "Driver's desired speed:", T), ("text", "slow", T2), ("grad", "speed", gw),
                    ("text", "fast", T2)]
+        elif self.colour_mode == "type":
+            car = [("text", "Vehicle:", T), ("box", TYPE_COLOURS[0]), ("text", "car", T2),
+                   ("box", TYPE_COLOURS[1]), ("text", "truck", T2)]
         else:
             car = [("text", "Lane:", T)]
             for lane in range(self.sim.n_lanes):
                 car += [("box", palette.SERIES[lane % len(palette.SERIES)]), ("text", str(lane + 1), T2)]
             car.append(("text", "(1 = inner)", T2))
-        cfg = self.sim.cfg
-        jam = 100 * cfg.car_length / (cfg.car_length + cfg.min_gap)
+        jam = 100 * jam_cover(self.sim)
         return [car, [("ring", palette.CRITICAL), ("text", "braking", T)],
                 [("text", "Inner band, lane covered:", T), ("text", "0", T2), ("grad", "seq", gw),
                  ("text", f"{jam:.0f}% (jam)", T2)],
@@ -1288,41 +2129,79 @@ class App:
         share = f"{100 * following:.0f} %" if np.isfinite(following) else "–"
         order, base = row["order_param"], row.get("order_baseline", np.nan)
         base_text = f"{base:.2f}" if np.isfinite(base) else "–"
+        order_text = f"{order:.2f}" if np.isfinite(order) else "–"
+
+        def percent(value: float) -> str:  # (NaN on an empty ring: no car to average over)
+            return f"{100 * value:.1f} %" if np.isfinite(value) else "–"
+
+        def fixed(value: float) -> str:
+            return f"{value:.2f}" if np.isfinite(value) else "–"
+
+        open_demand = sim.open_demand
+        if open_demand:  # the number of cars varies; Density set only the start
+            cars = Stat("Cars on ring", f"{row['cars']}", key="Cars on ring (open)")
+            queued = Stat("Queued to enter", f"{row['queued']} · max {row['longest_queue']}",
+                          short=("Queued", f"{row['queued']} · max {row['longest_queue']}"),
+                          key="Queued to enter (open)")
+        else:
+            cars = Stat("Cars on ring", f"{row['cars']} / {sim.target_cars()}")
+            queued = Stat("Queued to enter", f"{row['queued']}")
+        trucks = []
+        if sim.cfg.truck_share > 0:  # only with trucks, so the card keeps its size without them
+            n_trucks, truck_v = row["trucks"], row["truck_speed"]
+            pct = 100 * n_trucks / max(row["cars"], 1)
+            truck_speed = f"{truck_v:.1f} m/s" if np.isfinite(truck_v) else "–"
+            trucks = [Stat("Trucks", f"{n_trucks} ({pct:.0f} %) · {truck_speed}",
+                           short=("Trucks", f"{n_trucks} · {truck_speed}"))]
         traffic = [
             Stat("Sim time", f"{row['time']:.0f} s"),
-            Stat("Cars on ring", f"{row['cars']} / {sim.target_cars()}"),
-            Stat("Queued to enter", f"{row['queued']}"),
+            cars,
+            queued,
+            *trucks,
             Stat("Density", f"{row['density']:.1f} veh/km/lane"),
             Stat("Area covered", f"{100 * row['occupancy']:.1f} %"),
-            Stat("Mean speed", f"{v:.1f} m/s · {3.6 * v:.0f} km/h"),
+            Stat("Mean speed", f"{v:.1f} m/s · {3.6 * v:.0f} km/h" if np.isfinite(v) else "–"),
             Stat("Mean free speed", f"{free:.1f} m/s" if np.isfinite(free) else "–"),
             Stat("Ring flux", f"{row['flux']:.2f} veh/s"),
             Stat("Detector flux", f"{row['detector_flux']:.2f} veh/s"),
         ]
         congestion = [
-            Stat("Jammed cars", f"{100 * row['jam_fraction']:.1f} %"),
-            Stat("Speed deficit", f"{100 * row['speed_deficit']:.1f} %"),
+            Stat("Jammed cars", percent(row["jam_fraction"])),
+            Stat("Speed deficit", percent(row["speed_deficit"])),
             Stat("Stop-and-go", f"{row['stops_per_car_min']:.2f} stops/car/min",
                  short=("Stop-and-go", f"{row['stops_per_car_min']:.2f} /car/min")),
             Stat("Jams", f"{row['n_jams']}"),
             Stat("Following share of jams", share, short=("Following share", share)),
             Stat("Harsh braking (episodes/min)", f"{row['emergency_per_min']:.1f}",
                  short=("Harsh braking", f"{row['emergency_per_min']:.1f} /min")),
-            Stat("Spacing (Gini)", f"{row.get('spacing_gini', np.nan):.2f}"),
-            Stat("Clustering", f"{row['clustering']:.2f}"),
-            Stat("Order", f"{order:.2f} · random {base_text}", short=("Order", f"{order:.2f} / {base_text}")),
+            Stat("Spacing (Gini)", fixed(row.get("spacing_gini", np.nan))),
+            Stat("Clustering", fixed(row["clustering"])),
+            Stat("Order", f"{order_text} · random {base_text}", short=("Order", f"{order_text} / {base_text}")),
         ]
+        delay = row["mean_entry_delay"]
+        delay_text = f"{delay:.1f} s · LOS {metrics.level_of_service(delay, row['entry_vc'])}" \
+            if np.isfinite(delay) else "–"
+        entry_delay = [Stat("Entry delay", delay_text)]
+        entrances = [  # open mode: what happens at the entrances comes first
+            Stat("Arrivals", f"{row['arrivals_per_min']:.1f} /min"),
+            Stat("Entries", f"{row['entries_per_min']:.1f} /min"),
+            Stat("Blocked", f"{row['blocked_per_min']:.1f} /min"),
+            *entry_delay,
+        ] if open_demand else []
         events = [
+            *entrances,
             Stat("Exits", f"{row['exits_per_min']:.1f} /min"),
             Stat("Lane changes", f"{row['lane_changes_per_min']:.1f} /min"),
             Stat("Missed exits", f"{row['missed_exits']}"),
             Stat("Mean trip time", f"{trip:.0f} s" if np.isfinite(trip) else "–"),
+            *([] if open_demand else entry_delay),
         ]
         for lane in range(sim.n_lanes):
             speed, cars = row.get(f"lane{lane}_speed", np.nan), row.get(f"lane{lane}_cars", 0)
             where = " inner" if lane == 0 and sim.n_lanes > 1 else " outer" if lane == sim.outer and lane else ""
             events.append(Stat(f"Lane {lane + 1}{where}",
-                               f"{speed:.1f} m/s · {cars} cars" if np.isfinite(speed) else f"{cars} cars",
+                               f"{speed:.1f} m/s · {plural(cars, 'car')}" if np.isfinite(speed) else
+                               plural(cars, "car"),
                                swatch=palette.SERIES[lane % len(palette.SERIES)], key="Lane"))
         return [traffic, congestion, events]
 
@@ -1362,6 +2241,8 @@ class App:
             slack = width - sum(needs) - gap * (len(columns) - 1)
             if slack >= 0:
                 break
+        if slack < 0 and len(columns) > 1 and width - sum(needs) >= round(8 * s) * (len(columns) - 1):
+            gap, slack = (width - sum(needs)) / (len(columns) - 1), 0  # narrower gaps rather than clipped text
         if slack >= 0:  # columns sized to their content, spare room shared out
             col_ws = [n + slack / len(columns) for n in needs]
         else:
@@ -1490,6 +2371,16 @@ class App:
             return [f"jams {n} — following {fol} · merge {merge} · exit {leave} · entry {enter} · other {other}",
                     f"jams {n} — following {fol} · arms {merge + leave + enter} · other {other}",
                     f"jams {n} · following {fol}", f"jams {n}"]
+        if kind == "delay":
+            delay, longest, vc = float(v["mean_entry_delay"]), int(v["longest_queue"]), float(v["entry_vc"])
+            if not np.isfinite(delay):
+                return [f"no entries in {WINDOW} · longest queue {longest}", "no entries"]
+            los = metrics.level_of_service(delay, vc)
+            ratio = [f"entry delay {delay:.1f} s · LOS {los} · v/c {vc:.2f} · longest queue {longest}"] \
+                if np.isfinite(vc) else []
+            return ratio + [f"entry delay {delay:.1f} s · LOS {los} · longest queue {longest}",
+                            f"entry delay {delay:.1f} s · LOS {los}", f"delay {delay:.1f} s · LOS {los}",
+                            f"{delay:.1f} s · LOS {los}", f"LOS {los}"]
         order, base = float(v["order_param"]), float(v.get("order_baseline", np.nan))
         if not one_sided(order, base):  # same test as the arrow in the view
             return ["no more one-sided than random", "not one-sided"]
@@ -1557,11 +2448,10 @@ class App:
         target = int(np.clip(plot.h // (0.9 * f.line("small")), 1, 3))
         step = nice_step(need, target)
         top = step * math.ceil(need / step - 1e-9)
-        ydec = max(0, decimals(step))
         for tick in np.arange(0, top + step / 2, step):
             y = plot.bottom - tick / top * plot.h
             pygame.draw.line(scr, UI["grid"], (plot.x, y), (plot.right, y))
-            f.blit(scr, f"{tick:.{ydec}f}", (plot.x - 4, y), "small", UI["muted"], "midright")
+            f.blit(scr, tick_text(tick, step), (plot.x - 4, y), "small", UI["muted"], "midright")
         self._x_ticks(plot, card, t_end, span, labels=x_labels)
         self._markers(plot, t_end, span)
         hover = self._hover_index(plot, t, t_end, span)
@@ -1641,9 +2531,7 @@ class App:
             if self.spacetime_mode == "speed":
                 rgb = np.stack(h.speed_rgb)
             else:
-                cfg = self.sim.cfg
-                jam_cover = cfg.car_length / (cfg.car_length + cfg.min_gap)
-                rgb = occupancy_rgb(np.stack(h.occupancy)[:, ::-1] / jam_cover).astype(np.uint8)
+                rgb = occupancy_rgb(np.stack(h.occupancy)[:, ::-1] / jam_cover(self.sim)).astype(np.uint8)
             img = pygame.surfarray.make_surface(rgb)  # x = sample, y = angle bin from the top
             width = int(np.clip(round(len(h) * SAMPLE_INTERVAL / span * plot.w), 1, plot.w))
             surf = pygame.transform.smoothscale(img, (width, plot.h))
@@ -1687,12 +2575,11 @@ class App:
         if readout:
             f.blit(scr, readout, (right, cy), "small", UI["text"], "midright")
         else:
-            cfg = self.sim.cfg
             if self.spacetime_mode == "speed":
                 parts = [("text", "stopped", UI["muted"]), ("grad", "speed", round(56 * s)),
                          ("text", "free", UI["muted"]), ("empty", EMPTY), ("text", "no cars", UI["muted"])]
             else:
-                jam = 100 * cfg.car_length / (cfg.car_length + cfg.min_gap)
+                jam = 100 * jam_cover(self.sim)
                 parts = [("text", "0", UI["muted"]), ("grad", "seq", round(56 * s)),
                          ("text", f"{jam:.0f}% covered", UI["muted"])]
             w = self._parts_width(parts)
@@ -1731,18 +2618,12 @@ class App:
             info += f"  ·  {speed:.0f}× real time"
         f.blit(scr, info, (x, y + f.line("title")), "small", UI["muted"])
         for w in self.panel_widgets:
-            if w.scrolls:
-                continue
-            if w.kind == "button":
-                self._draw_button(w)
-            elif w.kind == "tab":
-                self._draw_tab(w)
-            else:
-                self._draw_control(w)
+            if not w.scrolls:
+                self._draw_widget(w)
         scr.set_clip(self.content_rect)
         for w in self.panel_widgets:
             if w.scrolls and w.rect.colliderect(self.content_rect):
-                self._draw_control(w)
+                self._draw_widget(w)
         scr.set_clip(None)
         overflow = self.content_h - self.content_rect.h
         if overflow > 0:  # scroll bar
@@ -1752,57 +2633,109 @@ class App:
             pygame.draw.rect(scr, UI["grid"], (c.right - round(6 * s), bar_y, round(3 * s), bar_h), border_radius=2)
         self._draw_status()
 
+    def _draw_widget(self, w: Widget) -> None:
+        draw = {"button": self._draw_button, "tab": self._draw_tab, "cycler": self._draw_cycler,
+                "info": self._draw_info, "text": self._draw_text}.get(w.kind, self._draw_control)
+        draw(w)
+
     def _draw_button(self, w: Widget) -> None:
         f, scr = self.fonts, self.screen
-        hot = w.rect.collidepoint(self.mouse)
+        hot = w.rect.collidepoint(self.mouse) and self._visible(w, self.mouse)
         active = w.name == "pause" and self.paused
         fill = UI["accent"] if active else UI["grid"] if hot else UI["raised"]
         pygame.draw.rect(scr, fill, w.rect, border_radius=round(4 * self.s))
-        label = next(lbl for name, lbl, _ in BUTTONS if name == w.name)
-        if w.name == "pause" and self.paused:
-            label = "Play"
-        f.blit(scr, label, w.rect.center, "small", UI["text"], "center")
+        label = "Play" if active else w.label
+        f.blit(scr, ellipsize(f, label, w.rect.w - round(6 * self.s)), w.rect.center, "small", UI["text"], "center")
+
+    def _draw_cycler(self, w: Widget) -> None:
+        """The preset selector: ◀ arrow, the preset's title (a click on it steps forward), ▶ arrow."""
+        f, s, scr = self.fonts, self.s, self.screen
+        radius = round(4 * s)
+        pygame.draw.rect(scr, UI["raised"], w.rect, border_radius=radius)
+        for i, box in enumerate(w.options):
+            hot = box.collidepoint(self.mouse) and self._visible(w, self.mouse)
+            pygame.draw.rect(scr, UI["grid"] if hot else UI["raised"], box, border_radius=radius)
+            cx, cy, half = box.centerx, box.centery, round(5 * s)
+            tip = cx + (half if i else -half)
+            back = cx - (half if i else -half)
+            pygame.draw.polygon(scr, UI["text"] if hot else UI["text2"],
+                                [(tip, cy), (back, cy - half), (back, cy + half)])
+        room = w.rect.w - 2 * w.options[0].w - round(8 * s)
+        title = ellipsize(f, presets.get(self.preset_choice).title, room, "base")
+        f.blit(scr, title, w.rect.center, "base", UI["text"], "center")
+
+    def _draw_info(self, w: Widget) -> None:
+        """Live text of the Presets tab: which preset the selector shows ("caption"), or where the
+        running settings come from ("origin")."""
+        f, scr = self.fonts, self.screen
+        if w.name == "caption":
+            text = ellipsize(f, self._caption(w.rect.w), w.rect.w)
+            f.blit(scr, text, (w.rect.centerx, w.rect.y), "small", UI["muted"], "midtop")
+            return
+        lh = f.line("small")  # (laid out to hold every line; cut only if it changed since)
+        for i, line in enumerate(wrap_lines(f, self._origin_line(), w.rect.w, max(1, w.rect.h // lh))):
+            f.blit(scr, line, (w.rect.x, w.rect.y + i * lh), "small", UI["text2"])
+
+    def _draw_text(self, w: Widget) -> None:
+        """A text block (the chosen preset's description, notes and sources), only its visible lines."""
+        f, c, lh = self.fonts, self.content_rect, self.fonts.line("small")
+        for dy, line, colour in w.lines:
+            y = w.rect.y + dy
+            if c.y - lh < y < c.bottom:
+                f.blit(self.screen, line, (w.rect.x, y), "small", colour)
 
     def _draw_tab(self, w: Widget) -> None:
-        f, scr = self.fonts, self.screen
-        active = w.name == self.group
-        colour = UI["text"] if active else UI["text2"] if w.rect.collidepoint(self.mouse) else UI["muted"]
-        f.blit(scr, w.name, w.rect.center, "small", colour, "center")
-        pygame.draw.line(scr, UI["accent"] if active else UI["grid"], (w.rect.x, w.rect.bottom - 1),
-                         (w.rect.right - 1, w.rect.bottom - 1), 2 if active else 1)
+        draw_tab(self.screen, self.fonts, w.rect, w.name, w.name == self.group, w.rect.collidepoint(self.mouse))
+
+    def inactive(self, spec: ParamSpec) -> str:
+        """Why a control has no effect right now ("" if it has one), e.g. "open mode only" (config.inactive_reason)."""
+        return inactive_reason(spec.name, self.sim.cfg)
 
     def _draw_control(self, w: Widget) -> None:
+        """Label, tags ("rebuilds"; "open mode only" when it does nothing now: then drawn dimmed,
+        though it can still be set), value and slider or choice buttons."""
         f, s, scr, spec = self.fonts, self.s, self.screen, w.spec
         x, y = w.rect.topleft
-        label = f.blit(scr, spec.label, (x, y), "base", UI["text2"])
-        if spec.reset:
-            f.blit(scr, "rebuilds", (label.right + round(6 * s), label.centery), "small", UI["muted"], "midleft")
+        idle = self.inactive(spec)
+        label = f.blit(scr, spec.label, (x, y), "base", UI["muted"] if idle else UI["text2"])
+        right = label.right
+        rebuilds = spec.reset and not (idle and spec.name in NEEDS_NONZERO)  # (it is only kept meanwhile)
+        for tag in ("rebuilds" if rebuilds else "", idle):
+            if tag:
+                right = f.blit(scr, tag, (right + round(6 * s), label.centery), "small", UI["muted"], "midleft").right
         value = self.value(spec.name)
         if spec.choices:
-            self._draw_choice(w)
+            self._draw_choice(w, dimmed=bool(idle))
             return
         unit = f" {spec.unit}" if spec.unit else ""
-        f.blit(scr, f"{format_value(spec, value)}{unit}", (w.rect.right, y), "base", UI["text"], "topright")
+        f.blit(scr, f"{format_value(spec, value)}{unit}", (w.rect.right, y), "base",
+               UI["text2"] if idle else UI["text"], "topright")
         track = w.track
         frac = float(np.clip((value - spec.lo) / (spec.hi - spec.lo), 0.0, 1.0))
         knob_x = track.x + frac * track.w
         pygame.draw.rect(scr, UI["grid"], track, border_radius=2)
-        pygame.draw.rect(scr, UI["accent"], (track.x, track.y, max(int(frac * track.w), 1), track.h), border_radius=2)
+        pygame.draw.rect(scr, DIM_ACCENT if idle else UI["accent"],
+                         (track.x, track.y, max(int(frac * track.w), 1), track.h), border_radius=2)
         hot = (self.drag and self.drag.widget is w) or w.rect.collidepoint(self.mouse)
-        pygame.draw.circle(scr, UI["text"], (knob_x, track.centery), round((8 if hot else 6.5) * s))
+        pygame.draw.circle(scr, UI["text2"] if idle else UI["text"], (knob_x, track.centery),
+                           round((8 if hot else 6.5) * s))
 
-    def _draw_choice(self, w: Widget) -> None:
+    def _draw_choice(self, w: Widget, dimmed: bool = False) -> None:
         f, scr = self.fonts, self.screen
         current = self.value(w.name)
         for option, rect in zip(w.spec.choices, w.options):
             selected = option == current
             hot = rect.collidepoint(self.mouse)
-            fill = UI["accent"] if selected else UI["grid"] if hot else UI["raised"]
+            fill = (DIM_ACCENT if dimmed else UI["accent"]) if selected else UI["grid"] if hot else UI["raised"]
             pygame.draw.rect(scr, fill, rect, border_radius=round(4 * self.s))
             f.blit(scr, option, rect.center, "small", UI["text"] if selected else UI["text2"], "center")
 
     def _status_text(self) -> str:
         w = self.drag.widget if self.drag else self.widget_at(self.mouse)
+        text, until = self.message
+        live = None if self.drag else self._live_message(w)
+        if live is not None:  # from a key or a click, or one that came in by itself (see ui.Messages)
+            return live
         if w is not None:
             if w.spec is None:
                 return w.help
@@ -1816,12 +2749,13 @@ class App:
         if self.st_card.collidepoint(self.mouse):
             return SPACETIME_HELP
         if self.view_rect.collidepoint(self.mouse):
+            if self.ring is not None and any(r.collidepoint(self.mouse) for r in self.ring.tag_rects):
+                return QUEUE_TAG_HELP
             return VIEW_HELP
         for rect, help_text in self.stat_hits:
             if rect.collidepoint(self.mouse):
                 return help_text
-        text, until = self.message
-        return text if time.monotonic() < until else DEFAULT_HINT
+        return text if time.monotonic() < until else AUTOSAVE_HINT if self.autosave else DEFAULT_HINT
 
     def _draw_status(self) -> None:
         f, r = self.fonts, self.status_rect
@@ -1837,40 +2771,33 @@ class App:
 
 
 # ------------------------------------------------------------------ main
-def _dpi_aware() -> None:
-    """Render at native resolution on high-DPI Windows displays instead of being upscaled blurrily."""
-    if sys.platform == "win32":
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except (AttributeError, OSError):
-            pass
-
-
-def _initial_size() -> tuple[int, int]:
-    """About 90 % of the desktop, but at least ``MIN_WINDOW`` where the screen allows."""
-    sizes = pygame.display.get_desktop_sizes()
-    w, h = sizes[0] if sizes else (MIN_WINDOW[0], MIN_WINDOW[1])
-    return (int(max(0.9 * w, min(MIN_WINDOW[0], w))), int(max(0.9 * h, min(MIN_WINDOW[1], h))))
-
-
-def _window_size(text: str) -> tuple[int, int]:
-    try:
-        w, h = (int(v) for v in text.lower().split("x"))
-    except ValueError:
-        raise argparse.ArgumentTypeError("expected WIDTHxHEIGHT, e.g. 1600x900") from None
-    return w, h
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m roundabout_sim", description="Interactive multi-lane roundabout traffic model.",
         epilog=f"Keys: Space pause, R reset (new seed), B brake a random car, +/- sim speed, C car colours, "
                f"S save a screenshot, D save the chart data ({HISTORY_TEXT}) as CSV with a settings file "
-               "(settings, live changes, equivalent experiments command), Esc quit. Files go to results/. "
-               "Click a car to make it brake; hover anything for help.")
-    parser.add_argument("--seed", type=int, default=None, help="random seed (default: random)")
-    parser.add_argument("--size", type=_window_size, default=None, metavar="WxH",
-                        help="window size in pixels (default: 90%% of the screen)")
+               "(settings, live changes, equivalent experiments command), F5 save the state "
+               "(state_<date>_<time>.npz: simulation, charts, markers), F9 carry on from the most recent one, "
+               "X random settings (Shift+X: only those of the tab shown; the seed shows in the help box), "
+               "V open the sweep viewer with the current settings as its base, Esc quit. Files go to results/. "
+               "Click a car to make it brake; hover anything for help; the Presets tab starts real-world "
+               f"presets. Closing the viewer saves the session (simulation, charts and view) to "
+               f"results/{SESSION_DIR}/ and the next launch carries on there; model settings given as flags "
+               "(--preset and --random too) start a new simulation instead (the view settings still restore). "
+               "Settings: the defaults, then --preset or --random, then the parameter flags.")
+    parser.add_argument("--seed", type=cli.seed_arg, default=None, help="random seed (default: random)")
+    cli.add_base_flags(parser, "parameter flags", seed_note=" (X in the viewer shows the seed it drew)")
+    parser.add_argument("--size", type=cli.window_size, default=None, metavar="WxH",
+                        help="window size in pixels (default: 90%% of the screen; at least 1100x700 where the "
+                             "screen allows, also when given)")
+    parser.add_argument("--fresh", action="store_true",
+                        help=f"ignore the session saved in results/{SESSION_DIR}/ (simulation and view settings); "
+                             "quitting replaces it unless --no-autosave")
+    parser.add_argument("--no-autosave", "--no_autosave", dest="no_autosave", action="store_true",
+                        help=f"do not save the session on quit (results/{SESSION_DIR}/ keeps the last one)")
+    parser.add_argument("--state", metavar="PATH", default=None,
+                        help="carry on from this saved state file (a results/state_*.npz saved with F5, or "
+                             f"results/{SESSION_DIR}/{SESSION_STATE}); cannot be combined with model settings")
     defaults = SimConfig()
     for spec in PARAMS:
         flags = [f"--{spec.name}"] + ([f"--{spec.name.replace('_', '-')}"] if "_" in spec.name else [])
@@ -1882,15 +2809,84 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             unit = f" {spec.unit}" if spec.unit else ""
             parser.add_argument(*flags, dest=spec.name, type=float, metavar=f"{spec.lo:g}-{spec.hi:g}{unit}",
                                 help=text)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.preset is not None:
+        try:
+            args.preset = presets.get(args.preset).name
+        except presets.UnknownPresetError as e:  # (lists the names)
+            parser.error(f"--preset: {e}")
+    given = explicit_settings(args)
+    if args.state and given:
+        parser.error(f"--state carries on from a saved simulation, so it takes no model settings ({', '.join(given)})")
+    try:
+        flags = _flag_settings(args)
+    except ValueError as e:  # e.g. --n_lanes 2.5: an error, not rounded (as experiments takes it)
+        parser.error(str(e))
+    try:
+        config_from_args(args)
+    except ValueError as e:  # e.g. --density -5: say so before a window opens
+        parser.error(f"invalid settings: {e}")
+    for name, value in flags.items():
+        if note := cli.range_note(name, value):
+            print(note)
+    return args
+
+
+def explicit_settings(args: argparse.Namespace) -> list[str]:
+    """The model settings given on the command line, as their flags (e.g. ["--seed", "--density"]).
+    Any of them makes the viewer start a new simulation instead of resuming the saved session
+    (whose view settings still restore); --preset and --random, which pick whole sets of settings,
+    count too."""
+    given = ["--seed"] * (getattr(args, "seed", None) is not None)
+    given += [flag for flag in ("--preset", "--random") if getattr(args, flag[2:], None) is not None]
+    return given + [f"--{spec.name}" for spec in PARAMS if getattr(args, spec.name, None) is not None]
+
+
+def _flag_settings(args: argparse.Namespace) -> dict:
+    """The parameters given with their own flags (--density 80, ...), read as the experiments CLI reads
+    them (cli.setting_value: --n_lanes 2.5 is a ValueError, not 2 lanes)."""
+    return {spec.name: cli.setting_value(spec.name, getattr(args, spec.name))
+            for spec in PARAMS if getattr(args, spec.name, None) is not None}
 
 
 def config_from_args(args: argparse.Namespace) -> SimConfig:
-    changes = {spec.name: coerce(spec.name, getattr(args, spec.name))
-               for spec in PARAMS if getattr(args, spec.name) is not None}
-    return SimConfig(seed=args.seed).updated(**changes)
+    """The settings the command line asks for (see :func:`explicit_settings` for whether it asks for any):
+    the defaults, then --preset or --random, then the parameter flags (as experiments takes them). With
+    --random the flags take part in the links: ``--random 40 --traffic_mode open`` draws an open-mode
+    start density."""
+    changes, base = _flag_settings(args), SimConfig(seed=args.seed)
+    if getattr(args, "preset", None) is not None:
+        base = presets.apply(args.preset, base)
+    elif getattr(args, "random", None) is not None:
+        base = base.updated(**presets.random_changes(args.random, fixed=changes))
+    return base.updated(**changes)
+
+
+def origin_from_args(args: argparse.Namespace) -> dict | None:
+    """Where the command line's settings come from: --preset or --random (see :func:`preset_origin`).
+    The parameter flags given with --random are named as given (they are not drawn), and changing
+    them later counts as a change, as with --preset."""
+    if getattr(args, "preset", None) is not None:
+        return preset_origin(args.preset)
+    if getattr(args, "random", None) is not None:
+        changes = _flag_settings(args)
+        drawn = presets.random_changes(args.random, fixed=changes)
+        return random_origin(args.random, None, drawn, given=[n for n in drawn if n in changes])
+    return None
+
+
+def session_options(args: argparse.Namespace) -> dict:
+    """App's ``resume`` and ``restore_view`` for the command line: model settings start a new
+    simulation, else --state carries on from that file, else the saved session resumes (--fresh:
+    nothing of it, not even the view settings)."""
+    if explicit_settings(args):
+        return {"resume": None, "restore_view": not args.fresh}
+    if args.state:
+        return {"resume": Path(args.state), "restore_view": not args.fresh}
+    return {"resume": None if args.fresh else "session", "restore_view": not args.fresh}
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    App(config_from_args(args), size=args.size).run()
+    App(config_from_args(args), size=args.size, autosave=not args.no_autosave, origin=origin_from_args(args),
+        **session_options(args)).run()

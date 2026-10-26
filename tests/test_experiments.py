@@ -16,10 +16,10 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 
 from roundabout_sim import experiments  # noqa: E402
-from roundabout_sim.metrics import SECTORS, SPACETIME_BINS  # noqa: E402
+from roundabout_sim.metrics import SECTORS, SPACETIME_BINS, Recorder  # noqa: E402
+from tests.helpers import assert_png  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 # Metrics every time series must carry (measurements named like a parameter get "measured_").
 TIMESERIES_COLUMNS = {
@@ -35,14 +35,6 @@ MEASURED_COLUMNS = {
     "emergency_per_min", "wave_speed",
 }
 BASELINE_COLUMNS = {f"baseline_{name}" for name in experiments.BASELINE_COLUMNS} | {"arm_jam_share"}
-
-
-def assert_png(path: Path) -> None:
-    assert path.is_file()
-    data = path.read_bytes()
-    assert data[:8] == PNG_MAGIC
-    width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
-    assert width >= 600 and height >= 400
 
 
 @pytest.mark.parametrize("flags, expect", [
@@ -158,6 +150,33 @@ def test_arm_share_table_compares_each_exit_chance_with_zero():
     assert experiments.arm_share_table(df, ["density"]) is None  # exit_prob not swept
 
 
+def test_arm_share_table_leaves_out_points_without_a_baseline(capsys):
+    """A plan need not pair every exit_prob > 0 run with an exit_prob = 0 run: such points are left out,
+    a cell without a run is blank (not '-', which means under 2 % jammed), and with nothing to compare
+    nothing is printed (no empty pandas frame)."""
+    df = pd.DataFrame({"exit_prob": [0.0, 0.1, 0.0, 0.2, 0.0, 0.3],
+                       "density": [80.0, 80.0, 90.0, 100.0, 70.0, 70.0],
+                       "jam_fraction": [0.1, 0.4, 0.2, 0.7, 0.0, 0.01], "traffic_mode": "closed", "n_arms": 4})
+    table = experiments.arm_share_table(df, ["exit_prob", "density"])
+    assert list(table.index) == [80.0, 70.0]  # 90: no run above 0; 100: no run at 0
+    assert list(table.columns) == ["exit_prob=0.1", "exit_prob=0.3"]  # 0.2 ran only at 100
+    assert table.loc[80.0, "exit_prob=0.1"] == pytest.approx(0.75)
+    experiments._print_arm_shares(df, ["exit_prob", "density"])
+    printed = capsys.readouterr().out
+    assert "- = under 2 % jammed; blank = no run there:" in printed
+    assert "(2 points left out: no exit_prob 0 run to compare with, or no run above 0)" in printed
+    rows = {line.split()[0]: line.split()[1:] for line in printed.splitlines() if line[:2] in ("80", "70")}
+    assert rows == {"80.0": ["75"], "70.0": ["-"]}  # the blank cells print as nothing
+    # Nothing to compare: exit_prob 0 only (a single --vary value), or the 0 runs elsewhere (open, a plan).
+    for frame, keys in ((df[df["exit_prob"] == 0], ["exit_prob", "density"]),
+                        (df.assign(traffic_mode=["closed", "open", "open", "open", "open", "open"]),
+                         ["exit_prob", "traffic_mode"])):
+        assert experiments.arm_share_table(frame[frame["traffic_mode"] == "closed"], keys) is None
+        experiments._print_arm_shares(frame, keys)
+        printed = capsys.readouterr().out
+        assert "Empty DataFrame" not in printed and "Jamming due to" not in printed
+
+
 def _jam_frame(times, jam) -> pd.DataFrame:
     return pd.DataFrame({"time": times, "jam_fraction": jam})
 
@@ -231,7 +250,7 @@ def test_sweep_over_initial_spacing_and_exit_chance_prints_the_notes(tmp_path, c
     assert_png(Path(f"{out}.png"))
 
 
-def test_parallel_sweep_matches_the_serial_one(tmp_path, capsys):
+def test_parallel_sweep_matches_the_serial_one(tmp_path, capsys, no_figures):
     base = ["sweep", "--x", "density=30,60", "--seeds", "1", "--warmup", "2", "--measure", "5"]
     experiments.main([*base, "--workers", "2", "--out", str(tmp_path / "parallel")])
     experiments.main([*base, "--workers", "1", "--out", str(tmp_path / "serial")])
@@ -303,3 +322,40 @@ def test_command_line_entry_point_reports_errors_without_a_traceback(tmp_path):
     assert result.returncode == 2
     assert "error:" in result.stderr and "Traceback" not in result.stderr
     assert not any(tmp_path.iterdir())
+
+
+def _sampled_by_recorder(start: float, measure: float, dt: float, interval: float) -> bool:
+    """Whether a Recorder stepped as experiments.advance steps it samples at or after ``start``."""
+    class Clock:
+        time, generation = 0.0, 0
+
+    rec = Recorder.__new__(Recorder)
+    rec.sim, rec.interval, rec._next, rec._generation, times = Clock(), interval, 0.0, 0, []
+    rec.record = lambda: times.append(rec.sim.time)
+    for _ in range(int(round(start / dt)) + int(round(measure / dt))):
+        rec.sim.time += dt
+        rec.update()
+    return any(t >= start for t in times)
+
+
+@pytest.mark.parametrize("dt", [0.1, 0.05, 0.25])
+def test_window_sampled_matches_the_recorder(dt):
+    cases = [(start, measure, interval) for start in (0.0, 0.3, 1.0, 3.3, 10.0)
+             for measure in (0.1, 0.25, 0.5, 2.0, 5.0) for interval in (0.05, 0.3, 0.5, 2.0, 10.0)]
+    for start, measure, interval in cases:
+        assert experiments.window_sampled(start, measure, dt, interval) == \
+            _sampled_by_recorder(start, measure, dt, interval), (start, measure, interval)
+
+
+def test_a_window_without_a_sample_is_refused_before_anything_runs(tmp_path, capsys):
+    """A measured window that falls between two samples would give a summary of nothing (NaN metrics):
+    the parser says so instead, for a sweep and for the second half of a run."""
+    for argv, why in ((["sweep", "--x", "density=20,30", "--warmup", "1", "--measure", "0.2", "--interval", "5"],
+                       "no sample in the measured window (1-1.2 s at a time step of 0.1 s, sampling every "
+                       "--interval 5 s): make --measure longer or --interval shorter"),
+                      (["run", "--duration", "2", "--interval", "5"],
+                       "no sample in the second half of the run, which the summary covers,")):
+        with pytest.raises(SystemExit):
+            experiments.main([*argv, "--out", str(tmp_path / "x")])
+        assert why in capsys.readouterr().err
+    assert not list(tmp_path.iterdir())  # nothing ran, nothing was written

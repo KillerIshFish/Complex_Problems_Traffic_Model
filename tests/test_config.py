@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import fields
 
 import pytest
 
-from roundabout_sim.config import PARAM_BY_NAME, PARAMS, SimConfig, coerce
+from roundabout_sim import cli, textfmt
+from roundabout_sim.config import PARAM_BY_NAME, PARAMS, SimConfig, axis_label, changed_settings, coerce
 
 DEFAULTS = SimConfig()
 FIELDS = {f.name for f in fields(SimConfig)}
@@ -112,3 +115,25 @@ def test_updated_copies_and_applies_changes():
 def test_updated_rejects_unknown_names():
     with pytest.raises(KeyError, match="not_a_param"):
         SimConfig().updated(not_a_param=1)
+
+
+def test_shared_setting_helpers():
+    """What the sweep tools and the viewers share: the settings that differ from the defaults, the axis
+    label of a setting, the strict reading of a value and the out-of-range note, the base's name."""
+    values = {"density": 50.0, "radius": 30.0, "seed": 3, "flux": 1.0, "exit_prob": DEFAULTS.exit_prob + 1e-15}
+    assert changed_settings(values) == {"radius": 30.0}  # no seed, no metric, nothing within rounding
+    assert axis_label("radius") == "Ring radius (m)" and axis_label("n_lanes") == "Lanes"
+    assert axis_label("flux") == "flux"
+    assert cli.setting_value("n_lanes", "3") == 3 and cli.setting_value("n_lanes", 3.0) == 3
+    for value in ("2.5", 2.5):
+        with pytest.raises(ValueError, match="bad value '2.5' for n_lanes: must be a whole number"):
+            cli.setting_value("n_lanes", value)
+    assert cli.range_note("n_lanes", 9) == "note: n_lanes=9 is outside the usual range 1-5"
+    assert cli.range_note("n_lanes", 3) == "" and cli.range_note("traffic_mode", "open") == ""
+    assert textfmt.base_text("etoile", 3) == "preset etoile"
+    assert textfmt.base_text(None, 8) == "random settings (seed 8)"
+    assert textfmt.base_text(None, None) == textfmt.base_text(None, True) == ""
+    assert textfmt.and_join(["Road"]) == "Road" and textfmt.and_join("abc") == "a, b and c"
+    kwargs = cli.child_process({"EXTRA": "1"})
+    assert kwargs["env"]["EXTRA"] == "1" and str(cli.ROOT) in kwargs["env"]["PYTHONPATH"].split(os.pathsep)
+    assert ("creationflags" in kwargs) == (sys.platform == "win32")

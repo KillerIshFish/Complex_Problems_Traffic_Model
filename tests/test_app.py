@@ -8,23 +8,18 @@ pygame delivers them, then checks the effect on the simulation and the charts.
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 
-# Before pygame initialises its display: render off-screen, no sound device.
-os.environ["SDL_VIDEODRIVER"] = "dummy"
-os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
-os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+import numpy as np
+import pandas as pd
+import pygame
+import pytest
 
-import numpy as np  # noqa: E402
-import pandas as pd  # noqa: E402
-import pygame  # noqa: E402
-import pytest  # noqa: E402
-
-from roundabout_sim import app as viewer  # noqa: E402
-from roundabout_sim import palette  # noqa: E402
-from roundabout_sim import experiments  # noqa: E402
-from roundabout_sim.config import SimConfig, coerce  # noqa: E402
+from roundabout_sim import app as viewer
+from roundabout_sim import palette
+from roundabout_sim import experiments
+from roundabout_sim.config import SimConfig, coerce
+from tests.helpers import click, down, frame, frames, key, move, resize, show_tab, up, wheel, widget
 
 SIZE = (1280, 720)
 SEED = 7
@@ -32,73 +27,7 @@ BIG_RING = dict(n_lanes=5, radius=300, car_length=2, min_gap=1, density=200)  # 
 
 
 # ------------------------------------------------------------------ helpers
-@pytest.fixture
-def make_app(tmp_path):
-    """Factory for viewers (fixed seed, screenshots into tmp_path); pygame is shut down afterwards."""
-
-    def make(size=SIZE, **config) -> viewer.App:
-        cfg = SimConfig(**{"seed": SEED, **config})
-        return viewer.App(cfg, size=size, results_dir=tmp_path / "results")
-
-    yield make
-    pygame.quit()
-
-
-def frame(app: viewer.App, *events: pygame.event.Event) -> None:
-    """One pass of ``App.run``'s loop body: events, layout, step (unless paused), draw, flip."""
-    for event in events:
-        assert app.handle(event), f"{event} asked to quit"
-    if app.screen.get_size() != app._layout_size:
-        app.layout()
-    if not app.paused:
-        app.advance(app.steps_per_frame)
-    app.draw()
-    pygame.display.flip()
-
-
-def frames(app: viewer.App, n: int) -> None:
-    for _ in range(n):
-        frame(app)
-
-
-def move(pos) -> pygame.event.Event:
-    return pygame.event.Event(pygame.MOUSEMOTION, pos=tuple(pos), rel=(0, 0), buttons=(0, 0, 0))
-
-
-def down(pos) -> pygame.event.Event:
-    return pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=tuple(pos), button=1)
-
-
-def up(pos) -> pygame.event.Event:
-    return pygame.event.Event(pygame.MOUSEBUTTONUP, pos=tuple(pos), button=1)
-
-
-def key(k: int) -> pygame.event.Event:
-    return pygame.event.Event(pygame.KEYDOWN, key=k, mod=0, unicode="", scancode=0)
-
-
-def wheel(y: int) -> pygame.event.Event:
-    return pygame.event.Event(pygame.MOUSEWHEEL, x=0, y=y, flipped=False, precise_x=0.0, precise_y=float(y))
-
-
-def resize(size) -> pygame.event.Event:
-    return pygame.event.Event(pygame.VIDEORESIZE, size=tuple(size), w=size[0], h=size[1])
-
-
-def click(app: viewer.App, pos) -> None:
-    for event in (move(pos), down(pos), up(pos)):
-        assert app.handle(event)
-
-
-def widget(app: viewer.App, kind: str, name: str) -> viewer.Widget:
-    return next(w for w in app.widgets if w.kind == kind and w.name == name)
-
-
-def show_tab(app: viewer.App, group: str) -> None:
-    click(app, widget(app, "tab", group).rect.center)
-    assert app.group == group
-
-
+# (make_app, from conftest: viewers at SIZE with seed SEED, screenshots into tmp_path)
 def slider_pos(w: viewer.Widget, value: float) -> tuple[int, int]:
     """Screen point on a slider's track for ``value``."""
     spec = w.spec
@@ -349,10 +278,10 @@ def test_keyboard_shortcuts(make_app):
     assert app.steps_per_frame == 1
 
     seen = []
-    for _ in range(3):  # C cycles the car colours
+    for _ in range(4):  # C cycles the car colours
         frame(app, key(pygame.K_c))
         seen.append(app.colour_mode)
-    assert seen == ["desired", "lane", "speed"]
+    assert seen == ["desired", "lane", "type", "speed"]
 
     frame(app, key(pygame.K_b))  # B brakes a random car for 3 s
     assert len(app.brakes) == 1
@@ -525,6 +454,52 @@ def test_hover_help_for_charts_view_controls_and_readouts(make_app):
     assert {"Stop-and-go", "Clustering", "Mean free speed", "Following share of jams",
             "Harsh braking (episodes/min)", "Spacing (Gini)"} <= labels
     assert not any(word in text for _, text in app.stat_hits for word in ("Natural", "Emergency", "near-crash"))
+
+
+def test_key_messages_show_wherever_the_mouse_rests(make_app, monkeypatch):
+    """F5, X, Shift+X, F9 and S confirm themselves in the help box even with the mouse resting on
+    the view, a chart, the stats or a control (whose hover help would otherwise come first)."""
+    from roundabout_sim import ui
+
+    app = make_app()
+    frames(app, 5)
+    spots = {"view": app.ring.rect.move(3, 3).topleft, "chart": app.chart_cards[0][2].center,
+             "stats": app.stat_hits[0][0].center, "slider": widget(app, "slider", "steps_per_frame").rect.center}
+    for name, pos in spots.items():
+        for k, mod in ((pygame.K_F5, 0), (pygame.K_x, 0), (pygame.K_x, pygame.KMOD_SHIFT), (pygame.K_F9, 0),
+                       (pygame.K_s, 0)):
+            show_tab(app, "Traffic")
+            frame(app, move(pos))
+            frame(app, pygame.event.Event(pygame.KEYDOWN, key=k, mod=mod, unicode="", scancode=0))
+            assert app._status_text() == app.message[0] != "", (name, k)
+            frame(app, move((pos[0] + 1, pos[1])))  # a move within PIN_HOLD keeps it
+            assert app._status_text() == app.message[0], (name, k)
+    monkeypatch.setattr(ui, "PIN_HOLD", 0.0)
+    frame(app, move(spots["view"]))  # held long enough: once the mouse moves, its help is back
+    assert app._status_text() == viewer.VIEW_HELP
+
+
+def test_chart_ticks_keep_the_decimals_of_a_2_5_step(make_app, monkeypatch):
+    """A tick step of 2.5 labels 2.5 and 7.5 as such (they printed as 2 and 8, rounded half to even)."""
+    app = make_app()
+    frames(app, 5)
+    monkeypatch.setattr(viewer, "nice_step", lambda span, target: 2.5)
+    texts = []
+    blit = app.fonts.blit
+    monkeypatch.setattr(app.fonts, "blit", lambda scr, text, *a, **k: texts.append(text) or blit(scr, text, *a, **k))
+    app.draw()
+    assert {"2.5", "7.5"} <= set(texts)
+    assert viewer.tick_text(7.5, 2.5) == "7.5" and viewer.tick_text(10.0, 5.0) == "10"
+
+
+def test_resume_note_shows_with_the_mouse_on_the_view(make_app, tmp_path):
+    first = viewer.App(SimConfig(seed=SEED), size=SIZE, results_dir=tmp_path / "res", autosave=True)
+    frames(first, 3)
+    assert first.save_session() is not None
+    app = viewer.App(SimConfig(seed=SEED), size=SIZE, results_dir=tmp_path / "res", resume="session")
+    frame(app)
+    frame(app, move(app.view_rect.center))
+    assert app._status_text().startswith("Resumed the saved session")
 
 
 @pytest.mark.parametrize("config", [
@@ -746,3 +721,57 @@ def test_save_csv_writes_the_chart_data_and_the_settings(make_app, tmp_path):
     changes = {name: coerce(name, value) for name, value in args.set}
     assert SimConfig(seed=args.seed).updated(**changes) == sim.cfg  # reruns the final settings
     assert set(changes) == {"density"}  # only what differs from the defaults
+
+
+def test_parameter_flags_are_read_as_strictly_as_the_experiments_cli(capsys):
+    """--n_lanes 2.5 is an error, not 2 lanes (banker's rounding made 3.5 four); a seed below 0 is refused
+    by --seed itself; a value off the slider range gets the experiments CLI's note."""
+    for bad, why in ((["--n_lanes", "2.5"], "bad value '2.5' for n_lanes: must be a whole number"),
+                     (["--n-arms", "1.5"], "bad value '1.5' for n_arms: must be a whole number"),
+                     (["--max_queue", "2.7"], "bad value '2.7' for max_queue"),
+                     (["--seed", "-2"], "argument --seed: seed must be a whole number >= 0, got '-2'")):
+        with pytest.raises(SystemExit) as exc:
+            viewer.parse_args(bad)
+        assert exc.value.code == 2 and why in capsys.readouterr().err, bad
+    cfg = viewer.config_from_args(viewer.parse_args(["--n_lanes", "9", "--n_arms", "3.0"]))
+    assert (cfg.n_lanes, cfg.n_arms) == (9, 3)
+    out = capsys.readouterr().out
+    assert "note: n_lanes=9 is outside the usual range 1-5" in out and "n_arms" not in out
+
+
+def test_small_readouts_read_naturally(make_app):
+    """The congregation chart's axis stops at 1 (its measures all lie in 0-1), a lane with one car reads
+    '1 car', and the short delay headers keep the decimal the stats card shows."""
+    spec = next(c for c in viewer.CHARTS if c.title.startswith("Congregation"))
+    assert spec.max_top == 1.0
+    app = make_app(n_lanes=2, density=5.0, n_arms=0)
+    row = {**app._latest_row(), "lane0_speed": 8.3, "lane0_cars": 1, "lane1_speed": np.nan, "lane1_cars": 0}
+    lanes = [s for s in app._stat_columns(row)[2] if s.key == "Lane"]
+    assert [s.value for s in lanes] == ["8.3 m/s · 1 car", "0 cars"]
+    texts = viewer.App._extra_texts("delay", {"mean_entry_delay": 1.4, "longest_queue": 3, "entry_vc": 1.2})
+    assert texts[-3:] == ["delay 1.4 s · LOS F", "1.4 s · LOS F", "LOS F"]
+    assert not any("delay 1 s" in t for t in texts)
+
+
+@pytest.mark.parametrize("size", [(1100, 700), (1920, 1080)])
+def test_arms_of_a_crowded_small_ring_do_not_overlap_and_the_detector_label_is_clear(make_app, size):
+    """Twelve arms on a 10 m ring: each arm is drawn at most as wide as its share of the ring's edge, and
+    the detector label moves past the arms' ends when the arms beside it would cover it."""
+    for config in (dict(n_arms=12, radius=10.0, n_lanes=1), dict(n_arms=12, radius=30.0, n_lanes=5), {}):
+        app = make_app(size=size, **config)
+        app.draw()
+        ring, sim = app.ring, app.sim
+        half = ring.arm_half_width(sim)
+        assert half <= ring.r_edge * math.sin(math.pi / sim.n_arms) + 1e-9
+        if not config:  # (four arms: as wide as their two lanes, as before)
+            assert half == pytest.approx(ring.arm_offset + ring.lw / 2)
+        assert not ring._on_arms(ring.detector_box, sim, half)
+        assert ring.layer.get_rect().contains(ring.detector_box)
+
+
+def test_a_window_size_below_the_minimum_is_raised_to_it(make_app, capsys):
+    app = make_app(size=(400, 300))
+    desk = (pygame.display.get_desktop_sizes() or [viewer.MIN_WINDOW])[0]
+    assert app.screen.get_size() == (max(400, min(viewer.MIN_WINDOW[0], desk[0])),
+                                     max(300, min(viewer.MIN_WINDOW[1], desk[1])))
+    assert "window size 400x300 is below the smallest the layout supports" in capsys.readouterr().err

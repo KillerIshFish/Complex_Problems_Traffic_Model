@@ -258,9 +258,12 @@ def test_recorder_holds_the_requested_graphs():
 def test_snapshot_of_empty_ring():
     row = snapshot(RingSim(seed=0, density=0.0))
     assert row["cars"] == 0
-    for key in ("mean_speed", "flux", "jam_fraction", "occupancy", "clustering", "order_param"):
+    for key in ("flux", "occupancy", "n_jams", "trucks"):
         assert row[key] == 0.0, key
-    assert np.isnan(row["mean_trip_time"])
+    # No car to average over: the per-car measures are NaN (time means skip them), not a speed of 0.
+    for key in ("mean_speed", "speed_std", "jam_fraction", "speed_deficit", "clustering", "order_param",
+                "spacing_gini", "mean_trip_time"):
+        assert np.isnan(row[key]), key
 
 
 def test_trip_time_and_exit_rate_with_arms():
