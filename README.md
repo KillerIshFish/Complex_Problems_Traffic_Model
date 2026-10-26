@@ -7,9 +7,10 @@ driver with its own desired speed, reaction time, attention span and
 lane-change decisions. Small cars on a large ring let the roundabout hold
 hundreds to thousands of them.
 
-You can change the number of lanes and entrances/exits, the density, driver
-behaviour and the starting layout, either live in a viewer or in batch
-experiments that write CSVs and figures.
+The interactive viewer is a single-lane closed ring. Most settings are
+adjustable in the scrollable control list; lane count, car dimensions, and
+lane-changing settings stay fixed and hidden. Batch experiments can still vary
+any model parameter and write CSVs and figures.
 
 ![The viewer: a closed ring at density 80 - phantom jams appear as orange stripes moving backwards in the space-time diagram](docs/viewer.png)
 
@@ -26,22 +27,23 @@ python -m roundabout_sim.experiments sweep --x density=10:150:10 --series n_lane
 python -m pytest -q                   # test suite (~1.5 min)
 ```
 
-Every parameter can also be set from the command line, for example
-`python -m roundabout_sim --n_lanes 1 --n_arms 0 --density 80 --seed 3`.
-`--help` lists all of them.
+The viewer accepts flags for its adjustable settings and `--seed`; the seed
+makes the randomized settings reproducible. Use
+`python -m roundabout_sim --help` for viewer options. The experiments CLI
+continues to expose all model parameters.
 
 ## Things to try
 
 | Experiment | How | What you should see |
 |---|---|---|
 | **Phantom jams from nothing** | Entrances/exits = 0, Lanes = 1, Density 65, then slowly raise it to 85 | At 65-70 the flow is smooth. From about 75-80, stop-and-go waves appear spontaneously and drift backwards at about -3 m/s (orange stripes sloping down in the space-time diagram). This is a phase transition. |
-| **Reaction distance** | Closed ring, 1 lane, Density 80; Drivers → Reaction distance 10 → 20 → 50 m | This is how far ahead drivers pay attention. At 10 m they notice the car in front too late and brake violently: over half the cars are jammed, with dozens of harsh-braking episodes per minute. At 20-25 m phantom jams form. From about 40 m drivers ease off early and the waves die down. |
-| **Reaction time** | Drivers → Reaction time 0.3 → 1.0 s | Slower reactions make waves form at much lower density (from about 50 instead of 75-80 on a closed ring), cut peak flux by about a third and cause a lot of harsh braking. |
+| **Reaction distance** | Closed ring, 1 lane, Density 80; set Reaction distance to 10, 20, then 50 m | This is how far ahead drivers pay attention. At 10 m they notice the car in front too late and brake violently: over half the cars are jammed, with dozens of harsh-braking episodes per minute. At 20-25 m phantom jams form. From about 40 m drivers ease off early and the waves die down. |
+| **Reaction time** | In a batch run, use `--set reaction_time=0.3`, then `--set reaction_time=1.0` | Slower reactions make waves form at much lower density (from about 50 instead of 75-80 on a closed ring), cut peak flux by about a third and cause a lot of harsh braking. |
 | **Trigger a jam yourself** | Click any car (or press **B**) | The car brakes for 3 s. Near the threshold the disturbance grows into a wave that outlives it. |
 | **Are the backups natural?** | `python -m roundabout_sim.experiments run --baseline` | Repeats the run with exit chance 0 (same seed) and reports how much of the jamming the entrances/exits cause. At the defaults (density 50) it is all of it: the same ring without exits does not jam until about 75. |
-| **Speed variance** | Drivers → Speed variance 0 → 4 m/s | Bigger differences between drivers lower the flux at low density (slow drivers hold others up), cause more lane changes, and in this model slightly damp the waves. |
-| **Lanes and lane changing** | Road → Lanes 1-5; Lane chg tab → Lane-change chance, motive "random" | Lane changes are cut-ins that force the car behind to brake, which is another source of waves. |
-| **Initial spacing** | Start → uniform / clustered, once at Density 70 on a closed 1-lane ring and once at 50 | The average gap is set by Density. Just below the jam threshold an uneven start locks in jams that an even start barely forms (density 70: about 17 % against 5 % jammed). At 50 every start ends up the same within 1-2 min (watch Spacing (Gini) fall back). |
+| **Speed variance** | Set Speed variance between 0 and 2 m/s | Bigger differences between drivers lower the flux at low density (slow drivers hold others up) and, in this model, slightly damp the waves. |
+| **One lane, no entrances** | The viewer keeps one lane and a closed ring; compare with batch experiments using other road layouts | Lane changes and entries/exits are excluded from the viewer so the focus remains on traffic already on the ring. |
+| **Initial spacing** | Set Initial spacing to uniform or clustered, once at Density 70 on a closed 1-lane ring and once at 50 | The average gap is set by Density. Just below the jam threshold an uneven start locks in jams that an even start barely forms (density 70: about 17 % against 5 % jammed). At 50 every start ends up the same within 1-2 min (watch Spacing (Gini) fall back). |
 | **Many cars** | Ring radius 300, Car length 2, Lanes 5, Density 120 | About 1,150 cars, with dozens of jams forming and dissolving at once. |
 
 ## The viewer
@@ -53,13 +55,13 @@ flow. **C** switches to colouring by driver type or by lane.
 - A thin inner band shows how much of each sector of the road is covered.
 - An arrow points at the side where cars bunch up, shown only when they bunch
   more than chance would explain.
-- Stubs mark the entrances and exits.
+- The ring has no entrances or exits.
 - A detector line counts cars passing a point.
 
-The **controls** are in tabs: Road, Traffic, Drivers, Lane chg and Start.
-Sliders marked *rebuilds* restart the roundabout when you release them; all
-others change every driver live, and each change is marked on the charts.
-Hover over any control, chart or readout to see what it means.
+The **controls** include sliders for Density and Driver noise. Other model
+settings are randomized when the viewer starts and stay constant for the
+session, including when restarted with **R**. Hover over any control, chart or
+readout to see what it means.
 
 Keys:
 
@@ -87,13 +89,24 @@ The **live charts** share one time axis:
 
 ## Changeable variables
 
+This is the full model parameter set used by batch experiments. In the
+interactive viewer, controls are provided for the relevant settings, while
+Lanes are fixed at 1, Entrances / exits at 0, and car dimensions and lane
+changing are hidden. Settings are randomized once per launch and held across
+resets. The viewer's Ring radius slider ranges from 20 to 60 m and its Speed
+variance slider from 0 to 2 m/s. Reaction time, following gap, standstill gap,
+and cornering limit are randomized but not exposed as controls; lane changing,
+car dimensions, and entrance/exit-only settings are hidden as well. Max
+acceleration is fixed at 1.2 m/s², comfortable braking at 2 m/s², and reaction
+distance at 25 m.
+
 **Road** (changing these rebuilds the roundabout)
 
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
 | Lanes (`n_lanes`) | 3 | 1-5 | Number of concentric lanes on the ring. |
 | Entrances / exits (`n_arms`) | 4 | 0-8 | Evenly spaced entry/exit pairs on the outer lane (0 = closed ring). |
-| Ring radius (`radius`) | 80 m | 20-300 m | Centreline radius of the innermost lane. |
+| Ring radius (`radius`) | 80 m | Viewer: 20-60 m; batch: 20-300 m | Centreline radius of the innermost lane. |
 | Car length (`car_length`) | 4 m | 1-8 m | Space each car takes up along the lane. |
 
 **Traffic**
@@ -110,15 +123,15 @@ The **live charts** share one time axis:
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
 | Mean desired speed (`mean_speed`) | 12 m/s | 3-30 | Average speed drivers want to drive on a free road. |
-| Speed variance (`speed_std`) | 1.5 m/s | 0-6 | Spread of desired speeds between drivers (floored at half the mean). |
+| Speed variance (`speed_std`) | 1.5 m/s | Viewer: 0-2 m/s; batch: 0-6 m/s | Spread of desired speeds between drivers (floored at half the mean). |
 | Reaction time (`reaction_time`) | 0.4 s | 0-2 s | Delay between perceiving the traffic and acting on it. |
-| Reaction distance (`reaction_distance`) | 25 m | 10-100 m | How far ahead drivers pay attention. They react to every car within this distance (up to 5), so looking further ahead lets them ease off early and damps stop-and-go waves. Very short (10-15 m) and they notice the car in front too late and brake violently. |
+| Reaction distance (`reaction_distance`) | 25 m | Viewer fixed at 25 m; batch: 10-100 m | How far ahead drivers pay attention. They react to every car within this distance (up to 5), so looking further ahead lets them ease off early and damps stop-and-go waves. Very short (10-15 m) and they notice the car in front too late and brake violently. |
 | Following time gap (`time_headway`) | 1.2 s | 0.5-3 s | Desired time gap to the car in front. |
 | Standstill gap (`min_gap`) | 2 m | 0.5-5 m | Bumper-to-bumper gap kept in a stopped queue. |
-| Max acceleration (`max_accel`) | 1.2 m/s² | 0.3-4 | How briskly drivers speed up. |
-| Comfortable braking (`comfort_decel`) | 2 m/s² | 0.5-5 | Braking drivers are happy to use. |
-| Driver noise (`driver_noise`) | 0.35 m/s² | 0-1.5 | Random fluctuations in each driver's acceleration. More noise brings waves on earlier. |
-| Cornering limit (`lateral_accel`) | 4 m/s² | 1-10 | Comfortable sideways acceleration; it makes tight inner lanes slower. |
+| Max acceleration (`max_accel`) | 1.2 m/s² | Viewer fixed at 1.2 m/s²; batch: 0.3-4 m/s² | How briskly drivers speed up. |
+| Comfortable braking (`comfort_decel`) | 2 m/s² | Viewer fixed at 2 m/s²; batch: 0.5-5 m/s² | Braking drivers are happy to use. |
+| Driver noise (`driver_noise`) | 0.35 m/s² | 0-1.5 m/s² | Random fluctuations in each driver's acceleration. More noise brings waves on earlier. |
+| Cornering limit (`lateral_accel`) | 4 m/s² | 1-10 | Hidden in viewer; randomized each launch. Comfortable sideways acceleration; it makes tight inner lanes slower. |
 
 **Lane changing (Lane chg tab) and start**
 
@@ -129,8 +142,8 @@ The **live charts** share one time axis:
 | Politeness (`politeness`) | 0.3 | 0-1 | How much drivers weigh the braking they force on others. |
 | Initial spacing (`init_spacing`) | uniform | uniform / random / clustered | The average gap is set by Density. *uniform*: evenly spaced; *random*: random gaps; *clustered*: one packed queue across all lanes. Near the jam threshold an uneven start can lock in jams; elsewhere the effect fades within 1-2 min. |
 
-All parameters live in [`roundabout_sim/config.py`](roundabout_sim/config.py),
-which is the single source of truth for the sliders, the command-line flags and
+Parameter ranges and defaults live in
+[`roundabout_sim/config.py`](roundabout_sim/config.py), used by the viewer and
 the experiments CLI.
 
 ## How congestion is measured

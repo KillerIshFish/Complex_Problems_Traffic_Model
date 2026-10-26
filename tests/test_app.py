@@ -36,8 +36,8 @@ BIG_RING = dict(n_lanes=5, radius=300, car_length=2, min_gap=1, density=200)  # 
 def make_app(tmp_path):
     """Factory for viewers (fixed seed, screenshots into tmp_path); pygame is shut down afterwards."""
 
-    def make(size=SIZE, **config) -> viewer.App:
-        cfg = SimConfig(**{"seed": SEED, **config})
+    def make(size=SIZE, sim_config: SimConfig | None = None, **config) -> viewer.App:
+        cfg = sim_config or viewer.randomized_config(SEED).updated(**config)
         return viewer.App(cfg, size=size, results_dir=tmp_path / "results")
 
     yield make
@@ -92,11 +92,6 @@ def click(app: viewer.App, pos) -> None:
 
 def widget(app: viewer.App, kind: str, name: str) -> viewer.Widget:
     return next(w for w in app.widgets if w.kind == kind and w.name == name)
-
-
-def show_tab(app: viewer.App, group: str) -> None:
-    click(app, widget(app, "tab", group).rect.center)
-    assert app.group == group
 
 
 def slider_pos(w: viewer.Widget, value: float) -> tuple[int, int]:
@@ -197,7 +192,6 @@ def test_dragging_a_live_slider_changes_the_running_model(make_app):
     frames(app, 20)
     sim = app.sim
     gen, t0, target0 = sim.generation, sim.time, sim.target_cars()
-    show_tab(app, "Traffic")
     w = widget(app, "slider", "density")
     assert not w.spec.reset
     tol = 2 * (w.spec.hi - w.spec.lo) / w.track.w  # two pixels of track
@@ -217,71 +211,19 @@ def test_dragging_a_live_slider_changes_the_running_model(make_app):
     assert app.hist.array("time")[0] < t0  # history kept
 
 
-def test_dragging_the_exit_chance_to_zero_reroutes_every_car(make_app):
+def test_viewer_controls_most_settings_but_hides_fixed_or_irrelevant_ones(make_app):
     app = make_app()
-    frames(app, 10)
-    show_tab(app, "Traffic")
-    w = widget(app, "slider", "exit_prob")
-    frame(app, move(slider_pos(w, 0.1)), down(slider_pos(w, 0.1)), move((w.track.x - 20, w.track.centery)),
-          up((w.track.x - 20, w.track.centery)))
-    assert app.sim.cfg.exit_prob == 0.0
-    assert np.all(np.isinf(app.sim.exit_at[app.sim.alive]))
-
-
-def test_steps_per_frame_slider(make_app):
-    app = make_app()
-    w = widget(app, "slider", "steps_per_frame")
-    frame(app, move(slider_pos(w, 1)), down(slider_pos(w, 1)), move((w.track.right + 30, w.track.centery)))
-    assert app.steps_per_frame == int(w.spec.hi) == 20
-    frame(app, up((w.track.right + 30, w.track.centery)))
-    t = app.sim.time
-    frame(app)
-    assert app.sim.time == pytest.approx(t + 20 * app.sim.cfg.dt)
-    assert not app.markers  # viewer settings are not model changes
-
-
-def test_rebuilding_slider_applies_only_on_release(make_app):
-    app = make_app()
-    frames(app, 20)
-    sim = app.sim
-    gen = sim.generation
-    assert app.group == "Road"
-    w = widget(app, "slider", "n_lanes")
-    assert w.spec.reset
-    end = (w.track.right, w.track.centery)
-    frame(app, move(slider_pos(w, 3)), down(slider_pos(w, 3)), move(end))
-    assert app.value("n_lanes") == 5  # the slider shows the new value...
-    assert sim.cfg.n_lanes == 3 and sim.n_lanes == 3 and sim.generation == gen  # ...the model waits
-    assert sim.time == pytest.approx(21 * sim.cfg.dt)  # and keeps running meanwhile
-    frame(app, up(end))
-    assert sim.cfg.n_lanes == 5 and sim.n_lanes == 5
-    assert sim.generation == gen + 1
-    # The charts restart with the rebuilt roundabout.
-    assert sim.time == pytest.approx(sim.cfg.dt)
-    assert list(app.hist.array("time")) == [0.0]
-    assert not app.markers and not app.brakes
-    assert "lane4_cars" in app._latest_row()
-    assert app.ring.r_edge == pytest.approx(sim.r_out + sim.cfg.lane_width / 2)
-    frames(app, 10)
-    assert_layout_fits(app)
-
-
-def test_releasing_a_rebuilding_slider_at_its_value_does_not_rebuild(make_app):
-    app = make_app()
-    frames(app, 5)
-    w = widget(app, "slider", "n_arms")
-    gen = app.sim.generation
-    start = slider_pos(w, app.sim.cfg.n_arms)
-    frame(app, move(start), down(start), move((start[0] + 60, start[1])), move(start), up(start))
-    assert app.sim.generation == gen and app.sim.cfg.n_arms == 4
-    assert app.sim.time == pytest.approx(6 * app.sim.cfg.dt)
+    controls = {w.name for w in app.panel_widgets if w.kind in {"slider", "choice"}}
+    expected = {spec.name for spec in viewer.CONTROL_PARAMS} | {"colour_mode"}
+    assert controls == expected
+    sliders = {w.name for w in app.panel_widgets if w.kind == "slider"}
+    assert {"radius", "density", "mean_speed", "speed_std", "driver_noise"} <= sliders
+    assert not any(w.kind == "tab" for w in app.panel_widgets)
 
 
 def test_choice_buttons(make_app):
     app = make_app()
     frames(app, 10)
-    sim = app.sim
-    gen = sim.generation
 
     colours = widget(app, "choice", "colour_mode")
     click(app, option_pos(colours, "lane"))
@@ -300,21 +242,6 @@ def test_choice_buttons(make_app):
     app.handle(up(option_pos(colours, "speed")))
     assert app.colour_mode == "lane"
 
-    # A live model choice: applied at once, marked on the charts, no rebuild.
-    show_tab(app, "Lane chg")
-    motive = widget(app, "choice", "lane_change_motive")
-    click(app, option_pos(motive, "random"))
-    assert sim.cfg.lane_change_motive == "random" and sim.generation == gen
-    assert app.markers[-1][1] == "Lane-change motive advantage→random"
-    frame(app)
-
-    # A rebuilding choice: restarts the roundabout and the charts.
-    show_tab(app, "Start")
-    spacing = widget(app, "choice", "init_spacing")
-    click(app, option_pos(spacing, "clustered"))
-    assert sim.cfg.init_spacing == "clustered" and sim.generation == gen + 1
-    assert sim.cfg.lane_change_motive == "random"  # earlier live change survives the rebuild
-    assert not app.markers and sim.time == 0.0
     frames(app, 5)
     assert app.colour_mode == "lane" and app.spacetime_mode == "occupancy"
 
@@ -473,27 +400,19 @@ def test_window_resize_relays_out_everything(make_app, size):
 
 def test_wheel_scrolls_the_parameter_list(make_app):
     app = make_app()
-    show_tab(app, "Drivers")
     overflow = app.content_h - app.content_rect.h
     assert overflow > 0
-    first = widget(app, "slider", "mean_speed")
-    y0 = first.rect.y
+    assert app.scroll == 0
     frame(app, move(app.content_rect.center), wheel(-1))
     assert app.scroll > 0
-    assert widget(app, "slider", "mean_speed").rect.y == y0 - app.scroll
     for _ in range(30):
         app.handle(wheel(-3))
-    assert app.scroll == overflow  # stops at the end of the list
+    assert app.scroll == overflow
     frame(app)
-    # The last slider is reachable now and still works.
-    last = widget(app, "slider", "lateral_accel")
+    last = widget(app, "choice", "init_spacing")
     assert app.content_rect.contains(last.rect)
-    target = slider_pos(last, 8.0)
-    frame(app, move(target), down(target), up(target))
-    assert app.sim.cfg.lateral_accel == pytest.approx(8.0, abs=0.5)
-    for _ in range(30):
-        app.handle(wheel(3))
-    assert app.scroll == 0
+    click(app, option_pos(last, "clustered"))
+    assert app.sim.cfg.init_spacing == "clustered"
 
 
 def test_hover_help_for_charts_view_controls_and_readouts(make_app):
@@ -509,14 +428,10 @@ def test_hover_help_for_charts_view_controls_and_readouts(make_app):
     frame(app, move(app.ring.rect.move(3, 3).topleft))
     assert app._status_text() == viewer.VIEW_HELP
 
-    show_tab(app, "Traffic")
-    density = widget(app, "slider", "density")
-    frame(app, move(density.rect.center))
-    assert app._status_text().startswith("Density: ")
-    show_tab(app, "Road")
-    lanes = widget(app, "slider", "n_lanes")
-    frame(app, move(lanes.rect.center))
-    assert "rebuilds the roundabout" in app._status_text()
+    for name, label in (("density", "Density"), ("driver_noise", "Driver noise")):
+        control = widget(app, "slider", name)
+        frame(app, move(control.rect.center))
+        assert app._status_text().startswith(f"{label}: ")
 
     rect, help_text = app.stat_hits[0]
     frame(app, move(rect.center))
@@ -568,17 +483,40 @@ def test_big_ring_of_about_2000_small_cars(make_app):
 
 
 def test_command_line_options():
-    args = viewer.parse_args(["--seed", "5", "--size", "1280x720", "--n-lanes", "2", "--density", "70",
-                              "--init_spacing", "clustered", "--reaction-distance", "40"])
+    args = viewer.parse_args([
+        "--seed", "5", "--size", "1280x720", "--density", "70", "--driver-noise", "0.5",
+        "--radius", "50", "--speed-std", "1.5", "--mean-speed", "18", "--init-spacing", "clustered",
+    ])
     assert args.size == (1280, 720)
     cfg = viewer.config_from_args(args)
-    assert cfg == SimConfig(seed=5, n_lanes=2, density=70.0, init_spacing="clustered", reaction_distance=40.0)
-    assert isinstance(cfg.n_lanes, int)
-    assert viewer.config_from_args(viewer.parse_args([])) == SimConfig()
-    for bad in (["--size", "big"], ["--init_spacing", "diagonal"], ["--density", "lots"]):
+    assert cfg == viewer.randomized_config(5).updated(
+        density=70.0, driver_noise=0.5, radius=50, speed_std=1.5, mean_speed=18, init_spacing="clustered")
+    assert cfg.n_lanes == 1 and cfg.n_arms == 0
+    assert cfg.density == 70.0 and cfg.driver_noise == 0.5 and cfg.radius == 50
+    default_cfg = viewer.config_from_args(viewer.parse_args([]))
+    assert default_cfg.n_lanes == 1 and default_cfg.n_arms == 0
+    assert default_cfg.density == SimConfig().density
+    assert default_cfg.driver_noise == SimConfig().driver_noise
+    for bad in (["--size", "big"], ["--n-lanes", "2"], ["--density", "lots"],
+                ["--lane-change-rate", "0.5"], ["--car-length", "4"], ["--reaction-time", "0.4"],
+                ["--time-headway", "1.2"], ["--min-gap", "2"], ["--lateral-accel", "4"],
+                ["--max-accel", "1.2"], ["--comfort-decel", "2"], ["--reaction-distance", "25"]):
         with pytest.raises(SystemExit) as exc:
             viewer.parse_args(bad)
         assert exc.value.code == 2
+
+
+def test_hidden_random_settings_are_seeded_and_stay_constant_on_reset(make_app):
+    cfg = viewer.randomized_config(5, density=70, driver_noise=0.5)
+    assert cfg == viewer.randomized_config(5, density=70, driver_noise=0.5)
+    assert 20 <= cfg.radius <= 60
+    assert 0 <= cfg.speed_std <= 2
+    assert all(viewer.randomized_config(seed).speed_std <= 2 for seed in range(20))
+    assert {name: getattr(cfg, name) for name in viewer.FIXED_PARAMS} == viewer.FIXED_PARAMS
+    app = make_app(sim_config=cfg)
+    app.action("reset")
+    assert app.sim.cfg == cfg
+    assert app.sim.n_lanes == 1 and app.sim.n_arms == 0
 
 
 def test_charts_read_in_order_with_the_new_measures(make_app):
@@ -631,15 +569,15 @@ def test_header_readouts_have_their_own_help(make_app):
     assert "upper bound" in viewer.JAMS_HELP and "Exit chance = 0" in viewer.JAMS_HELP
 
 
-def test_tabs_have_readable_tooltips(make_app):
+def test_fixed_parameters_have_no_controls(make_app):
     app = make_app()
-    for group in viewer.GROUPS:
-        w = widget(app, "tab", group)
-        frame(app, move(w.rect.center))
-        assert app._status_text() == w.help == viewer.tab_help(group)
-        assert w.help.startswith("Show the ") and "chg" not in w.help
-    assert widget(app, "tab", "Lane chg").help == "Show the lane-changing parameters."
-    assert viewer.tab_help("Other stuff") == "Show the other stuff parameters."  # a future group
+    controls = {w.name for w in app.panel_widgets if w.kind in {"slider", "choice"}}
+    expected = {spec.name for spec in viewer.CONTROL_PARAMS} | {"colour_mode"}
+    assert controls == expected
+    assert not any(w.kind == "tab" for w in app.panel_widgets)
+    assert not controls & viewer.HIDDEN_PARAMS
+    assert {"reaction_time", "time_headway", "min_gap", "lateral_accel", "max_accel",
+            "comfort_decel", "reaction_distance"} <= viewer.HIDDEN_PARAMS
 
 
 @pytest.mark.parametrize("size", [SIZE, (1600, 900), (2400, 1300)])
@@ -708,7 +646,6 @@ def test_marker_labels_keep_the_newest_and_hovering_names_any(make_app, monkeypa
 def test_save_csv_writes_the_chart_data_and_the_settings(make_app, tmp_path):
     app = make_app()
     frames(app, 30)
-    show_tab(app, "Traffic")
     w = widget(app, "slider", "density")
     frame(app, move(slider_pos(w, 50)), down(slider_pos(w, 50)), move(slider_pos(w, 80)), up(slider_pos(w, 80)))
     frames(app, 10)
@@ -736,7 +673,7 @@ def test_save_csv_writes_the_chart_data_and_the_settings(make_app, tmp_path):
 
     text = latest.with_name(f"{latest.stem}_settings.txt").read_text(encoding="utf-8")
     assert f"(seed {SEED})" in text and f"density = {sim.cfg.density:g}" in text
-    assert "reaction_distance = 25" in text and "last 10 min" in text
+    assert f"reaction_distance = {sim.cfg.reaction_distance:g}" in text and "last 10 min" in text
     when, label = app.markers[-1]
     assert f"{when:8.1f} s  {label}" in text and label.startswith("Density 50→")
     command = next(line.strip() for line in text.splitlines()
@@ -745,4 +682,4 @@ def test_save_csv_writes_the_chart_data_and_the_settings(make_app, tmp_path):
     assert args.seed == SEED and args.duration == pytest.approx(sim.time)
     changes = {name: coerce(name, value) for name, value in args.set}
     assert SimConfig(seed=args.seed).updated(**changes) == sim.cfg  # reruns the final settings
-    assert set(changes) == {"density"}  # only what differs from the defaults
+    assert changes["density"] == sim.cfg.density

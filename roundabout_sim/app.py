@@ -1,7 +1,7 @@
-"""Interactive viewer for the roundabout traffic model.
+"""Interactive viewer for the single-lane closed-ring traffic model.
 
-Run ``python -m roundabout_sim`` (``--help`` lists one flag per model
-parameter, e.g. ``--density 80 --n_lanes 4``). The left view draws the ring
+Run ``python -m roundabout_sim`` (``--help`` lists the model settings you can
+change, e.g. ``--density 80 --driver-noise 0.5``). The left view draws the ring
 at true scale; the panel on the right changes parameters while the model
 runs; the live charts (the last 10 minutes) track speed, congestion over
 time, stop-and-go, flux and how the cars congregate, and the space-time
@@ -15,16 +15,26 @@ C cycle car colours, S save a screenshot to results/, D save the chart data
 command), Esc quit.
 """
 
+# Viewer setup: n_lanes=1, n_arms=0, car_width=1.8 m, dt=0.1 s. Hidden
+# randomized settings: car_length 1-8 m; exit_prob 0-1, entry_gap 1.5-6 s,
+# turn_speed 2-15 m/s; lane_change_rate 0-1 /s, lane_change_motive
+# advantage/random, politeness 0-1; reaction_time 0-2 s, time_headway 0.5-3 s,
+# min_gap 0.5-5 m, lateral_accel 1-10 m/s2. Entrance/exit settings have no
+# effect on the closed ring.
+# Other settings are randomized once per launch and stay fixed on reset;
+# max_accel=1.2 m/s2, comfort_decel=2 m/s2 and reaction_distance=25 m are fixed.
+
 from __future__ import annotations
 
 import argparse
 import ctypes
 import math
 import os
+import random
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +57,16 @@ FONT_FACE = "segoeui,helveticaneue,arial"
 WINDOW = f"{metrics.RATE_WINDOW:g} s"
 UI = palette.UI
 EMPTY = UI["surface"]  # space-time bins without cars
-GROUPS = tuple(dict.fromkeys(p.group for p in PARAMS))
+HIDDEN_PARAMS = frozenset({
+    "n_lanes", "n_arms", "car_length", "car_width", "exit_prob", "entry_gap", "turn_speed",
+    "lane_change_rate", "lane_change_motive", "politeness", "reaction_time", "time_headway", "min_gap",
+    "lateral_accel", "max_accel", "comfort_decel", "reaction_distance",
+})
+FIXED_PARAMS = {"max_accel": 1.2, "comfort_decel": 2.0, "reaction_distance": 25.0}
+CONTROL_PARAMS = tuple(
+    replace(p, hi={"radius": 60, "speed_std": 2}.get(p.name, p.hi))
+    for p in PARAMS if p.name not in HIDDEN_PARAMS
+)
 
 # Viewer settings use the same spec type as model parameters, so they get the
 # same widgets; group "View" keeps them out of the model's tabs.
@@ -78,20 +97,6 @@ BUTTON_ROWS = (("pause", "step", "reset", "brake"), ("clear", "screenshot", "csv
 
 DEFAULT_HINT = ("Click a car to make it brake.  Space pause  ·  R reset  ·  B brake  ·  "
                 "+/- speed  ·  C colours  ·  S screenshot  ·  D data (CSV)  ·  Esc quit")
-
-# Tooltips of the parameter tabs (groups from config.PARAMS; others get a generic one).
-TAB_HELP = {
-    "Road": "Show the road parameters; changing them rebuilds the roundabout.",
-    "Traffic": "Show the traffic parameters: density, exits and entering.",
-    "Drivers": "Show the driver parameters: speeds, reactions, following and noise.",
-    "Lane chg": "Show the lane-changing parameters.",
-    "Start": "Show the initial-state parameters: how the cars are spaced at the start.",
-}
-
-
-def tab_help(group: str) -> str:
-    return TAB_HELP.get(group, f"Show the {group.lower()} parameters.")
-
 
 def control_help(spec: ParamSpec) -> str:
     """Help shown for a slider or choice."""
@@ -214,8 +219,8 @@ STAT_HELP = {
 
 def help_texts() -> list[str]:
     """Every fixed help text the status box can show (it is sized to fit the longest)."""
-    texts = [help_text for _, _, help_text in BUTTONS] + [tab_help(group) for group in GROUPS]
-    texts += [control_help(spec) for spec in (*PARAMS, *VIEW_PARAMS.values())]
+    texts = [help_text for _, _, help_text in BUTTONS]
+    texts += [control_help(spec) for spec in (*CONTROL_PARAMS, VIEW_PARAMS["colour_mode"])]
     texts += [spec.help for spec in CHARTS] + list(EXTRA_HELP.values())
     texts += [f"{'Lane 8 outer' if label == 'Lane' else label}: {text}" for label, text in STAT_HELP.items()]
     return texts + [SPACETIME_HELP, VIEW_HELP, DEFAULT_HINT]
@@ -354,7 +359,7 @@ class Fonts:
 
 @dataclass
 class Widget:
-    kind: str  # "button", "slider", "choice" or "tab"
+    kind: str  # "button", "slider" or "choice"
     name: str  # action, parameter or group name
     rect: pygame.Rect  # hover area
     spec: ParamSpec | None = None
@@ -645,7 +650,7 @@ class App:
         pygame.init()
         pygame.display.set_caption("Roundabout traffic model")
         self.screen = pygame.display.set_mode(size or _initial_size(), pygame.RESIZABLE)
-        self.sim = RingSim(config)
+        self.sim = RingSim(config if config is not None else randomized_config())
         self.rec = metrics.Recorder(self.sim, SAMPLE_INTERVAL, maxlen=int(HISTORY / SAMPLE_INTERVAL))
         self.hist = History(self.rec.maxlen)
         self.results_dir = Path(results_dir)
@@ -654,7 +659,6 @@ class App:
         self.steps_per_frame = 1
         self.colour_mode = "speed"
         self.spacetime_mode = "speed"
-        self.group = GROUPS[0]
         self.scroll = 0
         self.drag: Drag | None = None
         self.pressed: tuple[Widget, int] | None = None  # button or choice option under a held click
@@ -793,24 +797,18 @@ class App:
                 rect = pygame.Rect(left, y + row * (bh + gap), right - left, bh)
                 self.panel_widgets.append(Widget("button", name, rect, help=helps[name]))
         y += len(BUTTON_ROWS) * (bh + gap) - gap + round(14 * s)
-        for spec in (VIEW_PARAMS["steps_per_frame"], VIEW_PARAMS["colour_mode"]):
+        for spec in (VIEW_PARAMS["colour_mode"],):
             y = self._add_control(spec, x, y, w, scrolls=False)
         y += round(4 * s)
-        th = f.line("base") + round(8 * s)
-        tw = w / len(GROUPS)
-        for i, group in enumerate(GROUPS):
-            rect = pygame.Rect(round(x + i * tw), y, round(tw), th)
-            self.panel_widgets.append(Widget("tab", group, rect, help=tab_help(group)))
-        y += th + round(10 * s)
+        y += round(10 * s)
         self.status_lines = self._status_lines(w)
         status_h = self.status_lines * f.line("small") + round(12 * s)
         self.status_rect = pygame.Rect(x, r.bottom - p - status_h, w, status_h)
         self.content_rect = pygame.Rect(r.x, y, r.w, self.status_rect.y - round(8 * s) - y)
-        specs = [spec for spec in PARAMS if spec.group == self.group]
-        self.content_h = sum(self._control_height(spec) for spec in specs)
+        self.content_h = sum(self._control_height(spec) for spec in CONTROL_PARAMS)
         self.scroll = int(np.clip(self.scroll, 0, max(0, self.content_h - self.content_rect.h)))
         y -= self.scroll
-        for spec in specs:
+        for spec in CONTROL_PARAMS:
             y = self._add_control(spec, x, y, w, scrolls=True)
 
     def _status_lines(self, width: int) -> int:
@@ -1068,11 +1066,7 @@ class App:
                 self.sim.brake(slot)
                 self._record_brake(slot)
             return
-        if w.kind == "tab":
-            if w.name != self.group:
-                self.group, self.scroll = w.name, 0
-                self._layout_panel()
-        elif w.kind == "slider":
+        if w.kind == "slider":
             if w.track.inflate(2 * round(8 * self.s), round(20 * self.s)).collidepoint(pos):
                 start = self.value(w.name)
                 self.drag = Drag(w, start, start)
@@ -1167,7 +1161,6 @@ class App:
 
     def _draw_view(self, row: dict) -> None:
         sim, f = self.sim, self.fonts
-        cfg = sim.cfg
         if self.ring is None:
             self.ring = RingView(sim, self.view_rect, f)
         snap = sim.cars()
@@ -1176,9 +1169,7 @@ class App:
         self.ring.draw(self.screen, sim, snap, self._car_colours(snap), f, row, hovered)
         pad = round(10 * self.s)
         x, y = self.view_rect.x + pad, self.view_rect.y + pad
-        f.blit(self.screen, f"{sim.n_lanes} lane{'s' if sim.n_lanes > 1 else ''}  ·  "
-                            f"{sim.n_arms or 'no'} entrance{'s' if sim.n_arms != 1 else ''}/exit"
-                            f"{'s' if sim.n_arms != 1 else ''}  ·  radius {cfg.radius:g} m",
+        f.blit(self.screen, f"{sim.n_lanes} lane{'s' if sim.n_lanes > 1 else ''}  ·  closed ring",
                (x, y), "small", UI["muted"])
         if self.paused:
             f.blit(self.screen, "PAUSED", (self.view_rect.right - pad, y), "base", UI["text"], "topright")
@@ -1735,8 +1726,6 @@ class App:
                 continue
             if w.kind == "button":
                 self._draw_button(w)
-            elif w.kind == "tab":
-                self._draw_tab(w)
             else:
                 self._draw_control(w)
         scr.set_clip(self.content_rect)
@@ -1762,14 +1751,6 @@ class App:
         if w.name == "pause" and self.paused:
             label = "Play"
         f.blit(scr, label, w.rect.center, "small", UI["text"], "center")
-
-    def _draw_tab(self, w: Widget) -> None:
-        f, scr = self.fonts, self.screen
-        active = w.name == self.group
-        colour = UI["text"] if active else UI["text2"] if w.rect.collidepoint(self.mouse) else UI["muted"]
-        f.blit(scr, w.name, w.rect.center, "small", colour, "center")
-        pygame.draw.line(scr, UI["accent"] if active else UI["grid"], (w.rect.x, w.rect.bottom - 1),
-                         (w.rect.right - 1, w.rect.bottom - 1), 2 if active else 1)
 
     def _draw_control(self, w: Widget) -> None:
         f, s, scr, spec = self.fonts, self.s, self.screen, w.spec
@@ -1861,9 +1842,30 @@ def _window_size(text: str) -> tuple[int, int]:
     return w, h
 
 
+def randomized_config(seed: int | None = None, *, density: float | None = None,
+                      driver_noise: float | None = None) -> SimConfig:
+    """Choose model settings once; hidden road topology and car dimensions stay fixed."""
+    rng = random.Random(seed)
+    changes = {"n_lanes": 1, "n_arms": 0}
+    for spec in PARAMS:
+        if spec.name in {"n_lanes", "n_arms", "density", "driver_noise", *FIXED_PARAMS}:
+            continue
+        if spec.choices:
+            changes[spec.name] = rng.choice(spec.choices)
+        else:
+            hi = {"radius": 60, "speed_std": 2}.get(spec.name, spec.hi)
+            steps = round((hi - spec.lo) / spec.step)
+            changes[spec.name] = round(spec.lo + rng.randrange(steps + 1) * spec.step, 6)
+    if density is not None:
+        changes["density"] = density
+    if driver_noise is not None:
+        changes["driver_noise"] = driver_noise
+    return SimConfig(seed=seed).updated(**changes)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="python -m roundabout_sim", description="Interactive multi-lane roundabout traffic model.",
+        prog="python -m roundabout_sim", description="Interactive single-lane closed-ring traffic model.",
         epilog=f"Keys: Space pause, R reset (new seed), B brake a random car, +/- sim speed, C car colours, "
                f"S save a screenshot, D save the chart data ({HISTORY_TEXT}) as CSV with a settings file "
                "(settings, live changes, equivalent experiments command), Esc quit. Files go to results/. "
@@ -1872,7 +1874,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--size", type=_window_size, default=None, metavar="WxH",
                         help="window size in pixels (default: 90%% of the screen)")
     defaults = SimConfig()
-    for spec in PARAMS:
+    for spec in CONTROL_PARAMS:
         flags = [f"--{spec.name}"] + ([f"--{spec.name.replace('_', '-')}"] if "_" in spec.name else [])
         default = getattr(defaults, spec.name)
         text = f"{spec.label}: {spec.help} (default {default})".replace("%", "%%")
@@ -1887,8 +1889,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def config_from_args(args: argparse.Namespace) -> SimConfig:
     changes = {spec.name: coerce(spec.name, getattr(args, spec.name))
-               for spec in PARAMS if getattr(args, spec.name) is not None}
-    return SimConfig(seed=args.seed).updated(**changes)
+               for spec in CONTROL_PARAMS if getattr(args, spec.name) is not None}
+    return randomized_config(args.seed).updated(**changes)
 
 
 def main(argv: list[str] | None = None) -> None:
