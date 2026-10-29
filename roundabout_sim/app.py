@@ -53,9 +53,9 @@ import pygame
 from roundabout_sim import cli, metrics, palette, presets, state
 from roundabout_sim.config import (NEEDS_NONZERO, PARAM_BY_NAME, PARAMS, ParamSpec, SimConfig, coerce,
                                    inactive_reason, same_value)
-from roundabout_sim.engine import (MAX_DECEL, MAX_QUEUE, RESUME_FRACTION, SLOW_FRACTION, TRUCK_ACCEL_FACTOR,
-                                   TRUCK_HEADWAY_FACTOR, TRUCK_SPEED_FACTOR, TRUCK_WIDTH, TWO_PI, RingSim,
-                                   StateError)
+from roundabout_sim.engine import (MAX_DECEL, MAX_QUEUE, RESUME_FRACTION, SLOW_FRACTION, SUBJECT_ARM,
+                                   TRUCK_ACCEL_FACTOR, TRUCK_HEADWAY_FACTOR, TRUCK_SPEED_FACTOR, TRUCK_WIDTH, TWO_PI,
+                                   RingSim, StateError)
 from roundabout_sim.textfmt import (DISPLAY_DIGITS, decimals, format_number, plural,  # noqa: F401 (also app's API)
                                     value_text)
 from roundabout_sim.ui import (FONT_FACE, MIN_WINDOW, STATUS_LINES, Fonts, Messages, clamp_resize,  # noqa: F401
@@ -152,7 +152,7 @@ TAB_HELP = {
     "Road": "Show the road parameters: the layout (changing it rebuilds the roundabout) and the road condition.",
     "Traffic": "Show the traffic parameters: density, exits and entering.",
     "Demand": "Show the demand parameters: a closed ring of cars or open arrivals at the entrances, how many "
-              "arrive and when, and how long the queues can grow.",
+              "arrive and when, how long the queues can grow, and the capacity test (a saturated test entrance).",
     "Vehicles": "Show the vehicle parameters: the share and length of trucks (changing them rebuilds the "
                 "roundabout).",
     "Drivers": "Show the driver parameters: speeds, reactions, following and noise, and how much drivers differ.",
@@ -274,7 +274,8 @@ VIEW_HELP = ("Click a car to make it brake hard for 3 s; hover one for its detai
              "gives the demand per entrance in veh/h.")
 QUEUE_TAG_HELP = ("Queue: cars waiting at this entrance. The stub shows only as many as fit (on a big ring they "
                   "are too small to count), so longer queues get this count. Red and marked full: the queue has "
-                  "reached Max queue and turns further arrivals away (Blocked).")
+                  "reached Max queue and turns further arrivals away (Blocked). Marked test: the capacity test's "
+                  "entrance, its queue kept full whatever Max queue.")
 
 STAT_HELP = {
     "Sim time": "Simulated time since the last reset or rebuild.",
@@ -284,7 +285,8 @@ STAT_HELP = {
     "Queued to enter": f"Cars waiting at the entrances (at most {MAX_QUEUE} each; further replacements for "
                        "leavers are slotted straight into the ring).",
     "Queued to enter (open)": "Cars waiting at all the entrances now, and (max) at the longest queue (at most Max "
-                              "queue each; arrivals that find it full are turned away as blocked).",
+                              "queue each; arrivals that find it full are turned away as blocked). The capacity "
+                              "test's standing queue is left out.",
     "Density": "Cars on the ring per km of lane.",
     "Area covered": "Share of the road surface (all lanes) covered by vehicles.",
     "Trucks": f"Trucks on the ring now, their share of the vehicles and their mean speed. {TRUCK_TEXT}",
@@ -322,7 +324,8 @@ STAT_HELP = {
     "Arrivals": f"Cars arriving at the entrances per minute, over the last {WINDOW}: at random, blocked ones "
                 "included. Their mean is the Entrance chance × 60 per entrance, shaped by the demand profile.",
     "Entries": f"Cars entering the ring from the queues per minute, over the last {WINDOW}. While it stays below "
-               "Arrivals − Blocked the queues are growing.",
+               "Arrivals − Blocked the queues are growing (the capacity test's entries come on top: they are not "
+               "arrivals).",
     "Blocked": f"Arrivals per minute, over the last {WINDOW}, that found their queue full (Max queue) and were "
                "turned away: spill-back onto the approach roads.",
     "Lane": "Mean speed and number of cars in this lane (lane 1 is the inner lane).",
@@ -773,13 +776,14 @@ class RingView:
     def _draw_queues(self, screen: pygame.Surface, sim: RingSim, fonts: Fonts) -> None:
         """Queued vehicles on each entry stub, trucks at their length. A queue longer than the stub,
         or any queue when the cars are too small to count (big rings), gets its count at the stub's
-        end on a raised tag (red and marked "full" once it is at the limit and turns arrivals away);
-        ``tag_rects`` keeps the tags for their hover help."""
+        end on a raised tag (red and marked "full" once it is at the limit and turns arrivals away;
+        marked "test" at the capacity test's entrance); ``tag_rects`` keeps the tags for their hover help."""
         cfg = sim.cfg
         countable = (cfg.car_length + cfg.min_gap) * self.k >= QUEUE_MIN_PX
         xs, ys, hs, kinds, tags = [], [], [], [], []
         for arm, (a, q) in enumerate(zip(sim.arm_angle, sim.queue)):
             q = int(q)
+            test = sim.subject and arm == SUBJECT_ARM  # the capacity test's queue: kept full, never "full"
             # Oldest first from the road outwards; (a queue edited by hand may lack the types: cars).
             trucks = np.zeros(q, dtype=bool)
             types = list(sim.queue_trucks[arm])[:q]
@@ -793,7 +797,7 @@ class RingView:
             hs.append(np.full(shown, a + np.pi))
             kinds.append(trucks[:shown])
             if q > shown or (q > 0 and not countable):
-                tags.append((a, q))
+                tags.append((a, q, test))
         if xs and sum(len(x) for x in xs):
             trucks = np.concatenate(kinds)
             polys = self.car_polygons(np.concatenate(xs), np.concatenate(ys), np.concatenate(hs),
@@ -802,10 +806,10 @@ class RingView:
             for poly in polys.tolist():
                 pygame.draw.polygon(screen, UI["text2"], poly)  # light enough to see on the grey stub
         self.tag_rects = []
-        for a, q in tags:
-            full = sim.open_demand and q >= sim.queue_limit
+        for a, q, test in tags:
+            full = sim.open_demand and q >= sim.queue_limit and not test
             colour = palette.CRITICAL if full else UI["text"]
-            text = fonts.render(f"{q} full" if full else str(q), "small", colour)
+            text = fonts.render(f"{q} full" if full else f"{q} test" if test else str(q), "small", colour)
             pos = self.point(self.r_edge + self.stub + 4 / self.k, self.arm_offset, a)
             box = text.get_rect(**{anchor_out(a): (round(pos[0]), round(pos[1]))})
             pygame.draw.rect(screen, UI["raised"], box.inflate(6, 2), border_radius=3)
@@ -2014,14 +2018,20 @@ class App(Messages):
         if not sim.n_arms:
             return ["  ·  open", ""]
         rate, peak, uneven = 3600 * cfg.entry_rate, cfg.demand_profile == "peak", cfg.demand_imbalance > 0
+        # The capacity test's entrance gets no arrivals (its queue is kept full): the others' demand, and a note.
+        other, test, short_test = ("other ", "  ·  capacity test at the bottom entrance", "  ·  capacity test") \
+            if sim.subject else ("", "", "")
         if not (peak or uneven):
-            return [f"  ·  open: {rate:.0f} veh/h at each entrance", f"  ·  open: {rate:.0f} veh/h each",
-                    "  ·  open", ""]
-        main = rate * float(sim.demand_weight.max())  # the main road's mean
-        detail = ", ".join([f"main road {main:.0f}"] * uneven + ["peak profile"] * peak)
-        short = ", ".join([f"main {main:.0f}"] * uneven + ["peak"] * peak)
-        return [f"  ·  open: {rate:.0f} veh/h per entrance on average ({detail})",
-                f"  ·  open: {rate:.0f} veh/h mean ({short})", f"  ·  open: {rate:.0f} veh/h mean", "  ·  open", ""]
+            texts = [f"  ·  open: {rate:.0f} veh/h at each {other}entrance{test}",
+                     f"  ·  open: {rate:.0f} veh/h each{short_test}", f"  ·  open{short_test}"]
+        else:
+            main = rate * float(sim.demand_weight.max())  # the main road's mean
+            detail = ", ".join([f"main road {main:.0f}"] * uneven + ["peak profile"] * peak)
+            short = ", ".join([f"main {main:.0f}"] * uneven + ["peak"] * peak)
+            texts = [f"  ·  open: {rate:.0f} veh/h per {other}entrance on average ({detail}){test}",
+                     f"  ·  open: {rate:.0f} veh/h mean ({short}){short_test}",
+                     f"  ·  open: {rate:.0f} veh/h mean{short_test}"]
+        return list(dict.fromkeys(texts + ["  ·  open", ""]))
 
     def _car_tooltip(self, slot: int) -> None:
         sim, f, s = self.sim, self.fonts, self.s

@@ -33,6 +33,10 @@ Vehicles
   * ``trucks`` - trucks on the ring; ``truck_speed`` / ``car_speed`` - mean
     speed of the trucks and of the other vehicles (NaN if there are none).
 
+Lanes
+  * ``lane{k}_cars``, ``lane{k}_speed``, ``lane{k}_speed_std`` - cars on lane
+    k (0 = innermost), their mean speed and its spread (NaN on an empty lane).
+
 Space ("do cars congregate on one side?")
   * ``occupancy`` - share of the road surface covered by vehicles (their real
     lengths and widths).
@@ -68,6 +72,10 @@ Entrances ("how long do arriving cars wait?")
     can let in, and the level of service is F whatever the delay.
   * ``throughput_per_h`` - cars leaving the ring per hour.
 
+In the capacity test (``subject_arm`` on) the test entrance's standing queue
+is an instrument, not traffic: ``queued``, ``longest_queue`` and
+``mean_entry_delay`` leave it out (``entries_per_min`` counts its entries).
+
 Every arrival ends up entered, still queued, blocked or given up (a queued
 car dropped when Max queue or Density is lowered live: ``RingSim.n_gave_up``).
 
@@ -75,7 +83,8 @@ car dropped when Max queue or Density is lowered live: ``RingSim.n_gave_up``).
 space-time diagram (mean speed per angular bin over time) and per-sector
 occupancy, for the live charts and the experiment plots. Its samples are
 saved and restored with the simulation (``Recorder.state_dict`` /
-``load_state``; files: :mod:`roundabout_sim.state`).
+``load_state``; files: :mod:`roundabout_sim.state`); samples saved before a
+key was added get it filled in (ADDED_KEYS).
 """
 
 from __future__ import annotations
@@ -87,7 +96,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from roundabout_sim.engine import LOG_HORIZON, SLOW_FRACTION, TRUCK_WIDTH, TWO_PI, RingSim, StateError
+from roundabout_sim.engine import LOG_HORIZON, SLOW_FRACTION, SUBJECT_ARM, TRUCK_WIDTH, TWO_PI, RingSim, StateError
 
 SECTORS = 24  # sectors for the clustering index and the occupancy ring
 SPACETIME_BINS = 180  # 2-degree bins for the space-time diagram
@@ -97,6 +106,11 @@ MISSING, FLOAT, INT, BOOL, TEXT, NONE = range(6)
 # 0.5 s), and how many intervals its next sample may be overdue (a recorder not updated for a while).
 MIN_INTERVAL = 1e-3
 MAX_CATCH_UP = 1_000_000
+# Snapshot keys added after the first saved states, with the value the rows saved before them get:
+# Recorder.load_state fills a key only when no saved row has it (one that some rows lack is damaged). A key
+# with "{k}" stands for one per lane, filled for the lanes the rows have (their lane{k}_cars). Viewer code
+# reads these keys with row.get, so a row made elsewhere without them still draws.
+ADDED_KEYS: dict[str, float] = {"lane{k}_speed_std": float("nan")}
 
 
 RATE_WINDOW = 30.0  # [s] default window for rolling rates
@@ -326,11 +340,13 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
     n = idx.size
     cfg = sim.cfg
     t = sim.time
+    test = getattr(sim, "subject", False)  # the capacity test's queue is left out of the queue measures
+    queue = np.delete(sim.queue, SUBJECT_ARM) if test else sim.queue
     row = {
         "time": t,
         "cars": n,
-        "queued": int(sim.queue.sum()),
-        "longest_queue": int(sim.queue.max()) if sim.queue.size else 0,
+        "queued": int(queue.sum()),
+        "longest_queue": int(queue.max()) if queue.size else 0,
         "density": n / sim.total_lane_length * 1000.0,  # veh/km/lane
     }
     if n == 0:
@@ -389,7 +405,7 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
     )
     trips = [trip for when, _, trip in sim.exit_log if when >= t - window]
     row["mean_trip_time"] = float(np.mean(trips)) if trips else float("nan")
-    waits = [wait for _, _, wait in _since(sim.entry_log, t - window)]
+    waits = [wait for _, arm, wait in _since(sim.entry_log, t - window) if not (test and arm == SUBJECT_ARM)]
     row.update(
         arrivals_per_min=60.0 * _rolling_rate(sim.arrival_log, t, window),
         demand_per_min=60.0 * float(sim.arrival_rates().sum()) if sim.open_demand else float("nan"),
@@ -399,11 +415,25 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
         entry_vc=_rolling_entry_vc(sim, window),
         throughput_per_h=3600.0 * _rolling_rate(sim.exit_log, t, window),
     )
-    for lane in range(sim.n_lanes):
+    for lane in range(sim.n_lanes):  # (also when the ring is empty: every lane key, NaN speeds)
         in_lane = idx[sim.lane[idx] == lane]
         row[f"lane{lane}_cars"] = in_lane.size
         row[f"lane{lane}_speed"] = float(sim.v[in_lane].mean()) if in_lane.size else float("nan")
+        row[f"lane{lane}_speed_std"] = float(sim.v[in_lane].std()) if in_lane.size else float("nan")
     return row
+
+
+def added_keys(keys: Iterable[str]) -> dict[str, float]:
+    """The ADDED_KEYS that rows with these ``keys`` lack, with their fill: each "{k}" key for every lane k the
+    rows have (lane{k}_cars)."""
+    keys = set(keys)
+    lanes = sorted(int(key[4:-5]) for key in keys if key.startswith("lane") and key.endswith("_cars")
+                   and key[4:-5].isdigit())
+    wanted = {}
+    for key, value in ADDED_KEYS.items():
+        for name in ([key.format(k=k) for k in lanes] if "{k}" in key else [key]):
+            wanted[name] = value
+    return {name: value for name, value in wanted.items() if name not in keys}
 
 
 class Recorder:
@@ -497,10 +527,11 @@ class Recorder:
 
         Every row must hold a finite "time", and each of ``numbers`` as a whole or decimal number
         (NaN allowed, not infinite): a program that reads rows by name, as the viewer does, passes
-        the keys of :func:`snapshot`. ``interval`` (if given) is the sampling interval the samples
-        must have been taken at. Raises :class:`StateError` (and changes nothing) if ``state`` is
-        damaged, its clock does not fit this recorder's simulation, or it was recorded with other
-        bins, sectors or interval.
+        the keys of :func:`snapshot`. Keys added since the samples were saved (ADDED_KEYS) that no
+        saved row has are filled in first. ``interval`` (if given) is the sampling interval the
+        samples must have been taken at. Raises :class:`StateError` (and changes nothing) if
+        ``state`` is damaged, its clock does not fit this recorder's simulation, or it was recorded
+        with other bins, sectors or interval.
         """
         try:
             meta, arrays = state["meta"], state["arrays"]
@@ -517,6 +548,11 @@ class Recorder:
             if values.shape != (n, len(keys)) or kinds.shape != values.shape or kinds.dtype.kind not in "iu" \
                     or spacetime.shape != (n, self.bins) or occupancy.shape != (n, self.sectors):
                 raise StateError("the chart samples do not fit together")
+            fills = added_keys(keys)  # keys no saved row has yet: as floats, the same in every row
+            if fills:
+                keys = keys + list(fills)
+                values = np.hstack((values, np.tile(np.array(list(fills.values()), dtype=float), (n, 1))))
+                kinds = np.hstack((kinds, np.full((n, len(fills)), FLOAT, dtype=kinds.dtype)))
             for key in dict.fromkeys(("time", *numbers)):  # (in order, once each)
                 j = keys.index(key) if key in keys else None
                 if n and (j is None or not np.isin(kinds[:, j], (FLOAT, INT)).all()):

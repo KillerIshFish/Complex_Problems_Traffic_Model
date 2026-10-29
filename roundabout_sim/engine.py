@@ -43,7 +43,17 @@ centres less half of each one's length. The ``road_condition`` scales the
 settings the dynamics use (desired speed, acceleration, braking, time gap,
 entry gap, follow-up, cornering and the braking limit; ROAD_CONDITIONS), all
 through one set of effective values, ``RingSim.eff`` (dry: the settings
-themselves).
+themselves); ``weather_scale`` sets how strongly the drivers' behaviour follows the
+road (road_factors: the tyres' grip always applies in full).
+
+Every circulating vehicle passing an entrance's entry point (where entering cars
+merge: its conflict point) is logged (``conflict_log``) and counted per entrance
+(``arm_passed``, ``arm_passed_outer``): the entrance's conflicting flow. With
+``subject_arm`` on (open mode) entrance 0 is a capacity test: its queue is kept
+full without arrivals and every car leaves at the first exit after it (with 2+
+lanes the first far enough on to leave from any lane), so each car from the
+other entrances passes it exactly once and its conflicting flow is their entry
+flow, set by the Entrance chance (SUBJECT_*; the experiments' subject_* columns).
 """
 
 from __future__ import annotations
@@ -75,9 +85,16 @@ LOG_HORIZON = 600.0  # [s] how long event logs are kept for rolling rates
 EMERGENCY_HOLD = 2.0  # [s] an emergency episode ends after this long without one
 LEAVER_PATIENCE = 5.0  # [s] a leaver held at a standstill by merging gives up its exit
 SMALL_FILL = 3  # deficits up to this many cars are slotted into random gaps
-ANTICIPATION = 5  # most cars ahead a driver reacts to (within the reaction distance)
+ANTICIPATION = 5  # most cars ahead a driver reacts to (within the reaction distance): cfg.anticipation's default
 HEADWAY_FLOOR = 0.5  # nobody keeps less than this share of the Following time gap (cf. desired speeds)
 TEMPERAMENT_CLIP = 2.5  # per-driver draws are standard normals clipped to +- this
+# Capacity test (subject_arm on, open mode): entrance SUBJECT_ARM keeps a standing queue and every car leaves at
+# the first exit after it (with 2+ lanes the first far enough on: RingSim._subject_exit), so its conflicting flow
+# is the other entrances' entry flow (RingSim._assign_routes).
+# *model*: any queue of 2 or more keeps a car waiting at every step (the top-up comes before the entries, which
+# take at most one car per entrance per step); 10 shows as a standing queue in the viewer.
+SUBJECT_ARM = 0
+SUBJECT_QUEUE = 10
 
 # Per-car arrays, one value per slot (RingSim._alloc); the acceleration history acc_hist holds one row
 # per step of history on top.
@@ -85,14 +102,32 @@ CAR_ARRAYS = ("alive", "lane", "theta", "travel", "v", "z", "exit_at", "born", "
               "brake_until", "uid", "moving", "emergency_until", "stuck", "entered_at", "inserted_at", "truck",
               "length", "z_react", "z_gap", "accel", "headway", "delay")
 # Saved states (RingSim.state_dict): the layout version, and what they hold besides the per-car arrays.
-STATE_VERSION = 1
+STATE_VERSION = 2  # 1: before the capacity test; 2: + it, conflict points, weather strength and anticipation
 ARM_ARRAYS = {"queue": int, "entry_cool": np.int64, "arm_arrived": np.int64, "arm_entered": np.int64,
-              "queue_busy": float}  # one value per entrance, and its dtype
+              "queue_busy": float, "arm_passed": np.int64, "arm_passed_outer": np.int64,
+              "arm_passed_trucks": np.int64, "arm_entered_trucks": np.int64,
+              "arm_entry_wait": float}  # one value per entrance, and its dtype
 COUNTERS = ("n_entered", "n_exited", "n_missed", "n_lane_changes", "n_emergency", "n_stops", "n_arrived",
-            "n_blocked", "n_gave_up")  # whole numbers (entry_wait_total is the one float total)
+            "n_blocked", "n_gave_up", "n_topped_up")  # whole numbers
+FLOAT_TOTALS = ("entry_wait_total",)  # sums of floats (each kept in its own accumulation order)
 EVENT_LOGS = ("detector_log", "exit_log", "lane_change_log", "emergency_log", "stop_log", "arrival_log",
-              "entry_log", "blocked_log", "gave_up_log")  # tuples starting with the time; lane_change_log: times
+              "entry_log", "blocked_log", "gave_up_log", "conflict_log")  # tuples starting with the time
+# (lane_change_log: plain times)
 GENERATORS = ("rng", "rng_demand", "rng_drivers")  # every random stream
+# Everything saved that was added after version 1, with what a state of an older version gets for it (the
+# setting's default, zero counts, an empty log): RingSim._from_state fills only these names, and only into a
+# state of an older version (a state of this version that lacks one is damaged). Settings (SimConfig fields:
+# the value is the default), ARM_ARRAYS (the value per entrance), COUNTERS and FLOAT_TOTALS, EVENT_LOGS (an
+# empty log) and GENERATORS (k: the stream is default_rng([seed, k])). Each stage that changes the saved
+# layout adds its names here and raises STATE_VERSION.
+ADDED: dict[str, object] = {
+    # version 2: the capacity test, conflict points, weather strength and anticipation
+    "weather_scale": 1.0, "subject_arm": "off", "anticipation": ANTICIPATION,  # settings
+    "arm_passed": 0, "arm_passed_outer": 0, "arm_passed_trucks": 0, "arm_entered_trucks": 0,  # per entrance
+    "arm_entry_wait": 0.0,
+    "n_topped_up": 0,  # counter
+    "conflict_log": (),  # event log
+}
 
 # Heavy vehicles (trucks): multiples of a car driver's setting. Truck drivers keep a car's standstill gap
 # and comfortable braking (the sources disagree: x1-2 and x0.67-1) and a car's entry gap and follow-up
@@ -146,6 +181,26 @@ ROAD_CONDITIONS: dict[str, dict[str, float]] = {
     ),
 }
 
+# The behavioural factors weather_scale acts on (people's choices); lateral_accel and max_decel are the tyres'
+# grip and always apply in full.
+WEATHER_SCALED = ("mean_speed", "max_accel", "comfort_decel", "time_headway", "entry_gap", "follow_up")
+# *assumption*: no scaled factor falls below this. It first acts on ice's comfortable braking at weather_scale
+# 1.64 (1 - 1.64 x 0.55 = 0.098), and on its acceleration at 1.8 (1 - 1.8 x 0.5 = 0.10); without it they would
+# reach 0 at 1.82 and 2.0 (derived). The studies give no such extremes.
+WEATHER_FLOOR = 0.1
+
+
+def road_factors(condition: str, scale: float = 1.0) -> dict[str, float]:
+    """The multiple of each ROAD_SCALED setting on road ``condition``, with the behavioural factors
+    (WEATHER_SCALED) k turned into 1 + ``scale`` (k - 1), at least WEATHER_FLOOR: 0 = drivers act as on a dry
+    road, 1 = ROAD_CONDITIONS as given (exactly: 1 + 1 (k - 1) is not k for every float), 2 = twice the change.
+    A dry road is all 1 whatever the scale."""
+    k = ROAD_CONDITIONS[condition]
+    if scale == 1:
+        return k
+    return {name: max(WEATHER_FLOOR, 1.0 + scale * (f - 1.0)) if name in WEATHER_SCALED else f
+            for name, f in k.items()}
+
 
 @dataclass(frozen=True)
 class Effective:
@@ -167,8 +222,9 @@ class Effective:
 
 
 def effective(cfg: SimConfig) -> Effective:
-    """The settings ``cfg`` drives with on its road condition (one multiplier each, ROAD_CONDITIONS)."""
-    k = ROAD_CONDITIONS[cfg.road_condition]
+    """The settings ``cfg`` drives with on its road condition (one multiplier each, ROAD_CONDITIONS, the
+    behavioural ones scaled by the weather effect: road_factors)."""
+    k = road_factors(cfg.road_condition, cfg.weather_scale)
     return Effective(**{name: getattr(cfg, name) * k[name] for name in ROAD_SCALED if name != "max_decel"},
                      speed_std=cfg.speed_std * k["mean_speed"], headway_std=cfg.headway_std * k["time_headway"],
                      max_decel=MAX_DECEL * k["max_decel"])
@@ -307,15 +363,24 @@ class RingSim:
 
         self.n_entered = self.n_exited = self.n_missed = 0
         self.n_lane_changes = self.n_emergency = self.n_stops = 0
-        # Every arrival ends up entered, still queued, blocked or given up:
-        # n_arrived == n_entered + queue.sum() + n_blocked + n_gave_up.
+        # Every arrival (and car added to the capacity test's queue) ends up entered, still queued, blocked
+        # or given up: n_arrived + n_topped_up == n_entered + queue.sum() + n_blocked + n_gave_up.
         self.n_arrived = self.n_blocked = 0
         self.n_gave_up = 0  # queued cars dropped when Max queue (open) or Density (closed) was lowered live
+        self.n_topped_up = 0  # cars added to the subject entrance's queue (subject_arm on): not arrivals
         self.entry_wait_total = 0.0  # [s] queue wait summed over every car that entered
         # Per entrance, for its demand / capacity ratio (metrics.entry_vc).
         self.arm_arrived = np.zeros(n, dtype=np.int64)  # arrivals (blocked ones included)
         self.arm_entered = np.zeros(n, dtype=np.int64)  # entries
         self.queue_busy = np.zeros(n)  # [s] time it has had cars waiting to enter
+        # Its conflicting flow (observer only, _log_conflicts): circulating vehicles that passed its entry point,
+        # on any lane, on the outer lane (the one entering cars merge into) and trucks; its truck entries (pc/h)
+        # and the queue wait of its entrants [s] (apart from entry_wait_total, which keeps its own sum order).
+        self.arm_passed = np.zeros(n, dtype=np.int64)
+        self.arm_passed_outer = np.zeros(n, dtype=np.int64)
+        self.arm_passed_trucks = np.zeros(n, dtype=np.int64)
+        self.arm_entered_trucks = np.zeros(n, dtype=np.int64)
+        self.arm_entry_wait = np.zeros(n)
         # Event logs for rolling rates, oldest first, pruned after LOG_HORIZON.
         self.detector_log: deque[tuple[float, int]] = deque()  # (time, lane) crossings
         self.exit_log: deque[tuple[float, int, float]] = deque()  # (time, arm, trip time)
@@ -326,6 +391,7 @@ class RingSim:
         self.entry_log: deque[tuple[float, int, float]] = deque()  # (time, arm, queue wait)
         self.blocked_log: deque[tuple[float, int]] = deque()  # (time, arm) arrivals turned away
         self.gave_up_log: deque[tuple[float, int]] = deque()  # (time, arm) queued cars that gave up
+        self.conflict_log: deque[tuple[float, int, int, int]] = deque()  # (time, arm, lane, uid) at an entry point
         # Once a second: (time, arm_arrived, arm_entered, queue_busy) copies, for rolling ratios.
         self.entrance_log: deque[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = deque(
             [(0.0, self.arm_arrived.copy(), self.arm_entered.copy(), self.queue_busy.copy())])
@@ -363,9 +429,23 @@ class RingSim:
             self.exit_angle = (self.arm_angle - half) % TWO_PI  # exit comes first...
             self.entry_angle = (self.arm_angle + half) % TWO_PI  # ...then the entry
             self.detector_angle = float((-np.pi / 2 + np.pi / n) % TWO_PI)  # between arms
+            # The capacity test's exit (_assign_routes): the first after the subject entrance's entry point.
+            # With 2+ lanes, the first at least the innermost lane's lane-change zone beyond it (must_move_out),
+            # so leaving does not herd every car onto the outer lane before that point: its lane use stays the
+            # drivers' own (*model*; else all of its conflicting flow would be on the outer lane). None so far
+            # within a lap: the last one before the point comes round again (the subject's own exit).
+            arcs = (self.exit_angle - self.entry_angle[SUBJECT_ARM]) % TWO_PI
+            far = arcs * self.r_out >= ((self.n_lanes - 1) * LC_ZONE + 20.0 if self.n_lanes > 1 else 0.0)
+            self._subject_exit = int(np.argmin(np.where(far, arcs, np.inf))) if far.any() else int(np.argmax(arcs))
         else:
             self.arm_angle = self.exit_angle = self.entry_angle = np.zeros(0)
             self.detector_angle = 0.0
+            self._subject_exit = 0
+        # The entry points in angle order, then once more a lap on (_log_conflicts: the arc a car drives in a
+        # step starts in [0, 2pi) and ends before 4pi), and the entrance each belongs to.
+        self._entry_order = np.argsort(self.entry_angle, kind="stable")
+        ordered = self.entry_angle[self._entry_order]
+        self._entry_ext = np.concatenate((ordered, ordered + TWO_PI))
 
     def set(self, **changes) -> bool:
         """Change parameters live. Returns True if the change rebuilt the roundabout."""
@@ -373,9 +453,12 @@ class RingSim:
             return False
         old, old_seed = self.cfg, self.seed
         new_cfg = old.updated(**changes)  # validates names and values
-        # Truck length matters only once there are trucks: without any, before and after, it is just
-        # kept for later (nothing on the ring depends on it).
+        # Truck length matters only once there are trucks, and the capacity test only in open mode with an
+        # entrance: changed while it cannot act, before and after, it is just kept for later (nothing on the
+        # ring depends on it).
         idle = {"truck_length"} if old.truck_share == 0 and new_cfg.truck_share == 0 else set()
+        if not (self._can_test(old) or self._can_test(new_cfg)):
+            idle.add("subject_arm")
         # Geometry/numerics fields without a slider (lane_width, dt, ...) also rebuild.
         rebuild = any((PARAM_BY_NAME[k].reset if k in PARAM_BY_NAME else k != "seed")
                       and getattr(old, k) != v for k, v in changes.items() if k not in idle)
@@ -398,11 +481,11 @@ class RingSim:
         # delay follow the new settings and road condition at once.
         self._update_effective()
         self._set_driving(alive)
-        if new_cfg.exit_prob != old.exit_prob:
+        if new_cfg.exit_prob != old.exit_prob and not self.subject:  # (the capacity test's routes ignore it)
             self._assign_routes(alive)  # geometric routes are memoryless
         if any(getattr(new_cfg, k) != getattr(old, k) for k in
                ("mean_speed", "speed_std", "lateral_accel", "turn_speed", "exit_prob", "comfort_decel",
-                "road_condition")):
+                "road_condition", "weather_scale")):
             # New free speeds: re-baseline who counts as moving, so the change
             # itself is not logged as a wave of stops.
             self.moving[alive] &= self.v[alive] >= SLOW_FRACTION * self.target_speed(alive)
@@ -411,7 +494,8 @@ class RingSim:
         if self.open_demand:
             if new_cfg.max_queue < old.max_queue:  # shorter queues: their latest arrivals give up
                 for arm in range(self.n_arms):
-                    self._drop_queued(arm, max(int(self.queue[arm]) - new_cfg.max_queue, 0))
+                    if not (self.subject and arm == SUBJECT_ARM):  # (the capacity test's queue stays full)
+                        self._drop_queued(arm, max(int(self.queue[arm]) - new_cfg.max_queue, 0))
             if new_cfg.density != old.density:
                 self._sync_ring()  # Density sets the cars on the ring once, at this moment
         return False
@@ -469,6 +553,8 @@ class RingSim:
         lane index cache; and the bit-generator state of every random stream
         (GENERATORS). What follows from the settings alone (the geometry,
         ``eff``, the demand weights) is worked out again. Arrays are copies.
+        The layout is STATE_VERSION's; states of older versions still load
+        (ADDED: what was added since takes its fill).
         """
         arrays = {name: getattr(self, name).copy() for name in (*CAR_ARRAYS, "acc_hist", *ARM_ARRAYS)}
         logs = {}
@@ -496,7 +582,7 @@ class RingSim:
             "next_fill": self._next_fill, "next_prune": self._next_prune,
             "pending": [bool(truck) for truck in self._pending],
             "counters": {name: int(getattr(self, name)) for name in COUNTERS},
-            "entry_wait_total": float(self.entry_wait_total),
+            **{name: float(getattr(self, name)) for name in FLOAT_TOTALS},
             "logs": logs,
             "generators": {name: getattr(self, name).bit_generator.state for name in GENERATORS},
         }
@@ -508,7 +594,10 @@ class RingSim:
 
         Raises :class:`StateError` saying what is wrong if ``state`` is
         incomplete, damaged or from another version (e.g. settings this
-        version does not know, or arrays of the wrong shape).
+        version does not know, or arrays of the wrong shape). A state of an
+        older version (1 up to STATE_VERSION) loads with what was added since
+        filled in (ADDED: default settings, zero counts, empty logs), so it
+        carries on as it would have, its new measurements counted from then on.
         """
         try:
             return cls._from_state(state["meta"], state["arrays"])
@@ -522,9 +611,15 @@ class RingSim:
     @classmethod
     def _from_state(cls, meta: dict, arrays: dict) -> RingSim:
         version = meta.get("version")
-        if version != STATE_VERSION:
-            raise StateError(f"simulation state version {version!r}; this version reads {STATE_VERSION}")
+        if isinstance(version, bool) or not isinstance(version, int) or not 1 <= version <= STATE_VERSION:
+            raise StateError(f"simulation state version {version!r}; this version reads 1 to {STATE_VERSION}")
+
+        def fill(name: str, present) -> bool:
+            """Whether ``name``, missing from ``present``, takes its ADDED fill (in an older state only)."""
+            return version < STATE_VERSION and name in ADDED and name not in present
+
         config, names = dict(meta["config"]), {f.name for f in fields(SimConfig)}
+        config.update({name: ADDED[name] for name in sorted(names) if fill(name, config)})
         unknown, missing = sorted(set(config) - names), sorted(names - set(config))
         if unknown or missing:
             raise StateError("settings of another version (" + "; ".join(
@@ -533,8 +628,10 @@ class RingSim:
         self = cls.__new__(cls)
         self.cfg = cfg = SimConfig(**config)  # validates the values
         self.seed = int(meta["seed"])
+        generators = meta["generators"]
         for name in GENERATORS:
-            setattr(self, name, _generator(meta["generators"][name]))
+            setattr(self, name, np.random.default_rng([self.seed, ADDED[name]]) if fill(name, generators)
+                    else _generator(generators[name]))
         self._update_effective()
         self.time, self.steps, self.generation = float(meta["time"]), int(meta["steps"]), int(meta["generation"])
         if not (np.isfinite(self.time) and self.time >= 0 and self.steps >= 0 and self.generation >= 0):
@@ -542,7 +639,8 @@ class RingSim:
         self._geometry()
         n = self.n_arms
         for name, dtype in ARM_ARRAYS.items():
-            setattr(self, name, _array(arrays, name, (n,), dtype))
+            setattr(self, name, np.full(n, ADDED[name], dtype=dtype) if fill(name, arrays)
+                    else _array(arrays, name, (n,), dtype))
         self.demand_weight = self._demand_weights()
         for name, dtype in (("queue_times", float), ("queue_trucks", bool)):
             parts = _split(_array(arrays, name, None, dtype), _array(arrays, f"{name}_count", (n,), np.int64), name)
@@ -550,12 +648,17 @@ class RingSim:
         if (self.queue < 0).any() or any(len(fifo) != q for fifo, q in zip(self.queue_times, self.queue)) \
                 or any(len(fifo) > q for fifo, q in zip(self.queue_trucks, self.queue)):
             raise StateError("the queues do not match their arrival times and vehicle types")
+        counters = meta["counters"]
         for name in COUNTERS:
-            setattr(self, name, int(meta["counters"][name]))
-        self.entry_wait_total = float(meta["entry_wait_total"])
+            setattr(self, name, int(ADDED[name] if fill(name, counters) else counters[name]))
+        for name in FLOAT_TOTALS:
+            setattr(self, name, float(ADDED[name] if fill(name, meta) else meta[name]))
         for name in EVENT_LOGS:
-            setattr(self, name, _unpack_log(name, _array(arrays, name, None, float), list(meta["logs"][name]),
-                                            plain=name == "lane_change_log"))
+            if fill(name, arrays) and fill(name, meta["logs"]):
+                setattr(self, name, deque(ADDED[name]))
+            else:
+                setattr(self, name, _unpack_log(name, _array(arrays, name, None, float), list(meta["logs"][name]),
+                                                plain=name == "lane_change_log"))
         when = _array(arrays, "entrance_log_time", None, float)
         k = when.shape[0] if when.ndim == 1 else -1
         parts = [_array(arrays, f"entrance_log_{part}", (k, n), dtype)
@@ -657,8 +760,17 @@ class RingSim:
         return np.ones_like(np.asarray(t, dtype=float)) if np.ndim(t) else 1.0
 
     def arrival_rates(self) -> np.ndarray:
-        """[1/s] Mean arrival rate at each entrance right now (open mode)."""
-        return self.cfg.entry_rate * float(self.demand_factor()) * self.demand_weight
+        """[1/s] Mean arrival rate at each entrance right now (open mode); none at the capacity test's subject
+        entrance (its queue is topped up instead: _top_up)."""
+        rates = self.cfg.entry_rate * float(self.demand_factor()) * self.demand_weight
+        if self.subject:
+            rates[SUBJECT_ARM] = 0.0
+        return rates
+
+    @staticmethod
+    def _can_test(cfg: SimConfig) -> bool:
+        """Whether ``cfg`` could run the capacity test (subject_arm): open mode, with an entrance to test."""
+        return cfg.traffic_mode == "open" and int(cfg.n_arms) > 0
 
     # ------------------------------------------------- vehicles and drivers
     def _update_effective(self) -> None:
@@ -668,10 +780,12 @@ class RingSim:
         the one ``car_length``. ``alike``: also every driver keeps the same
         time gap and reaction time. Then the dynamics use plain numbers, which
         keeps the arithmetic, and the speed, of a model without trucks or
-        driver spread; otherwise they use each vehicle's own values.
+        driver spread; otherwise they use each vehicle's own values. Also
+        whether the capacity test is on (``subject``).
         """
         cfg = self.cfg
         self.eff = effective(cfg)
+        self.subject = cfg.subject_arm == "on" and self._can_test(cfg)  # the capacity test (subject_arm)
         self.uniform_length = cfg.truck_share == 0
         self.alike = self.uniform_length and cfg.headway_std == 0 and cfg.reaction_std == 0
 
@@ -781,8 +895,9 @@ class RingSim:
     def _car_following(self, idx, v, v0, ld, g, lead, gap) -> np.ndarray:
         """Car-following acceleration with multi-anticipation (as in Treiber's
         Human Driver Model): a driver reacts to every car ahead in its lane
-        within the reaction distance (up to ANTICIPATION cars), not just the
-        next one. The j-th car ahead is judged by the average gap per car to it
+        within the reaction distance (up to ``anticipation`` cars, by default
+        ANTICIPATION; 1 = the plain IDM), not just the next one. The j-th car
+        ahead is judged by the average gap per car to it
         and weighted 1/j^2; the weighted mean of these IDM braking terms
         replaces the single-leader term. In even traffic this changes nothing,
         but drivers who see further brake earlier and more gently for a slowdown
@@ -801,7 +916,7 @@ class RingSim:
         cars_ahead = np.bincount(self.lane[idx], minlength=self.n_lanes)[self.lane[idx]] - 1
         car, gaps = np.maximum(ld, 0), g.copy()
         between = 0.0  # [m] summed lengths of the cars passed so far (vehicles of mixed lengths)
-        for j in range(2, ANTICIPATION + 1):
+        for j in range(2, int(cfg.anticipation) + 1):
             gaps = gaps + gap[car]  # summed bumper gaps to the j-th car ahead
             if not self.uniform_length:
                 between = between + self.length[car]
@@ -936,8 +1051,28 @@ class RingSim:
         return i
 
     def _assign_routes(self, i) -> None:
-        """Draw each car's exit: it leaves at each exit it passes with chance ``exit_prob``."""
+        """Draw each car's exit: it leaves at each exit it passes with chance ``exit_prob``.
+
+        In the capacity test (``subject``) nothing is drawn: every car leaves at
+        the first exit after the subject entrance's entry point (``_subject_exit``),
+        so the subject's own entrants never pass that point and every other car
+        passes it once (an arm's exit comes before its entry). On one lane that
+        is the next exit, taken the next time the car reaches it; with 2+ lanes
+        it can be a later one, which a new car between the two (an entrant of an
+        arm in between) reaches only after going round past the point. Routes
+        are set once per car (a live Exit chance change leaves them alone).
+        """
         self.exit_at[i] = np.inf
+        if self.subject:
+            exit_angle, entry = self.exit_angle[self._subject_exit], self.entry_angle[SUBJECT_ARM]
+            if self._subject_exit == (SUBJECT_ARM + 1) % self.n_arms:
+                ahead = (exit_angle - self.theta[i]) % TWO_PI
+                self.exit_at[i] = self.travel[i] + np.where(ahead < 1e-6, ahead + TWO_PI, ahead)
+            else:  # round to the entry point first (the subject's entrants start on it), then on to the exit
+                to_entry = (entry - self.theta[i]) % TWO_PI
+                to_entry = np.where(to_entry > TWO_PI - 1e-6, 0.0, to_entry)
+                self.exit_at[i] = self.travel[i] + to_entry + (exit_angle - entry) % TWO_PI
+            return
         p = self.cfg.exit_prob
         if self.n_arms == 0 or p <= 0 or len(i) == 0:
             return
@@ -1084,6 +1219,8 @@ class RingSim:
             self._lane_changes(np.flatnonzero(self.alive))
         if open_demand:
             self._arrivals()
+        if self.subject:
+            self._top_up()
         self._entries()
         if not open_demand:
             # Last, so that after every step the population matches the density
@@ -1106,7 +1243,7 @@ class RingSim:
             self.entrance_log.append((self.time, self.arm_arrived.copy(), self.arm_entered.copy(),
                                       self.queue_busy.copy()))
         for log in (self.detector_log, self.exit_log, self.emergency_log, self.stop_log, self.arrival_log,
-                    self.entry_log, self.blocked_log, self.gave_up_log, self.entrance_log):
+                    self.entry_log, self.blocked_log, self.gave_up_log, self.entrance_log, self.conflict_log):
             while log and log[0][0] < cutoff:
                 log.popleft()
         while self.lane_change_log and self.lane_change_log[0] < cutoff:
@@ -1201,6 +1338,38 @@ class RingSim:
         crossed = (dtheta > 0) & (before > after)
         for lane in self.lane[idx[crossed]]:
             self.detector_log.append((self.time, int(lane)))
+        if self.n_arms:
+            self._log_conflicts(idx, old, dtheta)
+
+    def _log_conflicts(self, idx, old, dtheta) -> None:
+        """Log the circulating vehicles that passed an entrance's entry point this step (its conflict point
+        with the entering cars): ``conflict_log`` and the counts ``arm_passed`` (any lane),
+        ``arm_passed_outer`` (the outer lane) and ``arm_passed_trucks``. Observer only: it reads the
+        positions and draws nothing.
+
+        A vehicle passes a point when the arc it drove this step, from just
+        after where it was (``old``, aligned with ``idx``) to where it is now,
+        reaches it, as at the detector line; so a car placed on an entry point
+        (an entrant) does not pass that one. Leavers leave at the arm's exit,
+        which comes before its entry point, so a circulating flow never counts
+        the cars leaving there (a step is far shorter than the exit-to-entry arc).
+        """
+        ext = self._entry_ext
+        start = np.searchsorted(ext, old, side="right")  # the first entry point ahead of each vehicle
+        passed = np.searchsorted(ext, old + dtheta, side="right") - start  # how many it reached: 0, rarely 1
+        hit = np.flatnonzero(passed)
+        if hit.size == 0:
+            return
+        for k in range(int(passed[hit].max())):  # (more than one point in a step only with very long steps)
+            sub = hit[passed[hit] > k]
+            arms = self._entry_order[(start[sub] + k) % self.n_arms]
+            slots = idx[sub]
+            lanes = self.lane[slots]
+            np.add.at(self.arm_passed, arms, 1)
+            np.add.at(self.arm_passed_outer, arms[lanes == self.outer], 1)
+            np.add.at(self.arm_passed_trucks, arms[self.truck[slots]], 1)
+            self.conflict_log.extend(zip([self.time] * sub.size, arms.tolist(), lanes.tolist(),
+                                         self.uid[slots].tolist()))
 
     def must_move_out(self, idx) -> np.ndarray:
         """Leavers not yet on the outer lane that are inside their lane-change zone."""
@@ -1307,6 +1476,17 @@ class RingSim:
                 self.blocked_log.extend([(now, arm)] * (k - join))
         self.n_arrived += int(arrived.sum())
         self.arm_arrived += arrived
+
+    def _top_up(self) -> None:
+        """The capacity test (``subject``): fill the subject entrance's queue back up to SUBJECT_QUEUE cars,
+        each joining now (its queue wait counts from here) and a truck as often as an arrival is (from
+        rng_drivers). No arrival is drawn or counted: n_topped_up counts them instead."""
+        k = SUBJECT_QUEUE - int(self.queue[SUBJECT_ARM])
+        if k > 0:
+            self.queue[SUBJECT_ARM] += k
+            self.queue_times[SUBJECT_ARM].extend([self.time] * k)
+            self.queue_trucks[SUBJECT_ARM].extend(self._draw_trucks(k).tolist())
+            self.n_topped_up += k
 
     def _drop_queued(self, arm: int, k: int) -> None:
         """Take the ``k`` latest arrivals out of an entrance's queue: they give up
@@ -1455,12 +1635,15 @@ class RingSim:
             arm, angle = arms[k], self.entry_angle[arms[k]]
             trucks = self.queue_trucks[arm]
             truck = trucks.popleft() if trucks else False  # (a queue edited by hand may lack the types)
+            if truck:
+                self.arm_entered_trucks[arm] += 1
             slot = self._spawn(np.array([self.outer]), np.array([angle]), v_in[k:k + 1],
                                lat=np.array([self.outer + 1.0]), trucks=np.array([truck]))
             self.entered_at[slot] = self.time
             self.queue[arm] -= 1
             wait = self.time - self.queue_times[arm].popleft()  # first come, first served
             self.entry_wait_total += wait
+            self.arm_entry_wait[arm] += wait
             self.entry_log.append((self.time, int(arm), wait))
             self.entry_cool[arm] = follow_up
             self.n_entered += 1

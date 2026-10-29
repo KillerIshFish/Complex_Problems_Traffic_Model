@@ -372,20 +372,61 @@ PRESETS: dict[str, Preset] = {p.name: p for p in (
             # assumption: not reported (the ring was enlarged for the bigger US cars); mean length of 2019 US
             # passenger models 4.86 m (NCHRP RR 1061 Table 18)
             "car_length": 4.9,
-            # assumption: not reported (mean speeds 6.3 m/s with waves, 7.2 smoothed); the 40 km/h free
-            # speed of the similar Japanese rings
-            "mean_speed": 11.0,
             "lane_change_rate": 0.0,  # model: one lane, so no lane changes
             **DRIVERS,
+            # The drivers, calibrated to the human ring with waves (Stern Table 3: 1,755-1,828 veh/h, speed SD
+            # 2.36-3.85 m/s; first waves 55-161 s, Tables 1, 2, 4) on top of DRIVERS, whose ring jams fully at
+            # about 1,250 veh/h (see the notes). Each value lies within its calibration studies' spread; the
+            # set sits near the ring's stability boundary, so every value matters (notes).
+            # assumption: not reported (mean speed 6.3 m/s with waves, 7.2 smoothed); above the ring's cornering
+            # cap sqrt(4.0 x 41.4) = 12.9 m/s (the default Cornering limit), so most drivers' free speed is that
+            # cap; at 11 (the Japanese rings' 40 km/h) waves form in 8 % of the runs, at 13 in 79 % (this version)
+            "mean_speed": 14.0,
+            # Zhu 2018: calibrated IDM time gap 0.878 +/- 0.334 s; assumption: below the mean, as the drivers
+            # were asked to catch up with the car ahead (Sec. 2.1)
+            "time_headway": 0.8,
+            # Zhu 2018: calibrated s0 1.555 +/- 0.96 m (Kesting & Treiber 2008: measured 1.39-1.64 m);
+            # assumption: below the mean, drivers closing gaps (Sec. 2.1)
+            "min_gap": 1.25,
+            # assumption: the low end of measured car-following reaction times (Zhu 2018 GHR median 0.50 s;
+            # RANDOM_RANGES 0.3-1.2 s), alert drivers on a closed track; 0.4 already gives full stop-and-go at
+            # about 1,550 veh/h (this version)
+            "reaction_time": 0.3,
+            # derived: 0.4 m/s2 with the engine's NOISE_TAU = 2 s is a noise intensity Q = 2 x 0.4^2 x 2 = 0.64
+            # m2/s3, twice Treiber & Kesting 2017's platoon fit 0.32 (assumption: this ring's drivers vary more)
+            "driver_noise": 0.4,
+            # Kesting & Treiber 2008: calibrated 1.52-1.58 m/s2 (Table 1); 1.5 in town (Treiber & Kesting)
+            "max_accel": 1.5,
+            # Kesting & Treiber 2008: calibrated 0.61-3.73 m/s2 (Table 1); comfortable braking 0.27 g = 2.65 m/s2
+            # (Garber & Hoel)
+            "comfort_decel": 2.5,
+            # assumption: the plain IDM, only the car in front (drivers were asked to close any widening gap to
+            # the vehicle ahead, Sec. 2.1); drivers anticipate 1-7 vehicles (Treiber, Kesting & Helbing 2006)
+            "anticipation": 1,
         },
-        "Drivers were told to drive as in rush hour, catching up with the car ahead; they started evenly "
-        "spaced from a standstill and drove 7-10 minutes. Targets: first waves at 79 and 55 s in Experiments A "
-        "and B, with the preset's 21 cars (one of them the CAT Vehicle, driven by a human until its controller "
-        "was switched on); Experiment C had 22 cars (84.6 veh/km) and its first wave at 161 s. Speed std over "
-        "all cars 2.4-3.9 m/s with waves; 1,755-1,828 veh/h; mean speed about 6.3 m/s. Check of the research "
-        "and this version (seeds 1-3, 600 s): waves at 133, 100 and 100 s, later than A and B, and 1,160-1,210 "
-        "veh/h at 4.0-4.2 m/s: the model's stop-and-go state carries about 35 % less flow than the real one "
-        "(so do the other ring presets). " + DRIVERS_NOTE,
+        "Drivers were told to drive as in rush hour, catching up with the car ahead; they started evenly spaced "
+        "from a standstill and drove 7-10 minutes. Targets: first waves at 79 and 55 s in Experiments A and B, "
+        "with the preset's 21 cars (one of them the CAT Vehicle, driven by a human until its controller was "
+        "switched on); Experiment C had 22 cars (84.6 veh/km) and its first wave at 161 s. With waves (Table 3, "
+        "the first interval after they start): speed SD over all cars and time 3.31 / 2.36 / 3.85 m/s, 1,827 / "
+        "1,828 / 1,755 veh/h (mean speed 6.3 / 6.3 / 5.8 m/s); the flow hardly fell when the waves came in A and B "
+        "(1,809 -> 1,827 and 1,665 -> 1,828 veh/h; C 2,160 -> 1,755). Drivers calibrated to that (C1): the time "
+        "gap, standstill gap, reaction time, noise, acceleration, comfortable braking, anticipation and desired "
+        "speed differ from DRIVERS (sources by each value). This version (seeds 0-31, 300 s warm-up + 600 s): "
+        "median 1,781 veh/h (1,627-1,889) at 6.13 m/s, speed SD 2.55 m/s, first wave (speed std across cars above "
+        "2.5 m/s for 5 s) at 116 s, waves in 29 of the 32 runs by 300 s, moving backward at 4.6-5.1 m/s (Sugiyama "
+        "2008: about 5.6), a car below 0.5 m/s in 8 % of the samples, 0.4 harsh brakings a minute. Mechanism: "
+        "these drivers are string-stable on this ring (one car braking for 2 s without noise fades out), so the "
+        "waves are noise-driven oscillations that rarely stop anyone (Treiber & Kesting 2017). With DRIVERS alone "
+        "the ring is string-unstable: the same braking grows into a lasting jam, cars stand in 76 % of the "
+        "samples, a stopped car restarts only once its gap has opened and after its 0.6 s reaction, and the jam "
+        "lets out only about one car per 2.9 s: 1,250 veh/h (1,150-1,420; seeds 0-11) at 4.3 m/s, about 30 % below "
+        "Stern and below the 1,770 veh/h the same drivers keep without waves (so do the other ring presets: "
+        "Sugiyama 1,180 veh/h, waves at 3.4 m/s). Near the stability boundary every value matters (seeds 0-23): "
+        "anticipation 2 or desired speed 11 keep the ring smooth (waves in 0-8 % of the runs); comfortable braking "
+        "2.0, standstill gap 1.0 m or noise 0.3 leave waves in 33-58 % of them; reaction 0.4 s, acceleration 1.2 "
+        "or standstill gap 1.5 m bring back full stop-and-go at 1,370-1,550 veh/h (a car standing in 71-92 % of "
+        "the samples).",
         cite="Stern et al. 2018, Transp. Res. C 89, 205-221"),
 
     # A typical US single-lane roundabout, NCHRP Report 672 geometry and HCM 6 gap acceptance.
@@ -756,6 +797,12 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
                           "3.885 m; simulations use 4-5 m (Inovev 2023; NCHRP RR 1061 Table 18; Tadaki 2013)."),
     "road_condition": Choice(("dry", "wet", "snow", "ice"), (0.75, 0.17, 0.06, 0.02),
                              "Depends on the climate; weights assumed for a temperate one."),
+    "weather_scale": Numeric(0.5, 2.0, 1.0,
+                             "The studies behind the road factors span about 0.5-1.6 x each one's change from "
+                             "dry (snow speeds -25 to -40 % against -25 %, snow discharge headways +13 to +26 % "
+                             "against +25 %, rain speeds -6 to -10 % against -8 %: FHWA RWM, Perrin 2000; derived); "
+                             "the model's snow capacity loss needs about 2 x to reach Munehiro 2017's -300 veh/h. "
+                             "Typical 1: the factors as given."),
     # Traffic
     "density": Numeric(5.0, 110.0, 35.0,
                        "Closed rings flow freely below about 80 veh/km and jam above about 89 (Tadaki 2013); jam "
@@ -786,8 +833,8 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
                           "Per approach: low 150-300 veh/h (0.04-0.08 /s), moderate 400-500 (0.11-0.14), the "
                           "single-lane service limit 560-625 (0.16-0.17) (NCHRP 672 Exhibit 1-9); the Etoile "
                           "averages 0.11 /s. Drawn as a degree of saturation (DEMAND_VC) of the layout's HCM 6 "
-                          "capacity on the drawn road condition (ROAD_CAPACITY), with the drawn trucks "
-                          "(TRUCK_PCE)."),
+                          "capacity on the drawn road condition and weather effect (ROAD_CAPACITY), with the "
+                          "drawn trucks (TRUCK_PCE)."),
     "demand_profile": Choice(("constant", "peak"), (0.7, 0.3),
                              "A peak hour factor of 0.92 means demand is nearly constant within an hour (FHWA "
                              "HPMS); the Etoile counts show a flat daytime plateau (weights assumed)."),
@@ -798,6 +845,9 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
                          "Approach storage before spill-back blocks the junctions upstream: 50 cars are about "
                          "300-425 m at 6-8.5 m per queued car (HCS7 jam density). A modelling boundary "
                          "(assumption)."),
+    "subject_arm": Choice(("off",), (1.0,),
+                          "A measuring instrument (a saturated test entrance), not a feature of real roundabouts: "
+                          "never drawn on (model)."),
     # Vehicles
     "truck_share": Numeric(0.0, 0.15, 0.05,
                            "Lorries are 1.1 % of the traffic on GB minor roads and 5.0 % on A roads (DfT 2024); "
@@ -824,6 +874,10 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
     "reaction_distance": Numeric(15.0, 60.0, 25.0,
                                  "Drivers anticipate 1-7 vehicles (Treiber 2006); 15-60 m covers about 1-5 cars at "
                                  "roundabout spacings (assumption)."),
+    "anticipation": Numeric(1, 5, 5,
+                            "Drivers anticipate 1-7 vehicles (Treiber, Kesting & Helbing 2006, Physica A 360); the "
+                            "slider stops at 5. Typical: the model's 5 (assumption: the value it was calibrated "
+                            "with)."),
     "time_headway": Numeric(0.7, 1.8, 1.0,
                             "Calibrated IDM time gaps 0.88 +/- 0.33 s (Zhu 2018), 1.03-1.51 s (Kesting & Treiber "
                             "2008), 1.0 s city (Treiber & Kesting); 1.8 s is the German recommendation."),
@@ -891,6 +945,11 @@ HCM6_CAPACITY = {1: (1380.0, 1.02e-3), 2: (1420.0, 0.85e-3)}
 # 0.83 and 0.84, as on ice the slower acceleration and speeds cost capacity too. Real roads: about -10 % in
 # rain (FHWA 2006), -300 veh/h on compacted snow (Munehiro 2017).
 ROAD_CAPACITY = {"dry": 1.0, "wet": 0.92, "snow": 0.81, "ice": 0.70}
+# With weather_scale s the factor f becomes 1 + s (f - 1), as engine.road_factors scales the driving factors, at
+# least 0.1 (engine.WEATHER_FLOOR). *derived* approximation: the model's capacity loss is not exactly linear in s
+# (capacity test, us_single_lane, vc ~500 veh/h: snow at s 0.5 / 2 keeps 1.18 / 0.75 x its s = 1 capacity
+# against 1.12 / 0.77 by this rule; ice 1.32 / 0.35 against 1.21 / 0.57, its ring flow failing at s = 2).
+CAPACITY_FLOOR = 0.1
 TRUCK_PCE = 2.0  # a heavy vehicle counts as 2 passenger cars in the HCM 6 roundabout method (E_T)
 EXIT_SPREAD = (0.75, 1.25)  # exit_prob = 2 / n_arms x U(these) (derived, research), clipped to its range
 ENTRY_GAP_MULTILANE = 2.2  # mode of the entry gap with 2+ lanes (the HCM 6 two-lane model equivalent)
@@ -973,18 +1032,20 @@ def _nchrp_lateral(radius: float) -> float:
 
 
 def _hcm_entry_rate(vc: float, n_lanes: int, n_arms: int, exit_prob: float, imbalance: float,
-                    road_condition: str = "dry", truck_share: float = 0.0) -> float:
+                    road_condition: str = "dry", truck_share: float = 0.0, weather_scale: float = 1.0) -> float:
     """[1/s] Mean entrance chance that loads the busiest entrance to ``vc`` x its HCM 6 capacity.
 
     Each car passes 1 / exit_prob - 1 entrances before it leaves (an arm's exit
     comes before its entry), so a mean entering flow q puts about q (1 - p) / p
     on the ring at each entrance; the busiest entrance gets the largest demand
     weight w (as RingSim._demand_weights). Solves w q = vc f A exp(-B q (1 - p) / p)
-    in passenger cars, with f = ROAD_CAPACITY[road_condition], and converts back
-    to vehicles: with ``truck_share`` s each vehicle is 1 + s (TRUCK_PCE - 1) cars.
+    in passenger cars, with f = ROAD_CAPACITY[road_condition] (scaled by
+    ``weather_scale``: 1 + scale (f - 1), at least CAPACITY_FLOOR), and converts
+    back to vehicles: with ``truck_share`` s each vehicle is 1 + s (TRUCK_PCE - 1) cars.
     """
     a, b = HCM6_CAPACITY[1 if n_lanes <= 1 else 2]
-    a *= ROAD_CAPACITY[road_condition]
+    f = ROAD_CAPACITY[road_condition]
+    a *= f if weather_scale == 1 else max(CAPACITY_FLOOR, 1.0 + weather_scale * (f - 1.0))
     p = max(exit_prob, 0.05)
     weights = 1.0 + imbalance * np.cos(2 * 2 * np.pi * np.arange(n_arms) / n_arms)
     w = float(weights.max() / weights.mean())
@@ -1003,7 +1064,7 @@ def random_changes(seed: int, groups: Iterable[str] | str | None = None, *, base
     shows them exactly) and give a valid SimConfig. Some are linked, as on real
     roundabouts: the radius follows the lane count (RADIUS_BY_LANES); the exit
     chance the number of arms; the entrance chance a degree of saturation of
-    the layout's HCM 6 capacity on the drawn road with the drawn trucks; the
+    the layout's HCM 6 capacity on the drawn road (and weather effect) with the drawn trucks; the
     entry gap's mode the lane count; the density is lower in open mode (where
     it only sets the start) and stays below the jam density of the vehicles;
     the spreads of reaction times and time gaps follow their means; the
@@ -1076,14 +1137,14 @@ def random_changes(seed: int, groups: Iterable[str] | str | None = None, *, base
         if v["n_arms"] <= 0:  # no entrances: any value will do
             return _sample(ranges["entry_rate"], rng)
         rate = _hcm_entry_rate(_sample(DEMAND_VC, rng), int(v["n_lanes"]), int(v["n_arms"]), v["exit_prob"],
-                               v["demand_imbalance"], v["road_condition"], v["truck_share"])
+                               v["demand_imbalance"], v["road_condition"], v["truck_share"], v["weather_scale"])
         return _clip(rate, ranges["entry_rate"])
 
     # In order of dependence: each line may use the values drawn above it.
     for name in ("traffic_mode", "n_lanes", "n_arms"):
         pick(name)
     pick("radius", radius)
-    for name in ("car_length", "road_condition", "truck_share"):
+    for name in ("car_length", "road_condition", "weather_scale", "truck_share"):
         pick(name)
     pick("truck_length", truck_length)
     for name in ("mean_speed", "speed_std", "reaction_time", "reaction_distance", "time_headway", "min_gap",

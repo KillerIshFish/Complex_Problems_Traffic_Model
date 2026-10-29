@@ -46,6 +46,7 @@ INK, INK2, GRID, SURFACE = PLOT["text"], PLOT["text2"], PLOT["grid"], PLOT["surf
 LINE = 1.5  # [pt] ~2 px at the saved resolution
 REF = 0.9  # [pt] reference lines (thresholds, markers)
 DASHED = (0, (4, 3))  # faint comparison lines (a baseline run, random placement)
+DOTTED = (0, (1, 2))  # a second comparison line beside a dashed one (the capacity gain references)
 DPI = 120
 NOTE_SIZE = 8.5
 
@@ -1163,6 +1164,119 @@ def sweep_figure(df: pd.DataFrame, x: str, series: str | None, *, x_label: str,
             header.legend(handles, [h.get_label() for h in handles], loc="lower left", ncol=len(handles),
                           title=legend_title, alignment="left", title_fontsize=9.5, fontsize=9.5,
                           bbox_to_anchor=(0, 0), borderaxespad=0)
+        _fit_notes(fig)
+        _fit_header(fig, gs, header)
+    return fig
+
+
+def _split_line(ax, x, y, span: tuple[float, float], **style) -> None:
+    """``y`` against ``x`` solid inside ``span`` (lo, hi) and thin dashed outside it: a fit drawn beyond the
+    points it was fitted to is an extrapolation."""
+    inside = (x >= span[0]) & (x <= span[1])
+    label = style.pop("label", None)
+    ax.plot(x, np.where(inside, y, np.nan), label=label, **style)
+    style.update(linewidth=REF, linestyle=DASHED, alpha=0.8)
+    ax.plot(x, np.where(inside, np.nan, y), **style)
+
+
+def capacity_figure(series: Sequence[dict], *, hcm: tuple[float, float], hcm_label: str,
+                    factors: Sequence[tuple[float, float, float]], validated: tuple[float, float] | None,
+                    gains: Sequence[dict], references: Sequence[tuple[str, float, float]], ref_label: str,
+                    title: str, subtitle: str, units: str = "veh/h") -> Figure:
+    """Entry capacity against conflicting flow from capacity-test runs (``experiments capacity``).
+
+    Left: every run as a dot (one colour per series), each series' fitted
+    c = A exp(-B vc) as a line (solid over the flows it was fitted to, thin
+    dashed beyond), the HCM base curve ``hcm`` = (A, B) solid grey and the
+    HCM 7 CAV factor curves (``factors``: (share, fA, fB), FHWA Table 1.7)
+    dashed grey; the conflicting flows outside ``validated`` (lo, hi) are
+    shaded (all of them when it is None). Right, when there are ``gains``
+    (two or more series): each series' capacity over the reference series'
+    against the conflicting flow with its 95 % band (over the flows both were
+    fitted to; dashed beyond), gain = 1 as the reference line and
+    ``references`` ((label, gain at 0, d ln(gain)/d vc): the 100 %-CAV curves)
+    in grey dashes and dots. ``series`` holds dicts with "label", "vc", "cap"
+    (per run), the fit's "A" and "B" and its "range" (lo, hi); ``gains`` dicts
+    with "label", "k" (palette index), "vc", "mean", "lo", "hi" and "range".
+    ``units``: of the flows and capacities (veh/h or pc/h).
+    """
+    vc_all = np.concatenate([np.asarray(s["vc"], dtype=float) for s in series]) if series else np.zeros(0)
+    top_vc = max(1200.0, 1.05 * float(np.nanmax(vc_all))) if np.isfinite(vc_all).any() else 1200.0
+    grid = np.linspace(0.0, top_vc, 200)
+    cols = 2 if gains else 1
+
+    def shade(ax) -> None:
+        lo, hi = validated if validated is not None else (top_vc, top_vc)
+        for a, b in ((0.0, lo), (hi, top_vc)) if validated is not None else ((0.0, top_vc),):
+            if b > a:
+                ax.axvspan(a, b, color=GRID, alpha=0.6, linewidth=0, zorder=0)
+
+    with matplotlib.rc_context(RC):
+        fig = Figure(figsize=(8.5 * cols, 7.4), dpi=DPI, layout="constrained")
+        fig.get_layout_engine().set(h_pad=0.08, w_pad=0.08, hspace=0.06, wspace=0.05)
+        lines = _wrap(subtitle, fig.get_figwidth())
+        gs = fig.add_gridspec(2, cols, height_ratios=(_header_ratio(len(lines), fig.get_figheight(), 1.0), 1))
+        header = fig.add_subplot(gs[0, :])
+        _header(header, title, lines)
+
+        ax = fig.add_subplot(gs[1, 0])
+        shade(ax)
+        a0, b0 = hcm
+        for share, f_a, f_b in factors:
+            ax.plot(grid, f_a * a0 * np.exp(-f_b * b0 * grid), color=INK2, linewidth=REF, linestyle=DASHED,
+                    alpha=0.7, zorder=1)
+            ax.annotate(f"{100 * share:g} %", (grid[-1], f_a * a0 * np.exp(-f_b * b0 * grid[-1])), xytext=(3, 0),
+                        textcoords="offset points", fontsize=NOTE_SIZE, color=INK2, va="center")
+        ax.plot(grid, a0 * np.exp(-b0 * grid), color=INK2, linewidth=LINE, zorder=1.5, label=hcm_label)
+        peak = a0 * max((f_a for _, f_a, _ in factors), default=1.0)
+        for k, s in enumerate(series):
+            color = SERIES_HEX[k % len(SERIES_HEX)]
+            vc, cap = np.asarray(s["vc"], dtype=float), np.asarray(s["cap"], dtype=float)
+            ax.scatter(vc, cap, s=16, color=color, alpha=0.5, linewidths=0, zorder=2)
+            if np.isfinite(s["A"]) and np.isfinite(s["B"]):
+                _split_line(ax, grid, s["A"] * np.exp(-s["B"] * grid), s.get("range", (0.0, top_vc)), color=color,
+                            linewidth=LINE, zorder=3, label=s["label"])
+            if np.isfinite(cap).any():
+                peak = max(peak, float(np.nanmax(cap)))
+        ax.set_xlim(0.0, top_vc)
+        ax.set_ylim(0.0, 1.08 * peak)
+        ax.set_xlabel(f"Conflicting flow at the test entrance, all lanes ({units})")
+        ax.set_ylabel(f"Entry capacity ({units})")
+        _legend_band(ax, 2, len(series) + 1)
+        shaded = (f"shaded = outside the validated range {validated[0]:.0f}-{validated[1]:.0f} {units}"
+                  if validated is not None else "shaded: no validated range")
+        _panel_title(ax, f"Entry capacity ({units}) against conflicting flow",
+                     "dots = runs, lines = fits ln c = ln A - B vc (thin dashes beyond the fitted runs); grey = HCM "
+                     f"base, dashed = HCM 7 with 20-100 % CAVs (FHWA-OR-RD-22-11 Table 1.7 factors); {shaded}")
+
+        if gains:
+            ax = fig.add_subplot(gs[1, 1])
+            shade(ax)
+            _ref_line(ax, 1.0)
+            ys = [1.0]
+            for (label, g0, slope), style in zip(references, (DASHED, DOTTED, (0, (6, 2, 1, 2)))):
+                curve = g0 * np.exp(slope * grid)
+                ax.plot(grid, curve, color=INK2, linewidth=REF + 0.3, linestyle=style, label=label, zorder=1.5)
+                ys += [float(curve.min()), float(curve.max())]
+            for g in gains:
+                color = SERIES_HEX[g["k"] % len(SERIES_HEX)]
+                ax.fill_between(g["vc"], g["lo"], g["hi"], color=color, alpha=0.15, linewidth=0, zorder=2)
+                _split_line(ax, g["vc"], g["mean"], g.get("range", (0.0, top_vc)), color=color, linewidth=LINE,
+                            label=g["label"], zorder=3)
+                inside = (g["vc"] >= g.get("range", (0.0, top_vc))[0]) & (g["vc"] <= g.get("range", (0.0, top_vc))[1])
+                ys += [float(np.nanmin(g["lo"])), float(np.nanmax(g["hi"]))] if np.isfinite(g["lo"]).any() else []
+                ys += [float(g["mean"][inside].min()), float(g["mean"][inside].max())] if inside.any() else []
+            lo, hi = min(ys), max(ys)
+            pad = 0.06 * max(hi - lo, 0.1)
+            ax.set_ylim(max(0.0, lo - pad), hi + pad)
+            ax.set_xlim(0.0, top_vc)
+            ax.set_xlabel(f"Conflicting flow at the test entrance, all lanes ({units})")
+            ax.set_ylabel(f"Capacity / capacity at {ref_label}")
+            _legend_band(ax, 2, len(gains) + len(references))
+            _panel_title(ax, f"Capacity gain over {ref_label}",
+                         "line = fitted gain fA exp(-(B - B_ref) vc) (thin dashes beyond the flows both were fitted "
+                         "to), band = 95 % bootstrap over the seeds; line at 1 = no gain; grey dashes and dots = the "
+                         "100 % CAV references")
         _fit_notes(fig)
         _fit_header(fig, gs, header)
     return fig

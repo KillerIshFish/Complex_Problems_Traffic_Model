@@ -53,8 +53,8 @@ import pygame
 import pygame.gfxdraw
 
 from roundabout_sim import cli, palette, state
-from roundabout_sim.config import (NEEDS_NONZERO, PARAM_BY_NAME, PARAMS, SimConfig, axis_label, changed_settings,
-                                   coerce, idle_note, inactive_reason)
+from roundabout_sim.config import (NEEDS_NONZERO, NEEDS_WEATHER, PARAM_BY_NAME, PARAMS, TEST_FIXED, SimConfig,
+                                   axis_label, changed_settings, coerce, idle_note, inactive_reason)
 from roundabout_sim.experiments import range_values
 from roundabout_sim.metrics import LOS_LIMITS
 from roundabout_sim.textfmt import base_text, format_number, plural, significant, value_text
@@ -270,6 +270,18 @@ COLUMN_LABELS = {
     "entry_vc": "Entry v/c (busiest entrance)", "entry_los": "Entry LOS",
     "mean_entry_delay": "Mean entry delay (s, queue wait)", "throughput_per_h": "Throughput (veh/h)",
     "longest_queue": "Longest queue, mean over time (cars)", "peak_queue": "Longest queue, longest seen (cars)",
+    "speed_sd_pooled": "Speed SD, pooled over cars and time (m/s)",
+    **{f"lane{k}_speed_sd": f"Speed SD on lane {k} (m/s, 0 = innermost)" for k in range(5)},
+    "subject_cap_h": "Capacity test: capacity (veh/h)",
+    "subject_cap15_h": "Capacity test: capacity, busiest 15 min x 4 (veh/h)",
+    "subject_cap_pch": "Capacity test: capacity (pc/h)",
+    "subject_vc_h": "Capacity test: conflicting flow, all lanes (veh/h)",
+    "subject_vc_pch": "Capacity test: conflicting flow, all lanes (pc/h)",
+    "subject_vc_outer_h": "Capacity test: conflicting flow, outer lane (veh/h)",
+    "subject_queue_empty_share": "Capacity test: share with an empty queue (0-1)",
+    "subject_tf": "Capacity test: follow-up headway (s)",
+    "subject_tc_raff": "Capacity test: Raff critical gap (s)",
+    "subject_tc_raff_count": "Capacity test: Raff critical gap, by counts (s)",
 }
 
 
@@ -882,7 +894,9 @@ class FormVar:
 # What to change when a setting picked for a new sweep would do nothing in any of its runs.
 IDLE_FIX = {"open mode only": "pick Traffic mode too (with open), or start from open-mode base settings",
             "no entrances": "pick Arms too, or start from base settings with entrances",
-            "no trucks": "pick Truck share too, or start from base settings with trucks"}
+            "no trucks": "pick Truck share too, or start from base settings with trucks",
+            "dry road": "pick Road condition too, or start from base settings off a dry road",
+            "capacity test": "pick Capacity test too (with off), or start from base settings without it"}
 
 
 def param_help(spec, chosen: bool, idle: str = "") -> str:
@@ -943,11 +957,13 @@ def help_texts() -> list[str]:
     texts += [POINTS_HELP.format(cap=cap, role=role) for cap, role in
               zip(MAX_POINTS, ("x axis (1st setting)", "series (one line per value)", "3rd setting"))]
     for spec in PARAMS:
-        idle = f"{spec.applies_in} mode only" if spec.applies_in else NEEDS_NONZERO.get(spec.name, ("", ""))[1]
+        idle = f"{spec.applies_in} mode only" if spec.applies_in else NEEDS_NONZERO.get(spec.name, ("", ""))[1] \
+            or ("dry road" if spec.name in NEEDS_WEATHER else "")
         texts += [param_help(spec, True), param_help(spec, False, idle), f"{setting_label(spec.name)}: {spec.help}",
                   SLICE_HELP.format(label=setting_label(spec.name))]
     texts.append(idle_text({setting_label(n): "open mode only" for n in ("entry_rate", "demand_imbalance",
                                                                          "demand_profile")}))
+    texts += [param_help(PARAM_BY_NAME[name], False, "capacity test") for name in TEST_FIXED]
     texts += [metric_info(name, x, True).help for name in known_metrics() for x in ("", "density")]
     return texts
 

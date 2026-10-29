@@ -26,6 +26,15 @@ Examples::
     # browse the results
     python -m roundabout_sim.experiments view
 
+    # entry capacity against conflicting flow (the capacity test; FHWA-OR-RD-22-11's design: 300 s + 7,200 s, 5
+    # seeds), then the HCM form fitted to it
+    python -m roundabout_sim.experiments sweep --x entry_rate=0:0.15:0.01 --preset us_single_lane \\
+        --set subject_arm=on --seeds 5 --warmup 300 --measure 7200 --out results/cap
+    python -m roundabout_sim.experiments capacity results/cap.csv
+
+    # every metric of each run against the same seed's run at road_condition=dry, with 95 % CIs
+    python -m roundabout_sim.experiments compare results/sweep.csv --ref road_condition=dry
+
 Any model parameter can be set with ``--set name=value`` (repeatable) or its
 own flag (``--density 70``); ``--help`` on each command lists them all.
 ``--preset NAME`` or ``--random SEED`` give the base settings first
@@ -49,6 +58,16 @@ Outputs
          PREFIX.png             metrics against the x (mean across seeds, band = min-max);
                                 plans and samples: every run against each varied setting
          PREFIX_heatmap.png     2+ grid settings: x by series cells of the headline metrics
+  capacity
+         SWEEP_capacity.csv     one row per series: the fit c = A exp(-B vc) with 95 % bootstrap
+                                CIs, its ratio to the HCM base curve, tf and Raff tc, fA, fB
+                                (fitted and from the headways), the gain at vc 0/400/800/1200
+                                and d ln(gain)/d vc against the reference series
+         SWEEP_capacity.png     capacity against conflicting flow (runs, fits, HCM curves) and
+                                the gain over the reference series
+  compare
+         SWEEP_compare.csv      per point and metric: each seed's run against the same seed's
+                                run at the reference value, mean difference and ratio, 95 % CI
 
 CSV columns: settings are named exactly like the parameters (density, n_lanes,
 reaction_time, ...). A measurement that shares a parameter's name carries a
@@ -64,6 +83,7 @@ import argparse
 import csv
 import itertools
 import json
+import math
 import os
 import sys
 import time
@@ -78,8 +98,8 @@ import pandas as pd
 from roundabout_sim import cli, state
 from roundabout_sim.config import (PARAM_BY_NAME, PARAMS, SimConfig, axis_label, changed_settings, idle_note,
                                    inactive_reason)
-from roundabout_sim.engine import (MAX_DECEL, PEAK_PERIOD, SLOW_FRACTION, TWO_PI, RingSim, braking_limits,
-                                   mean_demand_factor)
+from roundabout_sim.engine import (LOG_HORIZON, MAX_DECEL, PEAK_PERIOD, SLOW_FRACTION, SUBJECT_ARM, SUBJECT_QUEUE,
+                                   TWO_PI, RingSim, braking_limits, mean_demand_factor)
 from roundabout_sim.metrics import LOS_LIMITS, RATE_WINDOW, Recorder, entry_vc, level_of_service, los_text
 from roundabout_sim.palette import SERIES_HEX
 from roundabout_sim.textfmt import plain as _plain
@@ -113,6 +133,35 @@ PATTERN_SPEED_CAP = 20.0  # [m/s] fastest a pattern may move between two samples
 BASELINE_COLUMNS = ("jam_fraction", "stops_per_car_min", "n_jams", "flux", "measured_mean_speed")
 INIT_SPACING_NOTE = ("Initial spacing shapes the start; near the jam threshold it can lock in jams, elsewhere it "
                      "fades in 1-2 min (use --warmup 0 to see the transient)")
+# experiments capacity. FHWA-OR-RD-22-11 Table 1.7 (= Table 7.4): the HCM 7 CAV factors (share, fA, fB) for a
+# single-lane entry against one circulating lane and against two (0 % is 1.00 / 1.00).
+CAV_FACTORS = {1: ((0.2, 1.05, 0.99), (0.4, 1.12, 0.97), (0.6, 1.22, 0.94), (0.8, 1.29, 0.90), (1.0, 1.35, 0.85)),
+               2: ((0.2, 1.03, 0.99), (0.4, 1.08, 0.96), (0.6, 1.18, 0.92), (0.8, 1.28, 0.89), (1.0, 1.38, 0.85))}
+# (gain at vc 0, d ln(gain) / d vc [per pc/h]) at 100 % CAVs, single-lane entry against one circulating lane.
+# HCM 7: gain = fA exp((1 - fB) B vc), so (1 - 0.85) x 1.02e-3 = +1.53e-4 (derived); FHWA made those factors
+# from Raff tc and tf by Siegloch (FHWA-OR-RD-22-11 Eqs. 7-7 to 7-12: capacity_table's *_hw columns). Its own
+# simulated capacities (Sec. 7.3.1, p. 114: +36 % at vc 0 rising to +116 % at 1,200 pc/h) rise more steeply:
+# ln(2.16 / 1.36) / 1200 = +3.9e-4 (derived), the like-for-like check of the fitted gains. Jiang et al. 2022
+# (J. Transp. Eng. A 148(5) 04022014), 1.40 at vc 0 falling to 1.26 at 1,200 veh/h: ln(1.26 / 1.40) / 1200 =
+# -8.8e-5 (derived); *assumption*: a secondary value, the paper not read, unverified and at odds with Sec. 7.3.1.
+FHWA_SIM_GAIN = (1.36, math.log(2.16 / 1.36) / 1200.0)
+JIANG_GAIN = (1.40, math.log(1.26 / 1.40) / 1200.0)
+GAIN_VC = (0.0, 400.0, 800.0, 1200.0)  # [veh/h] conflicting flows the gains and HCM ratios are reported at
+V1_TOLERANCE = 0.10  # validated: the reference series' capacity within +-10 % of the HCM base (*assumption*)
+BOOTSTRAP = 2000  # resamples of the seeds for the capacity CIs (percentile intervals; seeded, reproducible)
+# Percentile bootstrap intervals over fewer seeds than this are too narrow: a 95 % interval of a mean covers
+# 0.76 of the time with 3 seeds, 0.84 with 5 and 0.90 with 10 (derived: Monte Carlo, normal data, 2,000 trials).
+FEW_SEEDS = 10
+# The capacity columns experiments capacity can fit, each with its conflicting flow.
+CAP_COLUMNS = {"subject_cap_h": "subject_vc_h", "subject_cap15_h": "subject_vc_h",
+               "subject_cap_pch": "subject_vc_pch"}
+CAP15 = 900.0  # [s] subject_cap15_h: 4 x the most entries in one 15-minute interval (FHWA-OR-RD-22-11 p. 111)
+# experiments compare: Student t 0.975 quantiles for 1-30 degrees of freedom (any t table); beyond, the
+# Cornish-Fisher series of Abramowitz & Stegun 26.7.5 (error < 1e-4 there).
+T975 = (12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160, 2.145, 2.131,
+        2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042)
+COMPARE_METRICS = ("flux", "measured_mean_speed", "jam_fraction", "stops_per_car_min", "speed_sd_pooled",
+                   "emergency_per_min", "mean_entry_delay", "throughput_per_h", "subject_cap_h")  # the default
 
 DEFINITIONS = f"""\
 measured columns (CSV) and how to read them
@@ -229,7 +278,57 @@ measured columns (CSV) and how to read them
                        F whenever entry_vc > 1, as the HCM rates an entry lane
                        (with max_queue turning arrivals away, the wait of the
                        cars that got in no longer shows it)
-  throughput_per_h     cars leaving the ring per hour"""
+  throughput_per_h     cars leaving the ring per hour
+  speed_sd_pooled      spread of the speeds over the cars and the window [m/s]:
+                       sqrt(mean of measured_speed_std^2 + variance of
+                       measured_mean_speed) over the samples, Stern et al.
+                       2018's speed SD (3.31 m/s in waves, 0.64 with their
+                       wave-smoothing car). Higher = more stop-and-go
+  lane0_speed_sd       the same on each lane (0 = innermost; lane1_speed_sd,
+                       lane2_speed_sd, lane3_speed_sd, lane4_speed_sd), empty
+                       for a lane the run does not have
+  subject_cap_h        CAPACITY TEST (subject_arm on, open mode; empty
+                       otherwise): entries per hour from the bottom entrance,
+                       whose queue is kept full: its capacity [veh/h], against
+                       its conflicting flow subject_vc_h. experiments capacity
+                       fits c = A exp(-B vc) to these (HCM form). In these runs
+                       queued, longest_queue, peak_queue, mean_entry_delay and
+                       entry_los leave the test entrance's standing queue out
+  subject_cap15_h      the capacity as FHWA-OR-RD-22-11 p. 111 measures it: 4 x
+                       the most entries in one of the consecutive 15-minute
+                       intervals of the window [veh/h] (empty for a window
+                       under 15 min); above subject_cap_h, the more so the
+                       lower the capacity
+  subject_cap_pch      the same as subject_cap_h in passenger cars per hour (a
+                       truck counts as 2: the HCM 6 E_T)
+  subject_vc_h         conflicting flow at the test entrance [veh/h]: the
+                       circulating vehicles passing its entry point, every
+                       lane. Every other car passes it once, so the Entrance
+                       chance of the other entrances sets it
+  subject_vc_pch       the same in passenger cars per hour (a truck counts as
+                       2), the flow to set against subject_cap_pch
+  subject_vc_outer_h   the same, outer lane only (the lane entering cars merge
+                       into; = subject_vc_h on a one-lane ring)
+  subject_queue_empty_share  share of the window the test entrance had no car
+                       waiting: must be 0 (else it was not saturated)
+  subject_tf           follow-up headway [s]: mean time between consecutive
+                       entries from the test entrance with no outer-lane car
+                       passing in between (FHWA-OR-RD-22-11's measure; the
+                       model gives follow_up + one time step)
+  subject_tc_raff      critical gap [s] by Raff's method on the gaps between
+                       outer-lane cars passing the test entry point (accepted:
+                       a car entered in it; rejected: every other, as the
+                       queue is never empty): the gap length where the share
+                       of the accepted gaps shorter than it equals the share
+                       of the rejected gaps longer than it, the crossing of
+                       their cumulative distributions (FHWA-OR-RD-22-11 p.
+                       117, its Table 7.1 estimator). Not the model's
+                       entry_gap, which is a lag to the car behind, nor HCM's
+                       Siegloch tc
+  subject_tc_raff_count  the same with counts for shares: as many accepted gaps
+                       shorter as rejected gaps longer (Raff 1950, as
+                       FHWA-OR-RD-22-11 p. 110 words it). Short rejected gaps
+                       (a platoon's) lower subject_tc_raff, not this"""
 
 # Recorder columns averaged over a measurement window.
 MEAN_COLUMNS = ("cars", "queued", "longest_queue", "density", "mean_speed", "mean_free_speed", "speed_std",
@@ -243,6 +342,12 @@ SUMMARY_COLUMNS = ("measured_density", "measured_mean_speed", "flux", "jam_fract
                    "order_param", "emergency_per_min", "wave_speed", "mean_entry_delay")
 OPEN_COLUMNS = ("cars", "queued", "demand_per_min", "blocked_per_min", "entry_vc", "throughput_per_h")
 TRUCK_COLUMNS = ("trucks", "truck_speed", "car_speed")
+SUBJECT_PRINTED = ("subject_vc_h", "subject_cap_h", "subject_tf", "subject_tc_raff")  # printed with capacity tests
+# The capacity test's columns, in every summary (NaN without the test), so sweep CSVs stay rectangular.
+SUBJECT_COLUMNS = ("subject_cap_h", "subject_cap15_h", "subject_cap_pch", "subject_vc_h", "subject_vc_pch",
+                   "subject_vc_outer_h", "subject_queue_empty_share", "subject_tf", "subject_tc_raff",
+                   "subject_tc_raff_count")
+LANE_SD_LANES = 5  # lane{k}_speed_sd columns for k below this (the slider's most lanes), NaN for lanes a run lacks
 
 
 # ----------------------------------------------------------------- analysis
@@ -384,13 +489,172 @@ def wave_speed(times: np.ndarray, speeds: np.ndarray, radius: float, t_from: flo
     return float(lags_a @ shifts_a / (lags_a @ lags_a) * bin_arc)
 
 
+def pooled_sd(std, mean) -> float:
+    """sqrt(mean(std^2) + var(mean)) over the samples that have both (``std``, ``mean``: each sample's spread
+    and mean of the speeds): the spread over the vehicles and the time, as Stern et al. 2018 report it (the law
+    of total variance with every sample weighted alike). NaN if no sample has both."""
+    s, m = np.asarray(std, dtype=float), np.asarray(mean, dtype=float)
+    ok = np.isfinite(s) & np.isfinite(m)
+    return float(np.sqrt(np.mean(s[ok] ** 2) + np.var(m[ok]))) if ok.any() else float("nan")
+
+
+def gap_acceptance(entries, passes) -> tuple[np.ndarray, np.ndarray]:
+    """(accepted, rejected) gaps [s] at a saturated entrance: the headways between consecutive circulating
+    vehicles passing its entry point (``passes``: times, in order), accepted when at least one queued car
+    entered in it (``entries``: times; a gap runs from one passing up to the next, and an entry in the same
+    step as a passing comes after it, as the engine moves cars before it lets any in). With a queue that is
+    never empty every gap was offered: FHWA-OR-RD-22-11 p. 110 counts as rejected "any headway between
+    circulating vehicles not taken by an entering vehicle waiting at the approach"."""
+    p, e = np.asarray(passes, dtype=float), np.asarray(entries, dtype=float)
+    if p.size < 2:
+        return np.zeros(0), np.zeros(0)
+    gaps = np.diff(p)
+    k = np.searchsorted(p, e, side="right") - 1  # the gap each entry falls in (-1: before the first passing)
+    taken = np.zeros(gaps.size, dtype=bool)
+    taken[k[(k >= 0) & (k < gaps.size)]] = True
+    return gaps[taken], gaps[~taken]
+
+
+def raff_critical_gap(accepted, rejected, shares: bool = False) -> float:
+    """Raff's (1950) critical gap [s]: the gap length t at which the number of accepted gaps shorter than t
+    equals the number of rejected gaps longer than t, as FHWA-OR-RD-22-11 p. 110 words it; with ``shares``,
+    the share of the accepted gaps shorter than t equals the share of the rejected gaps longer than t: the
+    crossing of the cumulative distribution of the accepted gaps and the reversed one of the rejected gaps,
+    as FHWA computed Table 7.1 (p. 117; :func:`raff_cdf_critical_gap`).
+
+    Exactly: D(t) = #{accepted < t} - #{rejected > t} (shares: each count
+    over its total) never falls as t grows, and changes only at the gap
+    lengths; the estimate is the midpoint of the interval of t where D = 0,
+    from inf{t: D(t) >= 0} to inf{t: D(t) > 0} (where D jumps past 0 at one
+    length, that length). So drivers who accept every gap above g and none
+    below give the midpoint of the longest rejected and the shortest accepted
+    gap either way. The two differ where the gaps are lopsided: more rejected
+    gaps shorter than t (a platoon's) lower the shares' estimate and leave the
+    counts' alone (FHWA's explanation of the CAV drop in Table 7.1, p. 117).
+    NaN without an accepted or a rejected gap.
+    """
+    a, r = np.sort(np.asarray(accepted, dtype=float)), np.sort(np.asarray(rejected, dtype=float))
+    if a.size == 0 or r.size == 0:
+        return float("nan")
+    u = np.unique(np.concatenate((a, r)))
+    # D just above each length (on the open interval to the next one): below all of them it is < 0, above all
+    # of them > 0, and at a length itself it is no more than just above it. (Shares compared as whole numbers:
+    # #a/na - #r/nr has the sign of #a nr - #r na.)
+    shorter, longer = np.searchsorted(a, u, side="right"), r.size - np.searchsorted(r, u, side="right")
+    above = shorter * r.size - longer * a.size if shares else shorter - longer
+    return float(0.5 * (u[np.argmax(above >= 0)] + u[np.argmax(above > 0)]))
+
+
+def raff_cdf_critical_gap(accepted, rejected) -> float:
+    """Raff's critical gap [s] from the cumulative distributions (FHWA-OR-RD-22-11 p. 117, Table 7.1): where
+    the share of the accepted gaps shorter than t equals the share of the rejected gaps longer than t
+    (:func:`raff_critical_gap` with shares)."""
+    return raff_critical_gap(accepted, rejected, shares=True)
+
+
+def follow_up_headway(entries, passes) -> float:
+    """Mean headway [s] of consecutive entries from a saturated entrance with no circulating vehicle passing
+    its entry point between them (``entries``, ``passes``: times, in order): the follow-up headway as
+    FHWA-OR-RD-22-11 p. 110 measures it ("consecutive queued vehicles entering ... within the same gap").
+    NaN with no such pair."""
+    e, p = np.asarray(entries, dtype=float), np.asarray(passes, dtype=float)
+    if e.size < 2:
+        return float("nan")
+    gap = np.searchsorted(p, e, side="right")  # passings up to each entry (in its step: before it)
+    same = gap[1:] == gap[:-1]
+    return float(np.diff(e)[same].mean()) if same.any() else float("nan")
+
+
+class SubjectTap:
+    """The capacity test's events from now on: the subject entrance's entry times and the times outer-lane
+    vehicles passed its entry point, copied from the engine's logs (which keep only LOG_HORIZON s) as they
+    come, so the gap statistics of :func:`summarise` cover a measured window of any length. :func:`advance`
+    polls it after every step; read-only on the simulation."""
+
+    def __init__(self, sim: RingSim):
+        self.sim = sim
+        self.entries: list[float] = []
+        self.passes: list[float] = []
+        self._upto = sim.time  # events logged at this time or later are new
+        self.start = sim.time  # it holds every event from this time on
+
+    @classmethod
+    def from_logs(cls, sim: RingSim, since: float) -> SubjectTap:
+        """The events the engine's logs still hold from ``since`` on (at most the last LOG_HORIZON s)."""
+        tap = cls(sim)
+        tap._upto, tap.start = since, max(since, sim.time - LOG_HORIZON)
+        tap.poll()
+        return tap
+
+    def poll(self) -> None:
+        sim, upto = self.sim, self._upto
+        self.entries += [t for t, arm, _ in _logged_since(sim.entry_log, upto) if arm == SUBJECT_ARM]
+        self.passes += [t for t, arm, lane, _ in _logged_since(sim.conflict_log, upto)
+                        if arm == SUBJECT_ARM and lane == sim.outer]
+        self._upto = sim.time  # (every event of the steps so far was logged at an earlier time)
+
+
+def _logged_since(log, since: float) -> list:
+    """Entries of a time-ordered engine log at ``since`` or later, oldest first (read-only)."""
+    recent = []
+    for entry in reversed(log):
+        if entry[0] < since:
+            break
+        recent.append(entry)
+    return recent[::-1]
+
+
+def peak_quarter(entries, t0: float, t1: float, start: float) -> float:
+    """[veh/h] 4 x the most ``entries`` (times) in one of the consecutive whole CAP15-s intervals from ``t0`` up
+    to ``t1``: FHWA-OR-RD-22-11 p. 111's capacity (the busiest of eight 15-minute counts in its 2 h, x 4). NaN
+    without a whole interval, or if the entries are known only from ``start`` on, after ``t0``."""
+    k = int(math.floor((t1 - t0) / CAP15 + 1e-6))  # (the clock is a sum of steps: 899.99999 s is 15 min)
+    if k < 1 or start > t0 + 1e-6:
+        return float("nan")
+    e = np.asarray(entries, dtype=float)
+    which = np.floor((e[(e >= t0) & (e < t0 + k * CAP15)] - t0) / CAP15).astype(int)
+    return 3600.0 / CAP15 * float(np.bincount(np.minimum(which, k - 1), minlength=k).max())
+
+
+def subject_columns(sim: RingSim, now: dict, start: dict, t0: float, tap: SubjectTap | None) -> dict:
+    """The capacity test's summary columns (SUBJECT_COLUMNS) from ``t0`` to now (:func:`_counters` then,
+    ``start``, and ``now``), with the gap statistics and the 15-minute counts from ``tap``; all NaN without
+    the test."""
+    if not sim.subject:
+        return dict.fromkeys(SUBJECT_COLUMNS, float("nan"))
+    from roundabout_sim.presets import TRUCK_PCE
+
+    def count(key: str) -> float:
+        return float(now[key][SUBJECT_ARM] - start[key][SUBJECT_ARM])
+
+    span = max(sim.time - t0, 1e-9)
+    per_h = 3600.0 / span
+    entries, passes = (tap.entries, tap.passes) if tap is not None else ([], [])
+    accepted, rejected = gap_acceptance(entries, passes)
+    return {
+        "subject_cap_h": per_h * count("arm_entered"),
+        "subject_cap15_h": peak_quarter(entries, t0, sim.time, tap.start) if tap is not None else float("nan"),
+        "subject_cap_pch": per_h * (count("arm_entered") + (TRUCK_PCE - 1.0) * count("arm_entered_trucks")),
+        "subject_vc_h": per_h * count("arm_passed"),
+        "subject_vc_pch": per_h * (count("arm_passed") + (TRUCK_PCE - 1.0) * count("arm_passed_trucks")),
+        "subject_vc_outer_h": per_h * count("arm_passed_outer"),
+        # (the time with a queue is summed per step like the clock: 1 - busy / span is float noise when full)
+        "subject_queue_empty_share": round(max(0.0, 1.0 - count("queue_busy") / span), 9),
+        "subject_tf": follow_up_headway(entries, passes),
+        "subject_tc_raff": raff_cdf_critical_gap(accepted, rejected),
+        "subject_tc_raff_count": raff_critical_gap(accepted, rejected),
+    }
+
+
 def _counters(sim: RingSim) -> dict[str, float | np.ndarray]:
     return {"exits": sim.n_exited, "missed": sim.n_missed, "lane_changes": sim.n_lane_changes,
             "emergency": sim.n_emergency, "stops": sim.n_stops, "arrivals": sim.n_arrived,
             "entries": sim.n_entered, "blocked": sim.n_blocked, "entry_wait": sim.entry_wait_total,
-            # per entrance, for entry_vc
+            # per entrance, for entry_vc and the capacity test
             "arm_arrived": sim.arm_arrived.copy(), "arm_entered": sim.arm_entered.copy(),
-            "queue_busy": sim.queue_busy.copy()}
+            "queue_busy": sim.queue_busy.copy(), "arm_passed": sim.arm_passed.copy(),
+            "arm_passed_outer": sim.arm_passed_outer.copy(), "arm_passed_trucks": sim.arm_passed_trucks.copy(),
+            "arm_entered_trucks": sim.arm_entered_trucks.copy(), "arm_entry_wait": sim.arm_entry_wait.copy()}
 
 
 def measured_names(names) -> dict[str, str]:
@@ -403,15 +667,19 @@ def settings(sim: RingSim) -> dict:
     return {**{name: getattr(sim.cfg, name) for name in CONFIG_NAMES}, "seed": sim.seed}
 
 
-def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int]) -> dict:
+def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int], tap: SubjectTap | None = None) -> dict:
     """Metrics from ``t0`` to now (``start`` = :func:`_counters` at ``t0``).
 
     Sampled metrics are averaged over the window; event rates come from the
     engine's counters, so they count exactly the events inside the window
     (``mean_entry_delay`` too: the queue wait of exactly the cars that entered
-    in it; and ``entry_vc``). ``stop_go_onset`` and ``congestion_onset`` are
-    measured from the start of the run. ``entry_los`` is the one text column.
-    Metrics that share a parameter's name get a ``measured_`` prefix.
+    in it, those of the capacity test's entrance left out; and ``entry_vc``;
+    and the capacity test's flows). ``stop_go_onset``
+    and ``congestion_onset`` are measured from the start of the run.
+    ``entry_los`` is the one text column. Metrics that share a parameter's
+    name get a ``measured_`` prefix. The capacity test's gap statistics come
+    from ``tap`` (a :class:`SubjectTap` started at ``t0``), else from what the
+    engine's logs still hold (the last LOG_HORIZON s of the window).
     """
     frame = rec.frame()
     window = frame[frame["time"] >= t0]
@@ -428,7 +696,12 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int]) -> 
     jams = mean["jam_fraction"] >= JAM_PRESENT
     wave = wave_speed(times, speeds, float(sim.radii.mean()), t0) if jams else float("nan")
     entered = now["entries"] - start["entries"]
-    delay = (now["entry_wait"] - start["entry_wait"]) / entered if entered > 0 else float("nan")
+    wait = now["entry_wait"] - start["entry_wait"]
+    if sim.subject:  # the capacity test's standing queue is an instrument: its entrants' wait is left out
+        others = np.arange(sim.n_arms) != SUBJECT_ARM
+        entered = int((now["arm_entered"] - start["arm_entered"])[others].sum())
+        wait = float((now["arm_entry_wait"] - start["arm_entry_wait"])[others].sum())
+    delay = wait / entered if entered > 0 else float("nan")
     vc = entry_vc(*(now[k] - start[k] for k in ("arm_arrived", "arm_entered", "queue_busy")), span) \
         if sim.open_demand else float("nan")  # closed mode has no demand of its own
     row = {
@@ -459,6 +732,12 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int]) -> 
         "entry_vc": vc,
         "entry_los": level_of_service(delay, vc),
         "throughput_per_h": 60.0 * per_min("exits"),
+        "speed_sd_pooled": pooled_sd(window["speed_std"], window["mean_speed"]),
+        **{f"lane{k}_speed_sd": pooled_sd(window[f"lane{k}_speed_std"], window[f"lane{k}_speed"])
+           if f"lane{k}_speed_std" in window and f"lane{k}_speed" in window else float("nan")
+           for k in range(LANE_SD_LANES)},
+        **subject_columns(sim, now, start, t0,
+                          tap if tap is not None or not sim.subject else SubjectTap.from_logs(sim, t0)),
     }
     # Measurements named like a parameter (density, mean_speed, ...) must not overwrite its setting.
     renames = measured_names(row)
@@ -466,10 +745,14 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int]) -> 
 
 
 # --------------------------------------------------------------- simulation
-def advance(sim: RingSim, rec: Recorder, seconds: float, on_sample: Callable[[], None] | None = None) -> None:
-    """Step ``sim`` for ``seconds``, recording; ``on_sample`` runs after each new sample."""
+def advance(sim: RingSim, rec: Recorder, seconds: float, on_sample: Callable[[], None] | None = None,
+            tap: SubjectTap | None = None) -> None:
+    """Step ``sim`` for ``seconds``, recording; ``on_sample`` runs after each new sample, and ``tap`` (the
+    capacity test's events) is polled after every step."""
     for _ in range(int(round(seconds / sim.cfg.dt))):
         sim.step()
+        if tap is not None:
+            tap.poll()
         before = len(rec.rows)
         rec.update()
         if on_sample is not None and len(rec.rows) > before:
@@ -514,8 +797,9 @@ def _sweep_job(job: tuple[dict, int, float, float, float]) -> dict:
     rec = Recorder(sim, interval)
     advance(sim, rec, warmup)
     start = _counters(sim)
-    advance(sim, rec, measure)
-    return {**settings(sim), **summarise(sim, rec, warmup, start)}
+    tap = SubjectTap(sim) if sim.subject else None
+    advance(sim, rec, measure, tap=tap)
+    return {**settings(sim), **summarise(sim, rec, warmup, start, tap)}
 
 
 # ------------------------------------------------------------- CLI parsing
@@ -974,6 +1258,11 @@ def _pct(value, digits: int = 1) -> str:
     return _fmt(100 * value if isinstance(value, float) and np.isfinite(value) else value, digits)
 
 
+def _g(value) -> str:
+    """Three significant figures, "-" for a missing value."""
+    return "-" if value is None or not np.isfinite(value) else f"{value:.3g}"
+
+
 # ---------------------------------------------------------------- commands
 def _simulate(cfg: SimConfig, duration: float, interval: float, late_from: float,
               keep_speeds: bool = False) -> tuple[RingSim, Recorder, dict, list[np.ndarray]]:
@@ -982,10 +1271,11 @@ def _simulate(cfg: SimConfig, duration: float, interval: float, late_from: float
     rec = Recorder(sim, interval)
     advance(sim, rec, late_from)
     start = _counters(sim)
+    tap = SubjectTap(sim) if sim.subject else None
     car_speeds: list[np.ndarray] = []
     advance(sim, rec, duration - late_from,
-            (lambda: car_speeds.append(sim.v[sim.alive].copy())) if keep_speeds else None)
-    return sim, rec, summarise(sim, rec, late_from, start), car_speeds
+            (lambda: car_speeds.append(sim.v[sim.alive].copy())) if keep_speeds else None, tap)
+    return sim, rec, summarise(sim, rec, late_from, start, tap), car_speeds
 
 
 def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -1113,6 +1403,11 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
         ("Longest queue", _fmt(summary["longest_queue"], 1),
          f"cars on average (at most {_fmt(summary['peak_queue'], 0)})"),
         ("Throughput", _fmt(summary["throughput_per_h"], 0), "veh/h leaving the ring"),
+        *([("Capacity test entrance", _fmt(summary["subject_cap_h"], 0),
+            f"veh/h ({_fmt(summary['subject_cap_pch'], 0)} pc/h) against {_fmt(summary['subject_vc_h'], 0)} veh/h "
+            f"circulating; follow-up {_fmt(summary['subject_tf'])} s, Raff critical gap "
+            f"{_fmt(summary['subject_tc_raff'])} s")] if sim.subject else []),
+        ("Speed spread (pooled)", _fmt(summary["speed_sd_pooled"]), "m/s over the cars and the time (Stern 2018's SD)"),
     ]
     if args.baseline and base_frame is None:
         rows.append(("Baseline: same run, exit_prob 0", "skipped", f"({skipped}; columns left empty)"))
@@ -1135,7 +1430,9 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
 
 
 IDLE_FIX = {"open mode only": "add --set traffic_mode=open, or vary traffic_mode too",
-            "no entrances": "set n_arms above 0", "no trucks": "set truck_share above 0"}
+            "no entrances": "set n_arms above 0", "no trucks": "set truck_share above 0",
+            "dry road": "set road_condition to wet, snow or ice, or vary it too",
+            "capacity test": "set subject_arm=off: the capacity test fixes every route"}
 
 
 def idle_notes(names, configs: list[SimConfig]) -> list[str]:
@@ -1209,6 +1506,8 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         demand = (f", {_fmt(r['cars'], 0)} cars + {_fmt(r['queued'], 0)} queued, entry delay "
                   f"{_fmt(r['mean_entry_delay'], 1)} s, blocked {_fmt(r['blocked_per_min'], 1)}/min"
                   if r["traffic_mode"] == "open" else "")
+        if np.isfinite(r["subject_cap_h"]):
+            demand += f", test entrance {_fmt(r['subject_cap_h'], 0)} veh/h at vc {_fmt(r['subject_vc_h'], 0)}"
         print(f"[{done:3d}/{len(jobs)}] {_where(design, job // args.seeds, r)}seed={r['seed']}: "
               f"flux {_fmt(r['flux'], 3)} cars/s, speed {_fmt(r['measured_mean_speed'])} m/s, "
               f"jammed {_pct(r['jam_fraction'], 0)} % (from {_fmt(r['congestion_onset'], 0)} s), "
@@ -1246,6 +1545,7 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
 
     open_runs = bool((df["traffic_mode"] == "open").any())
     truck_runs = bool((df["truck_share"] > 0).any())
+    subject_runs = bool(np.isfinite(df["subject_cap_h"].astype(float)).any())
     panels = headline_panels(open_runs, STOP_GO_ONSET)
     subtitle = _held_text(df, design, setup)
     times = f"{args.warmup:g} s warm-up + {args.measure:g} s measured"
@@ -1326,8 +1626,9 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
     if design.kind == "sample":
         _print_sample(df, design, [p.column for p in panels])
     else:
-        columns = list(SUMMARY_COLUMNS) + list(OPEN_COLUMNS * open_runs) + list(TRUCK_COLUMNS * truck_runs)
-        _print_means(df, keys, columns, open_runs, truck_runs)
+        columns = list(SUMMARY_COLUMNS) + list(OPEN_COLUMNS * open_runs) + list(TRUCK_COLUMNS * truck_runs) \
+            + list(SUBJECT_PRINTED * subject_runs)
+        _print_means(df, keys, columns, open_runs, truck_runs, subject_runs)
         _print_arm_shares(df, keys)
     print(f"\nwrote {', '.join(written[:-1])} and {written[-1]} ({time.time() - t_wall:.0f} s)")
 
@@ -1392,7 +1693,8 @@ def _json_value(value):
     raise TypeError(f"{type(value).__name__} is not JSON serialisable")
 
 
-def _print_means(df: pd.DataFrame, keys: list[str], columns: list[str], open_runs: bool, truck_runs: bool) -> None:
+def _print_means(df: pd.DataFrame, keys: list[str], columns: list[str], open_runs: bool, truck_runs: bool,
+                 subject_runs: bool = False) -> None:
     """The means across seeds of every point (grid or plan): one row per combination of the varied settings."""
     table = df.groupby(keys, sort=False)[columns].mean() if keys else df[columns].mean().to_frame("all runs").T
     table[["jam_fraction", "following_jam_share"]] *= 100
@@ -1408,7 +1710,8 @@ def _print_means(df: pd.DataFrame, keys: list[str], columns: list[str], open_run
                                   "wave_speed": "wave_m/s", "mean_entry_delay": "delay_s",
                                   "demand_per_min": "demand/min", "blocked_per_min": "blocked/min",
                                   "entry_vc": "v/c", "throughput_per_h": "veh/h", "truck_speed": "truck_m/s",
-                                  "car_speed": "car_m/s"})
+                                  "car_speed": "car_m/s", "subject_vc_h": "test_vc", "subject_cap_h": "test_cap",
+                                  "subject_tf": "test_tf_s", "subject_tc_raff": "test_tc_s"})
     print("\nMeans across seeds:")
     print(table.to_string(float_format=table_number, na_rep="-"))
     print(f"(jam_% = cars below {100 * SLOW_FRACTION:g} % of free speed, the congestion level; congested_s = first "
@@ -1422,7 +1725,10 @@ def _print_means(df: pd.DataFrame, keys: list[str], columns: list[str], open_run
              "turned away by a full queue; v/c = demand / capacity of the busiest entrance (LOS F above 1); "
              "veh/h = cars leaving per hour" if open_runs else "")
           + (";\n trucks = trucks on the ring; truck_m/s, car_m/s = mean speed of the trucks and of the other "
-             "vehicles" if truck_runs else "") + ")")
+             "vehicles" if truck_runs else "")
+          + (f";\n test_vc, test_cap = conflicting flow and capacity of the capacity test's entrance (veh/h; queue "
+             f"kept at {SUBJECT_QUEUE}); test_tf_s, test_tc_s = its follow-up headway and Raff critical gap (s)"
+             if subject_runs else "") + ")")
 
 
 def _print_sample(df: pd.DataFrame, design: Design, metrics: list[str]) -> None:
@@ -1507,6 +1813,489 @@ def _print_arm_shares(df: pd.DataFrame, keys: list[str]) -> None:
     print(cells.to_string())
     if left_out:
         print(f"({plural(left_out, 'point')} left out: no exit_prob 0 run to compare with, or no run above 0)")
+
+
+# ------------------------------------------------------- capacity and compare
+def fit_capacity(vc, cap, weights=None) -> tuple:
+    """(A, B) of the HCM form c = A exp(-B vc): least squares of ln c on ``vc``, each point weighted by
+    ``weights`` (default 1; an array (..., n) gives one fit per row, e.g. bootstrap counts). Points need
+    c > 0. NaN where the points have fewer than two distinct conflicting flows."""
+    x, y = np.asarray(vc, dtype=float), np.log(np.asarray(cap, dtype=float))
+    w = np.ones_like(x) if weights is None else np.asarray(weights, dtype=float)
+    total = w.sum(axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        xm, ym = (w * x).sum(axis=-1) / total, (w * y).sum(axis=-1) / total
+        dx = x - np.expand_dims(xm, -1)
+        sxx = (w * dx * dx).sum(axis=-1)
+        slope = np.where(sxx > 1e-9 * np.maximum(total, 1.0), (w * dx * (y - np.expand_dims(ym, -1))).sum(axis=-1)
+                         / np.where(sxx > 0, sxx, 1.0), np.nan)
+    return np.exp(ym - slope * xm), -slope
+
+
+def _interval(samples) -> tuple[float, float]:
+    """The 95 % percentile interval of bootstrap ``samples`` (NaN replicates left out; NaN, NaN if all are)."""
+    samples = np.asarray(samples, dtype=float)
+    ok = samples[np.isfinite(samples)]
+    return (float(np.percentile(ok, 2.5)), float(np.percentile(ok, 97.5))) if ok.size else (np.nan, np.nan)
+
+
+def t975(df: int) -> float:
+    """The Student t 0.975 quantile for ``df`` >= 1 degrees of freedom (T975, then A&S 26.7.5)."""
+    if df <= len(T975):
+        return T975[df - 1]
+    z = 1.959963985
+    return (z + (z**3 + z) / (4 * df) + (5 * z**5 + 16 * z**3 + 3 * z) / (96 * df**2)
+            + (3 * z**7 + 19 * z**5 + 17 * z**3 - 15 * z) / (384 * df**3)
+            + (79 * z**9 + 776 * z**7 + 1482 * z**5 - 1920 * z**3 - 945 * z) / (92160 * df**4))
+
+
+def mean_ci(values) -> tuple[float, float, float]:
+    """(mean, low, high): the mean of the finite ``values`` and its 95 % t interval (NaN bounds for one value,
+    all NaN for none)."""
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return np.nan, np.nan, np.nan
+    mean = float(v.mean())
+    if v.size == 1:
+        return mean, np.nan, np.nan
+    half = t975(v.size - 1) * float(v.std(ddof=1)) / math.sqrt(v.size)
+    return mean, mean - half, mean + half
+
+
+def _design_columns(df: pd.DataFrame, leave_out: tuple[str, ...] = ()) -> list[str]:
+    """The settings that differ between the runs of a sweep CSV (the design's varied ones), but ``leave_out``."""
+    return [c for c in CONFIG_NAMES if c in df and c not in leave_out and df[c].nunique(dropna=False) > 1]
+
+
+def _matches(column: pd.Series, value) -> pd.Series:
+    """Rows of a CSV column equal to a setting's ``value`` (numbers within rounding, as ``_key``)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and pd.api.types.is_numeric_dtype(column):
+        return pd.Series(np.isclose(column.to_numpy(float), float(value), rtol=1e-9, atol=1e-12), index=column.index)
+    return column.astype(str) == str(value)
+
+
+def _series_values(column: pd.Series, name: str) -> list:
+    """A --by column's distinct values: numbers ascending, a choice in its listed order, else as they appear."""
+    values = column.dropna().unique().tolist()
+    if pd.api.types.is_numeric_dtype(column):
+        return sorted(values)
+    spec = PARAM_BY_NAME.get(name)
+    order = list(spec.choices) if spec and spec.choices else []
+    return sorted(values, key=lambda v: (order.index(v) if v in order else len(order), values.index(v)))
+
+
+def validated_range(vc, cap, groups, hcm: tuple[float, float]) -> tuple[float, float] | None:
+    """The conflicting flows where the reference series follows the HCM base ``hcm`` = (A, B): the longest run
+    of consecutive design points (runs grouped by ``groups``, one label per run; in order of their mean
+    conflicting flow) whose mean capacity is within V1_TOLERANCE of the base at their mean conflicting flow, as
+    (lowest, highest) conflicting flow of those points' runs (so a fit over it takes them whole); None if no
+    point is within it."""
+    frame = pd.DataFrame({"vc": np.asarray(vc, float), "cap": np.asarray(cap, float), "g": groups})
+    points = frame.groupby("g", sort=False).agg(vc=("vc", "mean"), cap=("cap", "mean"), lo=("vc", "min"),
+                                                 hi=("vc", "max")).sort_values("vc")
+    ok = (np.abs(points["cap"] / (hcm[0] * np.exp(-hcm[1] * points["vc"])) - 1.0) <= V1_TOLERANCE).to_numpy()
+    best, run = None, None
+    for i, good in enumerate(ok):
+        run = (run if run is not None else i) if good else None
+        if run is not None and (best is None or i - run > best[1] - best[0]):
+            best = (run, i)
+    if best is None:
+        return None
+    return float(points["lo"].iloc[best[0]:best[1] + 1].min()), float(points["hi"].iloc[best[0]:best[1] + 1].max())
+
+
+def _weighted_mean(values, weights) -> np.ndarray:
+    """Mean of the finite ``values`` (n,) with ``weights`` (..., n): one per row; NaN where no weight is left."""
+    v = np.asarray(values, dtype=float)
+    w = np.where(np.isfinite(v), np.asarray(weights, dtype=float), 0.0)
+    total = w.sum(axis=-1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(total > 0, (w * np.where(np.isfinite(v), v, 0.0)).sum(axis=-1) / total, np.nan)
+
+
+def _column(part: pd.DataFrame, name: str) -> np.ndarray:
+    """A numeric column as floats, all NaN if the CSV lacks it (a sweep of an older version)."""
+    return part[name].to_numpy(float) if name in part else np.full(len(part), np.nan)
+
+
+def capacity_analysis(df: pd.DataFrame, by: str | None = None, ref=None, fit="validated", boot: int = BOOTSTRAP,
+                      seed: int = 0, validated: tuple[float, float] | None = None, cap: str | None = None) -> dict:
+    """The capacity test's fits from a sweep CSV, per series (the values of ``by``; one series without it).
+
+    ``cap`` is the capacity column, fitted against its conflicting flow
+    (CAP_COLUMNS); default subject_cap_pch against subject_vc_pch when a run
+    has trucks (the HCM curves are in pc/h), else subject_cap_h. The fit is
+    c = A exp(-B vc) by least squares of ln c, over the runs with capacity > 0
+    in the fitted range: with ``fit`` = "validated" (default) the validated
+    range (``validated`` if given, else validated_range of the reference
+    series) when it spans some flows, else every run; (lo, hi) that range;
+    None every run; one range for every series. Each run is weighted by its
+    capacity, i.e. by its entry count (a sweep's runs share one window), as
+    Var(ln c) is about 1/N for N entries (*assumption*: entries counted like a
+    renewal process): a collapsed run with a handful of entries no longer
+    weighs as much as one with hundreds. 95 % CIs come from ``boot``
+    resamples of the seeds, drawn alike for every series (paired: the series
+    share their seeds' random traffic). Each series also gets the means of its
+    fitted runs' subject_tf and subject_tc_raff (FHWA-OR-RD-22-11 averages them
+    over the conflicting flows, Sec. 7.3.2), with the same resamples.
+
+    Returns {"series": [dict per series], "ref": its index, "lanes": the
+    circulating lanes, "hcm": the HCM base (A, B) (presets.HCM6_CAPACITY),
+    "validated": the validated range or None, "fit": the fitted range or None
+    (every run), "fit_from": "validated range", "given" or "every run",
+    "cap"/"vc": the columns, "units", "trucks": whether a run has trucks,
+    "boot": the resamples}. ValueError if the CSV has no capacity-test run, or
+    runs on 3+ circulating lanes (no HCM base curve).
+    """
+    from roundabout_sim.presets import HCM6_CAPACITY
+
+    if any(c not in df for c in ("subject_vc_h", "subject_cap_h", "seed")):
+        raise ValueError("it has no capacity-test columns (subject_vc_h, subject_cap_h): not a sweep of this version")
+    tested = df[np.isfinite(df["subject_vc_h"].astype(float)) & np.isfinite(df["subject_cap_h"].astype(float))]
+    if tested.empty:
+        raise ValueError("it has no capacity-test runs: sweep with --set subject_arm=on (open mode)")
+    trucks = bool("truck_share" in tested and (tested["truck_share"].astype(float) > 0).any())
+    if cap is None:
+        cap = "subject_cap_pch" if trucks and {"subject_cap_pch", "subject_vc_pch"} <= set(df) else "subject_cap_h"
+    if cap not in CAP_COLUMNS:
+        raise ValueError(f"--cap {cap}: choose from {', '.join(CAP_COLUMNS)}")
+    vc_name = CAP_COLUMNS[cap]
+    if cap not in df or vc_name not in df:
+        raise ValueError(f"it has no {cap} / {vc_name} column: a sweep of an older version")
+    runs = tested[np.isfinite(tested[vc_name].astype(float)) & np.isfinite(tested[cap].astype(float))]
+    if runs.empty:
+        raise ValueError(f"its {cap} is empty in every run" + (": the measured windows are shorter than 15 minutes "
+                                                                f"(sweep with --measure {CAP15:g} or more)"
+                                                                if cap == "subject_cap15_h" else ""))
+    lanes = int(runs["n_lanes"].max()) if "n_lanes" in runs else 1
+    if lanes >= 3:
+        raise ValueError("runs on 3 or more circulating lanes: the HCM 6/7 roundabout model has no base curve for "
+                         "them (1 entry lane against 1 or 2 circulating lanes)")
+    hcm = HCM6_CAPACITY[1 if lanes <= 1 else 2]
+    if by is not None and by not in runs:
+        raise ValueError(f"--by {by}: no such column")
+    values = _series_values(runs[by], by) if by is not None else [None]
+    if ref is None:
+        ref = values[0]
+    elif not any(_matches(pd.Series([v]), ref).iloc[0] for v in values):
+        raise ValueError(f"--ref {ref}: {by} takes {', '.join(map(_value_text, values))} here")
+    ref_index = next(i for i, v in enumerate(values) if v is None or _matches(pd.Series([v]), ref).iloc[0])
+    seeds = np.sort(runs["seed"].unique())
+    rng = np.random.default_rng(seed)
+    counts = np.zeros((boot, seeds.size))
+    np.add.at(counts, (np.arange(boot)[:, None], rng.integers(seeds.size, size=(boot, seeds.size))), 1.0)
+    design = _design_columns(runs, ("seed", by) if by else ("seed",))
+    name = _axis_label(by).split(" (")[0] if by is not None else ""
+    out = []
+    for value in values:
+        part = runs if value is None else runs[_matches(runs[by], value)]
+        vc = part[vc_name].to_numpy(float)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            outer = _column(part, "subject_vc_outer_h") / _column(part, "subject_vc_h")
+        out.append({"value": value, "label": "all runs" if value is None else f"{name} = {_value_text(value)}",
+                    "vc": vc, "cap": part[cap].to_numpy(float), "seed_index": np.searchsorted(seeds, part["seed"]),
+                    "tf_runs": _column(part, "subject_tf"), "tc_runs": _column(part, "subject_tc_raff"),
+                    "outer_runs": np.where(vc > 0, outer, np.nan), "runs": len(part),
+                    "seeds": int(part["seed"].nunique()),
+                    "groups": part[design].astype(str).agg("|".join, axis=1).to_numpy() if design
+                    else np.zeros(len(part))})
+    r = out[ref_index]
+    if validated is None:
+        validated = validated_range(r["vc"], r["cap"], r["groups"], hcm)
+    if fit == "validated":
+        span = validated is not None and validated[1] > validated[0]
+        fit, fit_from = (validated, "validated range") if span else (None, "every run")
+    else:
+        fit, fit_from = (None, "every run") if fit is None else (tuple(fit), "given")
+    for s in out:
+        vc, c = s["vc"], s["cap"]
+        use = c > 0
+        if fit is not None:
+            use &= (vc >= fit[0]) & (vc <= fit[1])
+        weights = counts[:, s["seed_index"][use]]
+        a, b = fit_capacity(vc[use], c[use], c[use])
+        boot_a, boot_b = fit_capacity(vc[use], c[use], weights * c[use]) if use.any() \
+            else (np.full(boot, np.nan),) * 2
+        s.update(used=use, A=float(a), B=float(b), boot_A=np.asarray(boot_a), boot_B=np.asarray(boot_b),
+                 tf=float(_weighted_mean(s["tf_runs"][use], np.ones(use.sum()))),
+                 tc=float(_weighted_mean(s["tc_runs"][use], np.ones(use.sum()))),
+                 boot_tf=_weighted_mean(s["tf_runs"][use], weights), boot_tc=_weighted_mean(s["tc_runs"][use], weights),
+                 outer=float(np.nanmean(s["outer_runs"][use])) if np.isfinite(s["outer_runs"][use]).any()
+                 else np.nan)
+    return {"series": out, "ref": ref_index, "lanes": lanes, "hcm": hcm, "boot": boot, "validated": validated,
+            "fit": fit, "fit_from": fit_from, "cap": cap, "vc": vc_name, "trucks": trucks,
+            "units": "pc/h" if cap == "subject_cap_pch" else "veh/h"}
+
+
+def _fitted_flows(s: dict) -> tuple[float, float]:
+    """(lowest, highest) conflicting flow of a series' fitted runs (NaN, NaN without any)."""
+    vc = s["vc"][s["used"]]
+    return (float(vc.min()), float(vc.max())) if vc.size else (np.nan, np.nan)
+
+
+def capacity_table(result: dict, by: str | None) -> pd.DataFrame:
+    """One row per series of :func:`capacity_analysis`: the fit and its CIs; the ratio to the HCM base at
+    GAIN_VC; the mean tf and Raff tc of the fitted runs with A and B by Siegloch as HCM 6 and FHWA-OR-RD-22-11
+    Eqs. 7-7 to 7-9 have them (A_hw = 3600 / tf, B_hw = (tc - tf / 2) / 3600); and against the reference series
+    fA, fB, the gains at GAIN_VC and d ln(gain)/d vc from the fits (comparable to FHWA Sec. 7.3.1's simulated
+    capacities), and fA_hw = tf_ref / tf, fB_hw = (tc - tf/2) / (tc_ref - tf_ref/2) from the headways (how
+    FHWA made the Table 1.7 factors, Eqs. 7-10 to 7-12), each with its 95 % CI. A ratio or gain at a flow
+    outside the series' fitted conflicting flows (or the reference's) is NaN: an extrapolation, not a result."""
+    series, ref = result["series"], result["series"][result["ref"]]
+    a0, b0 = result["hcm"]
+    slope_hcm = (1.0 - CAV_FACTORS[1 if result["lanes"] <= 1 else 2][-1][2]) * b0
+    validated = result["validated"] or (np.nan, np.nan)
+    fit = result["fit"] or (np.nan, np.nan)
+    ref_lo, ref_hi = _fitted_flows(ref)
+    rows = []
+    for s in series:
+        lo, hi = _fitted_flows(s)
+        row = {**({by: s["value"]} if by else {}), "runs": s["runs"], "seeds": s["seeds"],
+               "fitted_runs": int(s["used"].sum()), "vc_min": lo, "vc_max": hi}
+        for name in ("A", "B", "tf", "tc"):
+            row[name] = s[name]
+            row[f"{name}_lo"], row[f"{name}_hi"] = _interval(s[f"boot_{name}"])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            row["A_hw"], row["B_hw"] = 3600.0 / s["tf"], (s["tc"] - s["tf"] / 2.0) / 3600.0
+        for vc in GAIN_VC:
+            row[f"hcm_ratio_{vc:.0f}"] = s["A"] * math.exp(-s["B"] * vc) / (a0 * math.exp(-b0 * vc)) \
+                if lo <= vc <= hi else np.nan
+        with np.errstate(invalid="ignore", divide="ignore"):
+            pairs = {"fA": (s["A"] / ref["A"], s["boot_A"] / ref["boot_A"]),
+                     "fB": (s["B"] / ref["B"], s["boot_B"] / ref["boot_B"]),
+                     **{f"gain_{vc:.0f}": (s["A"] / ref["A"] * math.exp(-(s["B"] - ref["B"]) * vc),
+                                           s["boot_A"] / ref["boot_A"] * np.exp(-(s["boot_B"] - ref["boot_B"]) * vc))
+                        if max(lo, ref_lo) <= vc <= min(hi, ref_hi) else (np.nan, np.full(1, np.nan))
+                        for vc in GAIN_VC},
+                     "slope": (ref["B"] - s["B"], ref["boot_B"] - s["boot_B"]),
+                     "fA_hw": (ref["tf"] / s["tf"], ref["boot_tf"] / s["boot_tf"]),
+                     "fB_hw": ((s["tc"] - s["tf"] / 2) / (ref["tc"] - ref["tf"] / 2),
+                               (s["boot_tc"] - s["boot_tf"] / 2) / (ref["boot_tc"] - ref["boot_tf"] / 2))}
+        for name, (value, samples) in pairs.items():
+            row[name] = float(value)
+            row[f"{name}_lo"], row[f"{name}_hi"] = _interval(samples)
+        row.update(slope_hcm7=slope_hcm, slope_fhwa_sim=FHWA_SIM_GAIN[1], slope_jiang=JIANG_GAIN[1],
+                   outer_share=s["outer"], validated_lo=validated[0], validated_hi=validated[1], fit_lo=fit[0],
+                   fit_hi=fit[1], units=result["units"])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _range_arg(name: str, text: str | None, parser: argparse.ArgumentParser) -> tuple[float, float] | None:
+    """A LO:HI option as (lo, hi) (None if not given); a parser error if it is not two numbers, lo <= hi."""
+    if text is None:
+        return None
+    try:
+        lo, hi = (float(v) for v in text.split(":"))
+    except ValueError:
+        parser.error(f"{name} takes LO:HI (two numbers), got {text!r}")
+    if not lo <= hi:
+        parser.error(f"{name}: need LO <= HI, got {text!r}")
+    return lo, hi
+
+
+def _read_sweep(path: str, parser: argparse.ArgumentParser) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+    except (OSError, ValueError, pd.errors.ParserError) as err:
+        parser.error(f"cannot read {path}: {err}")
+    if df.empty:
+        parser.error(f"{path} has no runs")
+    return df
+
+
+def _gain_curve(s: dict, r: dict, grid: np.ndarray, k: int) -> dict:
+    """A series' fitted gain over the reference ``r`` on ``grid`` with its 95 % bootstrap band, for
+    capacity_figure; "range" = the flows both fitted (the band covers only those)."""
+    lo, hi = max(_fitted_flows(s)[0], _fitted_flows(r)[0]), min(_fitted_flows(s)[1], _fitted_flows(r)[1])
+    inside = (grid >= lo) & (grid <= hi)
+    band = np.full((grid.size, 2), np.nan)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        boot = (s["boot_A"] / r["boot_A"])[:, None] * np.exp(-(s["boot_B"] - r["boot_B"])[:, None] * grid[inside])
+        band[inside] = np.array([_interval(column) for column in boot.T]).reshape(-1, 2)
+        mean = s["A"] / r["A"] * np.exp(-(s["B"] - r["B"]) * grid)
+    return {"label": s["label"], "k": k, "vc": grid, "mean": mean, "lo": band[:, 0], "hi": band[:, 1],
+            "range": (lo, hi)}
+
+
+def cmd_capacity(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    from roundabout_sim.plots import capacity_figure
+
+    df = _read_sweep(args.csv, parser)
+    if args.bootstrap < 1:
+        parser.error("need --bootstrap >= 1")
+    ref = None
+    if args.ref is not None:
+        if args.by is None:
+            parser.error("--ref needs --by (the column whose values are the series)")
+        numeric = args.by in df and pd.api.types.is_numeric_dtype(df[args.by])
+        try:  # (as the column holds it: a setting's type, else a number for a numeric column)
+            ref = _coerce(args.by, args.ref) if args.by in CONFIG_NAMES else float(args.ref) if numeric else args.ref
+        except ValueError as err:
+            parser.error(f"--ref: {err}")
+        if not isinstance(ref, str) and args.by in df and not numeric:
+            ref = str(ref)
+    given = _range_arg("--validated", args.validated, parser)
+    try:
+        result = capacity_analysis(df, args.by, ref, _range_arg("--fit", args.fit, parser) or "validated",
+                                   args.bootstrap, validated=given, cap=args.cap)
+    except ValueError as err:
+        parser.error(f"{args.csv}: {err}")
+    validated, fit, units = result["validated"], result["fit"], result["units"]
+    table = capacity_table(result, args.by)
+    out = Path(args.out) if args.out else Path(args.csv).with_suffix("").with_name(Path(args.csv).stem + "_capacity")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state.write_atomic(f"{out}.csv", lambda fh: table.to_csv(fh, index=False, encoding="utf-8"))
+
+    series, r = result["series"], result["series"][result["ref"]]
+    a0, b0 = result["hcm"]
+    factors = CAV_FACTORS[1 if result["lanes"] <= 1 else 2]
+    lanes = "1 circulating lane" if result["lanes"] <= 1 else "2 circulating lanes"
+    hcm_label = f"HCM 6/7 base {a0:g} exp(-{b0:.3g} vc) (1 entry lane, {lanes}; pc/h)"
+    slope_hcm = float(table["slope_hcm7"].iloc[0])
+    references = [(f"HCM 7 (Table 1.7 factors), 100 % CAVs: {factors[-1][1]:g} exp({slope_hcm:+.2g} vc)",
+                   factors[-1][1], slope_hcm),
+                  ("FHWA 2022 Sec. 7.3.1 simulated, 100 % CAVs: 1.36 -> 2.16 at 1,200", *FHWA_SIM_GAIN),
+                  ("Jiang 2022, 100 % CAVs: 1.40 -> 1.26 at 1,200 (unverified)", *JIANG_GAIN)]
+    grid = np.linspace(0.0, max(1200.0, 1.05 * max(float(np.nanmax(s["vc"])) for s in series)), 120)
+    gains = [_gain_curve(s, r, grid, k) for k, s in enumerate(series) if k != result["ref"]]
+    seeds = int(r["seeds"])
+    fitted = {"validated range": f"in the validated range {fit[0]:.0f}-{fit[1]:.0f} {units}" if fit else "",
+              "given": f"with vc {fit[0]:g}-{fit[1]:g} {units} (--fit)" if fit else "",
+              "every run": "of every flow"}[result["fit_from"]]
+    subtitle = (f"{Path(args.csv).name}: {sum(s['runs'] for s in series)} capacity-test runs, {seeds} seed(s)"
+                + (f", {len(series)} series by {args.by} (reference {r['label']})" if args.by else "")
+                + f"; {result['cap']} against {result['vc']}"
+                + f"\nfits ln c = ln A - B vc over the runs {fitted} with entries, each weighted by its entries; 95 % "
+                  f"CIs from {args.bootstrap} resamples of the seeds; {hcm_label}")
+    fig = capacity_figure([{"label": s["label"], "vc": s["vc"], "cap": s["cap"], "A": s["A"], "B": s["B"],
+                            "range": _fitted_flows(s)} for s in series], hcm=(a0, b0), hcm_label=hcm_label,
+                          factors=factors, validated=validated, gains=gains, references=references,
+                          ref_label=r["label"], units=units,
+                          title="Roundabout capacity test: entry capacity against conflicting flow",
+                          subtitle=subtitle)
+    fig.savefig(f"{out}.png")
+
+    print(subtitle)
+    where = (f"validated range (the reference series within {100 * V1_TOLERANCE:g} % of the HCM base): "
+             f"{validated[0]:.0f}-{validated[1]:.0f} {units}" if validated else
+             f"no validated range: no design point of the reference series within {100 * V1_TOLERANCE:g} % of the "
+             "HCM base")
+    print(f"{where}{' (given with --validated)' if given else ''}")
+    print("fitted: " + {"validated range": "the runs in the validated range (--fit LO:HI for others)",
+                        "given": "the runs in the --fit range",
+                        "every run": "every run (no validated range spanning some flows; --fit LO:HI to choose)"}
+          [result["fit_from"]])
+    if validated and fit != validated:
+        beyond = sum(int((s["used"] & ((s["vc"] < validated[0]) | (s["vc"] > validated[1]))).sum()) for s in series)
+        if beyond:
+            print(f"warning: {plural(beyond, 'fitted run')} outside the validated range, where the model does not "
+                  "follow the HCM base")
+    if seeds < FEW_SEEDS:
+        print(f"warning: {plural(seeds, 'seed')}: percentile bootstrap intervals from fewer than {FEW_SEEDS} seeds "
+              "are too narrow (a 95 % interval covers about 76 % of the time with 3 seeds, 84 % with 5, 90 % with "
+              "10); sweep with more --seeds")
+    if result["trucks"] and units != "pc/h":
+        print(f"note: some runs have trucks, and {result['cap']} counts vehicles while the HCM curves are in pc/h "
+              "(--cap subject_cap_pch fits pc/h against pc/h)")
+    at = " / ".join(f"{vc:.0f}" for vc in GAIN_VC)
+    for (_, row), s in zip(table.iterrows(), series):
+        print(f"\n{s['label']}: {int(row['runs'])} runs ({int(row['fitted_runs'])} fitted), {int(row['seeds'])} "
+              f"seeds, fitted vc {_fmt(row['vc_min'], 0)}-{_fmt(row['vc_max'], 0)} {units}")
+        print(f"  A = {_fmt(row['A'], 0)} {units} [{_fmt(row['A_lo'], 0)}, {_fmt(row['A_hi'], 0)}]   B = "
+              f"{_g(row['B'])} [{_g(row['B_lo'])}, {_g(row['B_hi'])}] per {units}")
+        print("  capacity / HCM base: " + " / ".join(_fmt(row[f'hcm_ratio_{vc:.0f}']) for vc in GAIN_VC)
+              + f" at vc {at} {units} (- = outside the fitted flows)")
+        print(f"  headways: follow-up tf {_fmt(row['tf'])} s [{_fmt(row['tf_lo'])}, {_fmt(row['tf_hi'])}], Raff "
+              f"critical gap tc {_fmt(row['tc'])} s [{_fmt(row['tc_lo'])}, {_fmt(row['tc_hi'])}] -> by Siegloch "
+              f"A = {_fmt(row['A_hw'], 0)}, B = {_g(row['B_hw'])} (FHWA-OR-RD-22-11 Eqs. 7-7 to 7-9)")
+        if result["lanes"] > 1:
+            print(f"  outer lane: {_pct(row['outer_share'], 0)} % of the conflicting flow")
+        if args.by and s is not r:
+            print(f"  fits:     fA = {_fmt(row['fA'], 3)} [{_fmt(row['fA_lo'], 3)}, {_fmt(row['fA_hi'], 3)}]   fB = "
+                  f"{_fmt(row['fB'], 3)} [{_fmt(row['fB_lo'], 3)}, {_fmt(row['fB_hi'], 3)}]")
+            print(f"  headways: fA = {_fmt(row['fA_hw'], 3)} [{_fmt(row['fA_hw_lo'], 3)}, {_fmt(row['fA_hw_hi'], 3)}]"
+                  f"   fB = {_fmt(row['fB_hw'], 3)} [{_fmt(row['fB_hw_lo'], 3)}, {_fmt(row['fB_hw_hi'], 3)}] (as "
+                  "FHWA made the Table 1.7 factors)")
+            print("  gain " + " / ".join(f"{_fmt(row[f'gain_{vc:.0f}'], 3)} [{_fmt(row[f'gain_{vc:.0f}_lo'], 3)}, "
+                                         f"{_fmt(row[f'gain_{vc:.0f}_hi'], 3)}]" for vc in GAIN_VC) + f" at vc {at}")
+            print(f"  d ln(gain)/d vc = {row['slope']:+.2e} [{row['slope_lo']:+.2e}, {row['slope_hi']:+.2e}] per "
+                  f"{units} (100 % CAVs: FHWA Sec. 7.3.1 simulated {FHWA_SIM_GAIN[1]:+.2e}, HCM 7 factors "
+                  f"{slope_hcm:+.2e}, Jiang 2022 {JIANG_GAIN[1]:+.2e} unverified)")
+    print(f"\nwrote {out}.csv and {out}.png")
+
+
+def compare_table(df: pd.DataFrame, name: str, value, metrics: list[str]) -> pd.DataFrame:
+    """Each run against the run at ``name`` = ``value`` with the same seed and the same other settings: per
+    point (the other varied settings and each other value of ``name``) and metric, the pairs, the means, the
+    mean difference and the mean ratio of the pairs with their 95 % t intervals. Ratios leave out pairs whose
+    reference value is 0."""
+    others = [c for c in CONFIG_NAMES if c in df and c != name]
+    is_ref = _matches(df[name], value)
+    key = others + ["seed"]
+    pairs = df[~is_ref].merge(df[is_ref][key + metrics], on=key, suffixes=("", "__ref"))
+    varied = _design_columns(df, (name, "seed"))
+    rows = []
+    for point, group in pairs.groupby(varied + [name], sort=False, dropna=False):
+        point = point if isinstance(point, tuple) else (point,)
+        for metric in metrics:
+            x, x0 = group[metric].to_numpy(float), group[f"{metric}__ref"].to_numpy(float)
+            both = np.isfinite(x) & np.isfinite(x0)
+            diff, diff_lo, diff_hi = mean_ci(x[both] - x0[both])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio, ratio_lo, ratio_hi = mean_ci((x / x0)[both & (x0 != 0)])
+            rows.append({**dict(zip(varied + [name], point)), "metric": metric, "pairs": int(both.sum()),
+                         "ref_mean": float(np.mean(x0[both])) if both.any() else np.nan,
+                         "mean": float(np.mean(x[both])) if both.any() else np.nan,
+                         "diff": diff, "diff_lo": diff_lo, "diff_hi": diff_hi,
+                         "ratio": ratio, "ratio_lo": ratio_lo, "ratio_hi": ratio_hi})
+    return pd.DataFrame(rows)
+
+
+def cmd_compare(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    df = _read_sweep(args.csv, parser)
+    name, text = args.ref
+    if name not in df:
+        parser.error(f"--ref {name}: {args.csv} has no such column")
+    try:
+        value = _coerce(name, text)
+    except ValueError as err:
+        parser.error(f"--ref: {err}")
+    if "seed" not in df:
+        parser.error(f"{args.csv} has no seed column: nothing to pair the runs by")
+    if not _matches(df[name], value).any():
+        parser.error(f"--ref {name}={text}: no run has it; {name} takes "
+                     f"{', '.join(map(_value_text, _series_values(df[name], name)))} here")
+    if args.metrics:
+        metrics = [m.strip() for item in args.metrics for m in item.split(",") if m.strip()]
+        unknown = [m for m in metrics if m not in df]
+        if unknown:
+            parser.error(f"--metrics: no column {', '.join(unknown)} in {args.csv}")
+    else:
+        metrics = [m for m in COMPARE_METRICS if m in df and np.isfinite(df[m].astype(float)).any()]
+    numeric = [m for m in metrics if pd.api.types.is_numeric_dtype(df[m])]
+    if len(numeric) < len(metrics):
+        parser.error(f"--metrics: {', '.join(m for m in metrics if m not in numeric)} is not a numeric column")
+    table = compare_table(df, name, value, metrics)
+    if table.empty:
+        parser.error(f"no run pairs with the --ref run (same seed and other settings) in {args.csv}")
+    out = Path(args.out) if args.out else Path(args.csv).with_name(Path(args.csv).stem + "_compare")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    state.write_atomic(f"{out}.csv", lambda fh: table.to_csv(fh, index=False, encoding="utf-8"))
+    varied = [c for c in table.columns if c in CONFIG_NAMES and c != name]
+    print(f"{args.csv}: each run against the same seed's run at {name} = {_value_text(value)} (same other "
+          "settings); mean of the pairs and its 95 % t interval")
+    for point, group in table.groupby(varied + [name], sort=False, dropna=False):
+        point = point if isinstance(point, tuple) else (point,)
+        print("\n" + ", ".join(f"{k} = {_value_text(v)}" for k, v in zip(varied + [name], point))
+              + f" ({int(group['pairs'].max())} pairs)")
+        width = max(len(m) for m in group["metric"])
+        for _, row in group.iterrows():
+            print(f"  {row['metric']:<{width}}  {significant(row['ref_mean'])} -> {significant(row['mean'])}:  "
+                  f"diff {significant(row['diff'])} [{significant(row['diff_lo'])}, {significant(row['diff_hi'])}]"
+                  f"  ratio {_fmt(row['ratio'], 3)} [{_fmt(row['ratio_lo'], 3)}, {_fmt(row['ratio_hi'], 3)}]")
+    print(f"\nwrote {out}.csv")
 
 
 def cmd_view(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -1609,6 +2398,58 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument("--size", type=cli.window_size, default=None, metavar="WxH",
                       help="window size in pixels (default: 90%% of the screen)")
     view.set_defaults(handler=cmd_view, command_parser=view)
+
+    cap = sub.add_parser("capacity", help="entry capacity against conflicting flow from a capacity-test sweep -> "
+                                          "fits, factors, CSV and figure",
+                         description="Entry capacity against conflicting flow from a sweep of capacity-test runs "
+                                     "(subject_arm=on, open mode; vary entry_rate for the conflicting flow): per "
+                                     "series, c = A exp(-B vc) fitted to the runs' (subject_vc_h, subject_cap_h) in "
+                                     "the validated range (each run weighted by its entries), with 95 % CIs from a "
+                                     "bootstrap over the seeds (paired across the series); the ratio to the HCM 6/7 "
+                                     "base curve; the mean follow-up headway and Raff critical gap, with A and B "
+                                     "from them by Siegloch; and against the reference series fA = A/A_ref and fB = "
+                                     "B/B_ref (from the fits and from the headways), the gain at vc 0, 400, 800 and "
+                                     "1200 veh/h and d ln(gain)/d vc (at 100 % CAVs: FHWA-OR-RD-22-11's simulations "
+                                     "+3.9e-4, the HCM 7 factors +1.5e-4) -> PREFIX.csv and PREFIX.png (with the HCM "
+                                     "7 CAV factor curves of FHWA-OR-RD-22-11 Table 1.7, and the flows outside the "
+                                     "validated range shaded).",
+                         allow_abbrev=False)
+    cap.add_argument("csv", help="sweep CSV with capacity-test runs")
+    cap.add_argument("--by", metavar="NAME", help="column whose values are the series (e.g. road_condition); "
+                                                  "default: all runs as one series")
+    cap.add_argument("--ref", metavar="VALUE", help="the --by value the factors and gains are against (default: its "
+                                                    "first value: the lowest number, or the first choice)")
+    cap.add_argument("--fit", metavar="LO:HI", help="fit only the runs with a conflicting flow in this range [veh/h] "
+                                                    "(default: the validated range, else every run with entries)")
+    cap.add_argument("--validated", metavar="LO:HI",
+                     help="conflicting flows [veh/h] to leave unshaded as validated (default: where the design points "
+                          f"of the reference series are within {100 * V1_TOLERANCE:g} %% of the HCM base curve)")
+    cap.add_argument("--cap", choices=tuple(CAP_COLUMNS), default=None,
+                     help="the capacity column to fit, against its conflicting flow: subject_cap_h (entries per hour), "
+                          "subject_cap15_h (4 x the busiest 15 minutes, as FHWA-OR-RD-22-11; needs --measure 900 or "
+                          "more) or subject_cap_pch (pc/h, against subject_vc_pch); default subject_cap_pch when a run "
+                          "has trucks, else subject_cap_h")
+    cap.add_argument("--bootstrap", type=int, default=BOOTSTRAP,
+                     help=f"resamples of the seeds for the CIs (default {BOOTSTRAP})")
+    cap.add_argument("--out", help="output prefix (default: the CSV's, with _capacity)")
+    cap.set_defaults(handler=cmd_capacity, command_parser=cap)
+
+    compare = sub.add_parser("compare", help="each run against the same seed's run at a reference value -> paired "
+                                             "differences and ratios with 95 %% CIs",
+                             description="Pairs every run of a sweep CSV with the run at --ref NAME=VALUE that has the "
+                                         "same seed and the same other settings, and gives per point and metric the "
+                                         "mean difference and the mean ratio of the pairs with their 95 % t intervals "
+                                         "(common random numbers: the pairs share their random traffic) -> "
+                                         "PREFIX.csv and a printed table.",
+                             allow_abbrev=False)
+    compare.add_argument("csv", help="sweep CSV")
+    compare.add_argument("--ref", type=_assignment, required=True, metavar="NAME=VALUE",
+                         help="the reference grid value, e.g. road_condition=dry")
+    compare.add_argument("--metrics", nargs="+", metavar="COLUMN",
+                         help="metric columns to compare (default: " + ", ".join(COMPARE_METRICS) + ", those with "
+                              "values)")
+    compare.add_argument("--out", help="output prefix (default: the CSV's, with _compare)")
+    compare.set_defaults(handler=cmd_compare, command_parser=compare)
     return parser
 
 

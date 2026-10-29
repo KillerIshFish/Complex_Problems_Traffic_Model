@@ -25,6 +25,7 @@ class SimConfig:
     car_length: float = 4.0  # [m]
     car_width: float = 1.8  # [m]
     road_condition: str = "dry"  # "dry", "wet", "snow" or "ice" (live: scales the driving, see engine)
+    weather_scale: float = 1.0  # strength of the road condition's effect on driving (1 = ROAD_CONDITIONS as given)
     # --- Traffic --------------------------------------------------------------
     density: float = 50.0  # [veh/km/lane] cars on the ring per km of lane (open mode: at the start)
     exit_prob: float = 0.1  # chance a car leaves at each exit it passes
@@ -37,6 +38,7 @@ class SimConfig:
     demand_profile: str = "constant"  # "constant" or "peak" (rises and falls, same mean over each cycle)
     demand_imbalance: float = 0.0  # 0 = equal entrances, 1 = all on the main road
     max_queue: int = 50  # cars that can wait per entrance in open mode
+    subject_arm: str = "off"  # "on": entrance 0 is a saturated capacity test (open mode; see engine)
     # --- Vehicles (changing these rebuilds the roundabout) --------------------
     truck_share: float = 0.0  # share of the vehicles that are trucks
     truck_length: float = 12.0  # [m]
@@ -46,6 +48,7 @@ class SimConfig:
     reaction_time: float = 0.4  # [s] delay between perceiving and acting
     reaction_std: float = 0.0  # [s] spread of reaction times across drivers
     reaction_distance: float = 25.0  # [m] how far ahead drivers react to cars
+    anticipation: int = 5  # most cars ahead a driver reacts to (engine.ANTICIPATION)
     time_headway: float = 1.2  # [s] desired time gap to the car in front
     headway_std: float = 0.0  # [s] spread of desired time gaps across drivers
     min_gap: float = 2.0  # [m] bumper-to-bumper gap kept when stopped
@@ -79,7 +82,7 @@ class SimConfig:
                     "time_headway", "min_gap", "max_accel", "comfort_decel", "lateral_accel",
                     "turn_speed", "entry_gap", "follow_up", "reaction_distance")
         problems = [f"{name} must be > 0" for name in positive if not getattr(self, name) > 0]
-        for name, low in (("n_lanes", 1), ("n_arms", 0), ("max_queue", 1)):
+        for name, low in (("n_lanes", 1), ("n_arms", 0), ("max_queue", 1), ("anticipation", 1)):
             value = getattr(self, name)
             if not (float(value).is_integer() and value >= low):
                 problems.append(f"{name} must be a whole number >= {low}")
@@ -87,7 +90,7 @@ class SimConfig:
                                           and self.seed >= 0):
             problems.append("seed must be None or a whole number >= 0")
         for name in ("density", "speed_std", "reaction_time", "reaction_std", "headway_std", "driver_noise",
-                     "lane_change_rate", "politeness", "entry_rate"):
+                     "lane_change_rate", "politeness", "entry_rate", "weather_scale"):
             if not getattr(self, name) >= 0:
                 problems.append(f"{name} must be >= 0")
         for name in ("exit_prob", "demand_imbalance", "truck_share"):
@@ -148,6 +151,13 @@ PARAMS: tuple[ParamSpec, ...] = (
               "the following time gap, entry gap and follow-up time (factors from weather studies; ice is "
               "the least certain). The other sliders keep showing the dry values. Applies at once.",
               choices=("dry", "wet", "snow", "ice")),
+    # The behavioural factors only, as 1 + scale x (factor - 1) (engine.road_factors), so 0.5-2 brackets the
+    # studies' spread and the snow loss Munehiro 2017 measured (-300 veh/h, TRB 17-00960). Physics stays in full.
+    ParamSpec("weather_scale", "Weather effect", 0.0, 2.0, 0.05, "", "Road",
+              "How strongly the road condition changes driving: each wet, snow or ice factor on desired speed, "
+              "acceleration, comfortable braking, time gap, entry gap and follow-up becomes 1 + this x (factor "
+              "- 1): 1 = the studies, 0 = as if dry, 2 = twice the change. The grip limits (cornering, braking) "
+              "apply in full."),
     # Traffic
     ParamSpec("density", "Density", 1, 300, 1, "veh/km/lane", "Traffic",
               "Cars on the ring per km of lane (capped at jam density). On a closed ring with "
@@ -190,6 +200,12 @@ PARAMS: tuple[ParamSpec, ...] = (
               "Open mode: cars that can wait at each entrance. Arrivals that find the queue full are "
               "turned away and counted as blocked (spill-back onto the approach road).",
               applies_in="open"),
+    ParamSpec("subject_arm", "Capacity test", 0, 0, 0, "", "Demand",
+              "Open mode. on: the bottom entrance is a capacity test: its queue is kept full whatever Max queue "
+              "(not counted as arrivals), and every car leaves at the first exit after it (with 2+ lanes the "
+              "first far enough on; Exit chance is ignored), so its circulating flow is the other entrances' "
+              "entry flow (Entrance chance). Experiments report its capacity (subject_* columns).",
+              reset=True, choices=("off", "on"), applies_in="open"),
     # Vehicles
     ParamSpec("truck_share", "Truck share", 0.0, 0.3, 0.01, "", "Vehicles",
               "Share of the vehicles that are trucks (each new vehicle is one by chance). Trucks are Truck "
@@ -213,10 +229,15 @@ PARAMS: tuple[ParamSpec, ...] = (
               "place in the spread. Real drivers differ by about 0.2 s."),
     ParamSpec("reaction_distance", "Reaction distance", 10, 100, 5, "m", "Drivers",
               "How far ahead drivers pay attention. They react to every car within this "
-              "distance (up to 5), so looking further ahead lets them ease off early for a "
+              "distance (up to Anticipation), so looking further ahead lets them ease off early for a "
               "slowdown a few cars ahead, which damps stop-and-go waves. Very short (below "
               "about speed x following gap) and they notice the car in front too late and "
               "brake violently."),
+    ParamSpec("anticipation", "Anticipation", 1, 5, 1, "cars", "Drivers",
+              "Most cars ahead a driver reacts to (within Reaction distance), as in Treiber's Human Driver "
+              "Model: the j-th car ahead counts with weight 1/j^2. 1 = only the car in front (the plain IDM); "
+              "5, the default, lets drivers ease off early for a slowdown a few cars ahead, which damps "
+              "stop-and-go waves. Drivers anticipate 1-7 vehicles (Treiber, Kesting & Helbing 2006)."),
     ParamSpec("time_headway", "Following time gap", 0.5, 3.0, 0.1, "s", "Drivers",
               "Desired time gap to the car in front."),
     ParamSpec("headway_std", "Time gap spread (std)", 0.0, 0.8, 0.05, "s", "Drivers",
@@ -312,19 +333,27 @@ def axis_label(name: str) -> str:
 NEEDS_NONZERO = {"truck_length": ("truck_share", "no trucks"),
                  **{name: ("n_arms", "no entrances") for name in ("exit_prob", "entry_gap", "follow_up", "turn_speed",
                                                                   "entry_rate", "demand_profile", "demand_imbalance",
-                                                                  "max_queue")}}
+                                                                  "max_queue", "subject_arm")}}
+# Settings that act only off a dry road: the weather effect scales the wet, snow and ice factors (dry are all 1).
+NEEDS_WEATHER = ("weather_scale",)
+# Settings the capacity test (subject_arm on, in open mode with entrances) overrides: it fixes every route.
+TEST_FIXED = ("exit_prob",)
 IDLE_WHY = {  # (reason, one setting or several) -> what it says about every run of a sweep
     "open mode only": ("acts only in open mode", "act only in open mode", "every run here is closed"),
     "no entrances": ("does nothing without entrances", "do nothing without entrances",
                      "every run here has none (n_arms = 0)"),
     "no trucks": ("does nothing without trucks", "do nothing without trucks", "every run here has truck_share = 0"),
+    "dry road": ("does nothing on a dry road", "do nothing on a dry road", "every run here is on a dry road"),
+    "capacity test": ("does nothing in the capacity test (it fixes every route)",
+                      "do nothing in the capacity test (it fixes every route)", "every run here runs it"),
 }
 
 
 def inactive_reason(name: str, cfg: SimConfig) -> str:
     """Why the setting ``name`` has no effect with the settings ``cfg`` ("" if it has one): "open mode
-    only" (``applies_in``), "no entrances" or "no trucks" (NEEDS_NONZERO). The main viewer tags its
-    controls with it; the sweep tools warn of a varied setting that does nothing in every run."""
+    only" (``applies_in``), "no entrances" or "no trucks" (NEEDS_NONZERO), "dry road" (NEEDS_WEATHER), or
+    "capacity test" (TEST_FIXED). The main viewer tags its controls with it; the sweep tools warn of a varied
+    setting that does nothing in every run."""
     spec = PARAM_BY_NAME.get(name)
     if spec is not None and spec.applies_in and cfg.traffic_mode != spec.applies_in:
         return f"{spec.applies_in} mode only"
@@ -332,6 +361,10 @@ def inactive_reason(name: str, cfg: SimConfig) -> str:
         other, reason = NEEDS_NONZERO[name]
         if not getattr(cfg, other) > 0:
             return reason
+    if name in NEEDS_WEATHER and cfg.road_condition == "dry":
+        return "dry road"
+    if name in TEST_FIXED and cfg.subject_arm == "on" and cfg.traffic_mode == "open" and cfg.n_arms > 0:
+        return "capacity test"
     return ""
 
 

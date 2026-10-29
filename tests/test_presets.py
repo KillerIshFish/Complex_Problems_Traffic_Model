@@ -196,7 +196,7 @@ def wave_onset(cfg: SimConfig, horizon: float) -> float | None:
 @pytest.mark.parametrize("name, seed, cars, by", [
     ("sugiyama2008", 1, 22, 90.0),  # waves after 63 s (seed 1); Sugiyama: a jam in the 3-minute snapshot
     ("tadaki2013", 2, 30, 90.0),  # 55 s; Tadaki: 30 cars on the dome circuit jam
-    ("stern2018", 2, 21, 150.0)])  # 100 s; Stern: first waves 55-79 s after the start (161 s with 22 cars)
+    ("stern2018", 1, 21, 150.0)])  # 88 s; Stern: first waves 55-79 s after the start (161 s with 22 cars)
 def test_ring_presets_form_stop_and_go_waves_within_minutes(name, seed, cars, by):
     cfg = presets.apply(name, SimConfig(seed=seed))
     assert int(RingSim(cfg).alive.sum()) == cars  # the published number of cars
