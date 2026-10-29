@@ -66,8 +66,21 @@ class SimConfig:
     auto_share: float = 0.0  # share of the new vehicles that are automated, all of the kind auto_kind
     auto_kind: str = "cav"  # "cav", "robotaxi" or "acc": the one automated kind of a run
     robotaxi_headway: float = 1.3  # robotaxis' time gap as a multiple of a driver's (Hu et al. 2023; live)
+    acc_headway: float = 1.1  # [s] ACC cars' time gap (the PATH ACC law, Milanes & Shladover 2014; live)
+    acc_delay: float = 0.5  # [s] ACC cars' dead time (Gunter et al. 2019 Table II; live)
+    cav_headway: float = 0.7  # [s] a CAV's time gap behind a cooperating CAV (PATH CACC, FHWA-OR-RD-22-11; live)
+    platoon_max: int = 8  # most CAVs in one CACC string (FHWA-OR-RD-22-11 Sec. 6.2.2.1; live)
     # --- Cooperation ----------------------------------------------------------
     companies: int = 1  # companies (brands) the automated vehicles belong to, evenly at random
+    coop_class: str = "B"  # cooperation class within a company: "none", "A", "B", "C" or "D" (SAE J3216; live)
+    coop_between: str = "same"  # most cooperation between companies: "same" (= coop_class) or a class (live)
+    brand_spread: float = 0.0  # spread of the companies' ACC/CACC time gaps and ACC dead time (live)
+    # --- Wave smoothers (automated cars converted from drivers; all live; see engine RingSim._law_smoother) ---
+    smoothers: int = 0  # how many (a count, not a share)
+    smoother_law: str = "followerstopper"  # "followerstopper" (Stern et al. 2018), "pi" (PI with saturation) or "quiet"
+    smoother_speed: float = 7.5  # [m/s] FollowerStopper's set speed U (Stern 2018 Exp. A's best)
+    smoother_start: float = 0.0  # [s] when their controllers switch on (each drives as its driver until then)
+    smoother_lane: int = -1  # their lane: -1 = round-robin from the innermost, else that lane (0 = innermost)
     # --- Numerics -------------------------------------------------------------
     dt: float = 0.1  # [s] time step
     seed: int | None = None
@@ -86,19 +99,25 @@ class SimConfig:
             raise ValueError("; ".join(problems))
         positive = ("radius", "lane_width", "car_length", "car_width", "truck_length", "dt", "mean_speed",
                     "time_headway", "min_gap", "max_accel", "comfort_decel", "lateral_accel",
-                    "turn_speed", "entry_gap", "follow_up", "reaction_distance", "robotaxi_headway")
+                    "turn_speed", "entry_gap", "follow_up", "reaction_distance", "robotaxi_headway", "acc_headway",
+                    "cav_headway", "smoother_speed")
         problems = [f"{name} must be > 0" for name in positive if not getattr(self, name) > 0]
-        for name, low in (("n_lanes", 1), ("n_arms", 0), ("max_queue", 1), ("anticipation", 1), ("companies", 1)):
+        for name, low in (("n_lanes", 1), ("n_arms", 0), ("max_queue", 1), ("anticipation", 1), ("companies", 1),
+                          ("platoon_max", 1), ("smoothers", 0), ("smoother_lane", -1)):
             value = getattr(self, name)
             if not (float(value).is_integer() and value >= low):
                 problems.append(f"{name} must be a whole number >= {low}")
         if self.companies > 127:  # (each vehicle's company is an int8: 0 to companies - 1)
             problems.append("companies must be at most 127")
+        if self.platoon_max > 126:  # (a CAV's string position is an int8: up to platoon_max + 1)
+            problems.append("platoon_max must be at most 126")
+        if not 0 <= self.brand_spread < 1:  # (the lowest brand factor, 1 - brand_spread, must stay above 0)
+            problems.append("brand_spread must be at least 0 and below 1")
         if self.seed is not None and not (isinstance(self.seed, Integral) and not isinstance(self.seed, bool)
                                           and self.seed >= 0):
             problems.append("seed must be None or a whole number >= 0")
         for name in ("density", "speed_std", "reaction_time", "reaction_std", "headway_std", "driver_noise",
-                     "lane_change_rate", "politeness", "entry_rate", "weather_scale"):
+                     "lane_change_rate", "politeness", "entry_rate", "weather_scale", "acc_delay", "smoother_start"):
             if not getattr(self, name) >= 0:
                 problems.append(f"{name} must be >= 0")
         for name in ("exit_prob", "demand_imbalance", "truck_share", "auto_share"):
@@ -279,15 +298,15 @@ PARAMS: tuple[ParamSpec, ...] = (
               reset=True, choices=("uniform", "random", "clustered")),
     # Automated vehicles (engine: kinds, the monotone coupling of their draws, RingSim._automated_command)
     ParamSpec("auto_share", "Automated share", 0.0, 1.0, 0.05, "", "AVs",
-              "Share of the new vehicles that are automated, all of the AV kind (each new vehicle is one by chance, "
-              "a truck too). They follow only the car in front, without noise, and alike: one software, no spread "
-              "of desired speed, time gap or reaction. At the same seed a higher share automates the same vehicles "
-              "and more. Entries and lane changes are a driver's for now.", reset=True),
+              "Share of the new vehicles that are automated, all of the AV kind (a truck too). One software: they "
+              "follow only the car in front, without noise or spread (robotaxis keep the drivers' time-gap spread); "
+              "a safety layer brakes as the IDM would beyond comfortable braking. Entries and lane changes: a "
+              "driver's for now. At the same seed a higher share automates the same vehicles and more.", reset=True),
     ParamSpec("auto_kind", "AV kind", 0, 0, 0, "", "AVs",
-              "Kind of the automated vehicles. robotaxi: driverless, following at a longer time gap (Robotaxi "
-              "time gap) and a 1.94 m longer standstill gap, accelerating and braking like a driver (Hu et al. "
-              "2023, Waymo data). acc: driver-supervised cruise control; cav: connected and automated. For now "
-              "both drive like a robotaxi at a driver's gaps.", reset=True, choices=("cav", "robotaxi", "acc")),
+              "Kind of the automated vehicles. robotaxi: driverless, by the IDM at a longer time gap and a 1.94 m "
+              "longer standstill gap (Hu et al. 2023, Waymo data). acc: driver-supervised cruise control, the PATH "
+              "ACC law with a dead time. cav: connected and automated, in CACC strings behind cooperating CAVs, else "
+              "by the ACC law.", reset=True, choices=("cav", "robotaxi", "acc")),
     # 1.3 = Waymo's median time headway over the human one, 3.49 / 2.69 s (Hu et al. 2023 Sec. III-B, Fig. 5:
     # lognormal mu 1.25 vs 0.99; *derived*); its mean ratio is 1.26. 1.0-1.6: as close as drivers up to a more
     # cautious fleet (*assumption*; Hu's AV jam spacing is 1.27 x the human one, 10.0 vs 7.88 m, Sec. III-C).
@@ -295,11 +314,93 @@ PARAMS: tuple[ParamSpec, ...] = (
               "Robotaxis' time gap as a multiple of a driver's Following time gap (a truck body keeps 1.5 x on top). "
               "1.3: Waymo's median time headway, 3.49 s against 2.69 s for drivers (Hu et al. 2023, Waymo Open "
               "Dataset); 1 = as close as drivers. Applies at once."),
+    # 0.7-2.4 s: Gunter et al. 2019 Table II fits 0.54-2.05 s over production ACC settings, but below 0.7 s Xiao's
+    # margin would make the equilibrium spacing shrink with speed (engine ACC_GAP_MIN, which also floors a brand's
+    # gap); openACC's shortest settings 0.9-1.5 s (the openACC database, Makridis et al. 2021, arXiv 2004.06342 Sec.
+    # 4.1). 1.1 s: the gap Milanes & Shladover 2014 fitted the law at (Table 1), and the setting 50.4 % of PATH drivers
+    # chose (Liu et al. 2018 p. 21).
+    ParamSpec("acc_headway", "ACC time gap", 0.7, 2.4, 0.05, "s", "AVs",
+              "Time gap T of the ACC cars' PATH law (Milanes & Shladover 2014): a = 0.23 (gap - margin - T v) + 0.07 "
+              "(leader's v - v), at most 0.4 (target speed - v). 1.1 s: the gap it was fitted at; production cars' "
+              "shortest settings are 0.9-1.5 s. At least 0.7 s, brand factor included. Fitted at 15-34 m/s: "
+              "roundabouts are an extrapolation."),
+    # Gunter et al. 2019 Table II: fitted dead times 0.15-0.99 s, median 0.47 s at the shortest settings (derived), but
+    # with gains k1 of 0.012-0.071 s^-2; with the PATH law's 0.23 a lone follower goes unstable from 0.7-0.8 s at
+    # short effective gaps (engine ACC_DEAD_MAX, *derived*), so the slider stops at the engine's cap, 0.6 s.
+    ParamSpec("acc_delay", "ACC dead time", 0.0, 0.6, 0.1, "s", "AVs",
+              "Dead time of the ACC cars: they act on what they measured this long ago (production cars 0.15-0.99 "
+              "s, median 0.47 s: Gunter et al. 2019, whose longer ones go with much smaller gains). At most 0.6 s, "
+              "brand factor included: with this law's gains a longer one makes a car oscillate behind a steady "
+              "leader. Rounded to the time step."),
+    # 0.7 s intra-platoon, 1.5 s between platoons in FHWA-OR-RD-22-11's roundabout runs (p. 108); Liu et al. 2018
+    # p. 22: 0.6 s 57 %, 0.7 s 24 %, 0.9 s 7 %, 1.1 s 12 % (the PATH drivers' choices).
+    ParamSpec("cav_headway", "CACC time gap", 0.5, 1.5, 0.05, "s", "AVs",
+              "Time gap of a CAV behind a cooperating CAV, by the PATH CACC law of the HCM 7 CAV factors "
+              "(FHWA-OR-RD-22-11: 0.7 s; drivers chose 0.6-1.1 s). The CAV one past Max string length keeps 1.5 s "
+              "and leads a new string. Behind any other vehicle a CAV follows by the ACC law at its own 1.1, 1.6 or "
+              "2.2 s."),
     # Cooperation
     ParamSpec("companies", "Companies", 1, 4, 1, "", "Coop",
               "Companies (brands) the automated vehicles belong to: each new one joins one at random, all equally "
-              "likely. Until cooperation between vehicles is modelled the company only labels them (hover a car "
-              "to see it).", reset=True),
+              "likely. With ACC cars or CAVs, Brand spread sets how their settings differ and Between companies how "
+              "far CAVs of different companies cooperate; otherwise the company only labels them (hover a car).",
+              reset=True),
+    # The SAE J3216 classes of cooperative driving automation (*assumption* for what each does here: the capability
+    # table in engine COOP_CLASSES). B by default: the HCM 7 CAV basis had CACC and V2V route-conflict anticipation
+    # (FHWA-OR-RD-22-11 Sec. 7.2.2).
+    ParamSpec("coop_class", "Cooperation", 0, 0, 0, "", "Coop",
+              "How far CAVs of one company cooperate (SAE J3216 classes). none: no V2X, CAVs follow by the ACC law; "
+              "A status-sharing: CACC strings; B intent-sharing (the HCM 7 basis), C agreement-seeking and D "
+              "prescriptive add entry cooperation, not modelled yet: they act as A.",
+              choices=("none", "A", "B", "C", "D")),
+    ParamSpec("coop_between", "Between companies", 0, 0, 0, "", "Coop",
+              "Most cooperation between CAVs of different companies: same = as within a company (Cooperation); a "
+              "class caps it (none: CAVs of different companies never form CACC strings). Acts only with two or "
+              "more companies.", choices=("same", "none", "A", "B", "C", "D")),
+    # 0.6 around a mean of 1.3 s gives 0.52-2.08 s, Gunter et al. 2019 Table II's 0.54-2.05 s (derived).
+    ParamSpec("brand_spread", "Brand spread", 0.0, 0.6, 0.05, "", "Coop",
+              "How much the companies' ACC and CACC settings differ: company k of n multiplies its time gaps and "
+              "the ACC dead time by 1 + spread (2k/(n-1) - 1), evenly around 1 (0.6 around 1.3 s spans production "
+              "ACC time gaps, 0.54-2.05 s: Gunter et al. 2019). 0 = every company alike."),
+    # 8: FHWA-OR-RD-22-11 Sec. 6.2.2.1 (and its signal runs) with the same CACC; 10: Liu et al. 2018 p. 24 and the
+    # FHWA freeway runs; its roundabout chapter (Ch. 7) states none. (On the Coop tab: strings are status-sharing
+    # cooperation, class A; the AVs tab would overflow at 1280 x 720.)
+    ParamSpec("platoon_max", "Max string length", 1, 20, 1, "cars", "Coop",
+              "Most CAVs in one CACC string: the one past it keeps the 1.5 s gap between strings and leads a new "
+              "string (FHWA-OR-RD-22-11 uses 8 with the same CACC, Liu et al. 2018 10; its roundabout runs state "
+              "none). 1 = no strings: every CAV behind a CAV keeps 1.5 s."),
+    # Wave smoothers (engine RingSim._law_smoother, _sync_smoothers). Stern et al. 2018 (TR-C 89, arXiv 1705.01693):
+    # one automated car among 21 (Sec. 2.1) cut the speed SD 3.31 -> 0.64 m/s (-80.8 %, Table 3, Exp. A).
+    ParamSpec("smoothers", "Smoothers", 0, 20, 1, "cars", "Smoothers",
+              "Automated cars that damp stop-and-go waves: one among 21 cut the speed spread by 81 % (Stern et al. "
+              "2018). Picked without chance: the human-driven cars (not trucks) nearest evenly spaced points round the "
+              "ring. They never leave, change lane or get removed. Changed live, the nearest are converted or handed "
+              "back."),
+    # Stern 2018 Sec. 3.1 (FollowerStopper, Eqs. 1-2) and Sec. 3.2 (PI with saturation, Eqs. 3-5); the gap cap
+    # max(120 m, 6 s x v) is Lichtle et al. 2024's gap-closing threshold (IEEE ITSC 2023, arXiv 2401.09666, Sec.
+    # III-A.2), where their wrapper accelerates at 1.5 m/s2; here the driver's IDM takes over (*model*).
+    ParamSpec("smoother_law", "Smoother law", 0, 0, 0, "", "Smoothers",
+              "followerstopper: Smoother speed unless the gap is short, then the speed of the car ahead or a stop "
+              "(Stern et al. 2018). pi: the mean of its own speed over 38 s, saturated near the car ahead. quiet: a "
+              "placebo, its driver's own model without noise. Beyond Lichtle et al. 2024's gap cap, max(120 m, 6 s "
+              "x speed): the driver's model.",
+              choices=("followerstopper", "pi", "quiet")),
+    # Stern 2018 Sec. 4.2 (Exp. A): U = 6.5, 7.0, 7.5, 8.0, then 7.5 m/s; 7.5 best ('matches the average traffic speed
+    # almost precisely'), 6.5 damped the wave only partly, 8.0 brought it back.
+    ParamSpec("smoother_speed", "Smoother speed", 2.0, 15.0, 0.25, "m/s", "Smoothers",
+              "FollowerStopper's set speed U, which it never exceeds. Stern et al. 2018 settled the waves best at 7.5 "
+              "m/s, near the ring's mean speed; 6.5 damped them only partly and 8.0 brought them back. Never above the "
+              "lane's comfortable cornering speed."),
+    # Stern 2018 switched the controller on once the waves had formed (Exp. A: waves from 79 s, control from 126 s,
+    # Tables 1 and 3).
+    ParamSpec("smoother_start", "Smoother start", 0, 600, 10, "s", "Smoothers",
+              "When the smoothers' controllers switch on. Until then each drives as its human driver does, noise and "
+              "all (Stern et al. 2018 let the waves form first, then switched the car's controller on). 0 = from the "
+              "start."),
+    ParamSpec("smoother_lane", "Smoother lane", -1, 4, 1, "", "Smoothers",
+              "Lane the smoothers are picked in: -1 = spread round the lanes, the innermost first; 0 = the innermost "
+              "lane, 1 the next, and so on (beyond the ring's lanes: the outermost). Changed live, they are picked "
+              "again."),
 )
 
 PARAM_BY_NAME = {p.name: p for p in PARAMS}
@@ -350,6 +451,12 @@ def changed_settings(values: dict) -> dict:
     return {n: v for n, v in values.items() if n in defaults and n != "seed" and not same_value(v, defaults[n])}
 
 
+def range_text(spec: ParamSpec, dash: str = "-") -> str:
+    """'0.6-2.4': a numeric setting's slider range as the help texts show it (``dash`` between the ends); with a
+    negative end, which a dash would garble ('-1-4'), '-1 to 4'."""
+    return f"{spec.lo:g} to {spec.hi:g}" if spec.lo < 0 else f"{spec.lo:g}{dash}{spec.hi:g}"
+
+
 def axis_label(name: str) -> str:
     """'Ring radius (m)', 'Lanes': a setting's label with its unit, as on the chart axes (the name
     itself for a column that is no setting)."""
@@ -365,10 +472,48 @@ NEEDS_NONZERO = {"truck_length": ("truck_share", "no trucks"),
                  **{name: ("n_arms", "no entrances") for name in ("exit_prob", "entry_gap", "follow_up", "turn_speed",
                                                                   "entry_rate", "demand_profile", "demand_imbalance",
                                                                   "max_queue", "subject_arm")},
-                 **{name: ("auto_share", "no automated vehicles") for name in ("auto_kind", "companies")}}
+                 **{name: ("auto_share", "no automated vehicles") for name in ("auto_kind", "companies")},
+                 **{name: ("smoothers", "no smoothers") for name in ("smoother_law", "smoother_speed", "smoother_start",
+                                                                     "smoother_lane")}}
 # Settings that act only on automated vehicles of one kind: (the kind, the reason shown while there are none, for
 # want of automated vehicles (auto_share = 0) or of that kind: one reason, so a sweep of either still warns).
-NEEDS_KIND = {"robotaxi_headway": ("robotaxi", "no robotaxis")}
+NEEDS_KIND = {"robotaxi_headway": ("robotaxi", "no robotaxis"),
+              **{name: ("acc", "no ACC cars") for name in ("acc_headway", "acc_delay")},
+              **{name: ("cav", "no CAVs") for name in ("cav_headway", "platoon_max", "coop_class", "coop_between")}}
+# Settings that act only on the kinds with ACC or CACC settings (the brand factors scale those, not a robotaxi's).
+NEEDS_CONTROLLER = ("brand_spread",)
+# Settings that act only while CAVs of one company cooperate (CACC strings need class A or more: coop_class; the
+# class between companies is at most the class within one).
+NEEDS_COOP = ("cav_headway", "platoon_max", "coop_between")
+# Settings that act only while a string can hold two CAVs (platoon_max 1: every CAV behind a CAV keeps 1.5 s).
+NEEDS_STRINGS = ("cav_headway",)
+# Settings that act only between two or more companies.
+NEEDS_COMPANIES = ("coop_between", "brand_spread")
+
+
+# The highest cooperation class with behaviour of its own so far (engine COOP_CLASSES): B-D act as A until the entry
+# cooperation (route-conflict anticipation, B; gap creation, C and D) is modelled, when this rises with it.
+COOP_ACTING = "A"
+
+
+def companies_differ(cfg: SimConfig) -> bool:
+    """Whether the company a vehicle joins changes how it drives under ``cfg``: the ACC cars' or CAVs' settings
+    differ by brand (brand_spread above 0), or CAVs of different companies cooperate less than CAVs of one
+    company, counting only the classes up to COOP_ACTING (B-D act as A so far: so coop_between none where
+    coop_class is A or more). Otherwise Companies only labels them."""
+    if not (cfg.auto_share > 0 and cfg.auto_kind in ("acc", "cav")):
+        return False
+    if cfg.brand_spread > 0:
+        return True
+    rank = PARAM_BY_NAME["coop_class"].choices.index  # ("none", "A", "B", "C", "D")
+    within = min(rank(cfg.coop_class), rank(COOP_ACTING))
+    between = min(rank(cfg.coop_class if cfg.coop_between == "same" else cfg.coop_between), within)
+    return cfg.auto_kind == "cav" and between < within
+# Settings that act only on smoothers of the FollowerStopper law (PI sets its speed from its own mean; quiet is its
+# driver's model).
+NEEDS_FS = ("smoother_speed",)
+# Settings that act only on a ring of two or more lanes.
+NEEDS_LANES = ("smoother_lane",)
 # Settings that act only off a dry road: the weather effect scales the wet, snow and ice factors (dry are all 1).
 NEEDS_WEATHER = ("weather_scale",)
 # Settings the capacity test (subject_arm on, in open mode with entrances) overrides: it fixes every route.
@@ -385,15 +530,38 @@ IDLE_WHY = {  # (reason, one setting or several) -> what it says about every run
                               "every run here has auto_share = 0"),
     "no robotaxis": ("acts only on robotaxis", "act only on robotaxis",
                      "no run here has any (auto_kind = robotaxi with auto_share above 0)"),
+    "no ACC cars": ("acts only on ACC cars", "act only on ACC cars",
+                    "no run here has any (auto_kind = acc with auto_share above 0)"),
+    "no CAVs": ("acts only on CAVs", "act only on CAVs", "no run here has any (auto_kind = cav with auto_share above 0)"),
+    "no ACC cars or CAVs": ("acts only on ACC cars and CAVs", "act only on ACC cars and CAVs",
+                            "no run here has any (auto_kind = acc or cav with auto_share above 0)"),
+    "no cooperation": ("does nothing while CAVs do not cooperate", "do nothing while CAVs do not cooperate",
+                       "every run here has coop_class = none"),
+    "no strings": ("does nothing without CACC strings", "do nothing without CACC strings",
+                   "every run here has platoon_max = 1"),
+    "one company": ("acts only between companies", "act only between companies", "every run here has companies = 1"),
+    "companies alike": ("does nothing while the companies drive alike", "do nothing while the companies drive alike",
+                        "no run here has brand_spread above 0 (with ACC cars or CAVs) or coop_between = none (with "
+                        "cooperating CAVs)"),
+    "no smoothers": ("does nothing without smoothers", "do nothing without smoothers",
+                     "every run here has smoothers = 0"),
+    "no FollowerStopper": ("acts only on FollowerStopper smoothers", "act only on FollowerStopper smoothers",
+                           "every run here has smoother_law = pi or quiet"),
+    "one lane": ("does nothing on a single-lane ring", "do nothing on a single-lane ring",
+                 "every run here has n_lanes = 1"),
 }
 
 
 def inactive_reason(name: str, cfg: SimConfig) -> str:
     """Why the setting ``name`` has no effect with the settings ``cfg`` ("" if it has one): "open mode
     only" (``applies_in``), "no entrances", "no trucks" or "no automated vehicles" (NEEDS_NONZERO), "no
-    robotaxis" (NEEDS_KIND: no automated vehicle of the kind, auto_share 0 included), "dry road"
-    (NEEDS_WEATHER), or "capacity test" (TEST_FIXED); what it reads: :func:`inactive_inputs`. The main viewer
-    tags its controls with it; the sweep tools warn of a varied setting that does nothing in every run."""
+    robotaxis", "no ACC cars" or "no CAVs" (NEEDS_KIND: no automated vehicle of the kind, auto_share 0
+    included), "no ACC cars or CAVs" (NEEDS_CONTROLLER), "no cooperation" (NEEDS_COOP: coop_class none), "no
+    strings" (NEEDS_STRINGS: platoon_max 1), "one company" (NEEDS_COMPANIES), "companies alike" (companies,
+    while :func:`companies_differ` is false), "no smoothers" (NEEDS_NONZERO), "no FollowerStopper" (NEEDS_FS),
+    "one lane" (NEEDS_LANES), "dry road" (NEEDS_WEATHER), or "capacity test" (TEST_FIXED); what it reads:
+    :func:`inactive_inputs`. The main viewer tags its controls with it; the sweep tools warn of a varied setting
+    that does nothing in every run."""
     spec = PARAM_BY_NAME.get(name)
     if spec is not None and spec.applies_in and cfg.traffic_mode != spec.applies_in:
         return f"{spec.applies_in} mode only"
@@ -403,6 +571,20 @@ def inactive_reason(name: str, cfg: SimConfig) -> str:
             return reason
     if name in NEEDS_KIND and not (cfg.auto_share > 0 and cfg.auto_kind == NEEDS_KIND[name][0]):
         return NEEDS_KIND[name][1]
+    if name in NEEDS_CONTROLLER and not (cfg.auto_share > 0 and cfg.auto_kind in ("acc", "cav")):
+        return "no ACC cars or CAVs"
+    if name in NEEDS_COOP and cfg.coop_class == "none":
+        return "no cooperation"
+    if name in NEEDS_STRINGS and cfg.platoon_max <= 1:
+        return "no strings"
+    if name in NEEDS_COMPANIES and cfg.companies <= 1:
+        return "one company"
+    if name == "companies" and not companies_differ(cfg):
+        return "companies alike"
+    if name in NEEDS_FS and cfg.smoother_law != "followerstopper":
+        return "no FollowerStopper"
+    if name in NEEDS_LANES and cfg.n_lanes <= 1:
+        return "one lane"
     if name in NEEDS_WEATHER and cfg.road_condition == "dry":
         return "dry road"
     if name in TEST_FIXED and cfg.subject_arm == "on" and cfg.traffic_mode == "open" and cfg.n_arms > 0:
@@ -417,8 +599,20 @@ def inactive_inputs(name: str) -> set[str]:
     inputs = {"traffic_mode"} if spec is not None and spec.applies_in else set()
     if name in NEEDS_NONZERO:
         inputs.add(NEEDS_NONZERO[name][0])
-    if name in NEEDS_KIND:
+    if name in NEEDS_KIND or name in NEEDS_CONTROLLER:
         inputs |= {"auto_share", "auto_kind"}
+    if name in NEEDS_COOP:
+        inputs.add("coop_class")
+    if name in NEEDS_STRINGS:
+        inputs.add("platoon_max")
+    if name in NEEDS_COMPANIES:
+        inputs.add("companies")
+    if name == "companies":
+        inputs |= {"auto_share", "auto_kind", "brand_spread", "coop_class", "coop_between"}
+    if name in NEEDS_FS:
+        inputs.add("smoother_law")
+    if name in NEEDS_LANES:
+        inputs.add("n_lanes")
     if name in NEEDS_WEATHER:
         inputs.add("road_condition")
     if name in TEST_FIXED:

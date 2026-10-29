@@ -174,10 +174,15 @@ def test_the_new_sweep_form_combines_the_settings_robotaxi_time_gap_needs(tmp_pa
         assert view.idle["robotaxi_headway"] == "no robotaxis"
         view.base = {"auto_kind": "robotaxi"}  # robotaxi base settings: Automated share picked is enough
         view.layout()
-        assert view.idle["robotaxi_headway"] == "" and view.idle_reason("companies") == ""
+        # (Companies: no combination of the picked settings makes the companies drive differently, robotaxis' only
+        # label them, so the base settings' reason stands; config.companies_differ)
+        assert view.idle["robotaxi_headway"] == "" and view.idle_reason("companies") == "no automated vehicles"
         view.base = {}
         view.layout()
-        assert view.idle_reason("companies") == ""  # (Automated share picked)
+        assert view.idle_reason("companies") == "no automated vehicles"  # (Automated share picked: nothing differs)
+        view.base = {"brand_spread": 0.3}  # cav (the base kind) with a brand spread: the companies differ
+        view.layout()
+        assert view.idle_reason("companies") == ""
     finally:
         view.close()
         pygame.quit()

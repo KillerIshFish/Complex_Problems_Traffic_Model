@@ -97,9 +97,10 @@ import pandas as pd
 
 from roundabout_sim import cli, state
 from roundabout_sim.config import (PARAM_BY_NAME, PARAMS, SimConfig, axis_label, changed_settings, idle_note,
-                                   inactive_reason)
-from roundabout_sim.engine import (LOG_HORIZON, MAX_DECEL, PEAK_PERIOD, SLOW_FRACTION, SUBJECT_ARM, SUBJECT_QUEUE,
-                                   TWO_PI, RingSim, braking_limits, mean_demand_factor)
+                                   inactive_reason, range_text)
+from roundabout_sim.engine import (EMERGENCY_HOLD, LOG_HORIZON, MAX_DECEL, PAIR_TYPES, PEAK_PERIOD, SLOW_FRACTION,
+                                   SUBJECT_ARM, SUBJECT_QUEUE, TTC_CRITICAL, TWO_PI, RingSim, braking_limits,
+                                   mean_demand_factor)
 from roundabout_sim.metrics import LOS_LIMITS, RATE_WINDOW, Recorder, entry_vc, level_of_service, los_text
 from roundabout_sim.palette import SERIES_HEX
 from roundabout_sim.textfmt import plain as _plain
@@ -249,9 +250,55 @@ measured columns (CSV) and how to read them
                        there are none)
   automated            automated vehicles on the ring (mean): those of the
                        auto_kind (acc, cav or robotaxi), auto_share of the new
-                       vehicles; human_speed / auto_speed: mean speed of the
-                       human-driven and of the automated vehicles (empty if
-                       there are none). A truck counts by its kind
+                       vehicles (not the wave smoothers, which the safety
+                       rates below count); human_speed / auto_speed: mean
+                       speed of the human-driven and of the automated vehicles
+                       (empty if there are none). A truck counts by its kind
+  cacc_share           share of the automated vehicles' time on the ring spent
+                       following a cooperating CAV by the CACC law (members of
+                       a CACC string): mean CACC followers / mean automated
+                       (0 for acc and robotaxi runs; empty without automated
+                       vehicles)
+  aeb_per_veh_h        SAFETY LAYER interventions per hour an automated vehicle
+                       spends on the ring: episodes in which the IDM with the
+                       vehicle's own time gap and margin asks for more than
+                       comfortable braking and harder braking than its law,
+                       which then brakes as the IDM does (an episode ends after
+                       {EMERGENCY_HOLD:g} s without one). Automated: the auto_kind's
+                       and the smoothers (from smoother_start), together.
+                       Empty without automated vehicles
+  harsh_human_per_veh_h, harsh_auto_per_veh_h  harsh-braking episodes (those of
+                       emergency_per_min) per hour a human-driven / an
+                       automated vehicle (as for aeb_per_veh_h) spends on the
+                       ring (empty without any)
+  ttc_per_h            SAFETY (surrogate): time-to-collision episodes per hour
+                       of car following: a follower closing on the vehicle
+                       ahead with gap / closing speed <= {TTC_CRITICAL:g} s (SSAM's
+                       threshold); an episode ends after {EMERGENCY_HOLD:g} s without one.
+                       Following: the vehicle ahead is within
+                       reaction_distance, or closer than {TTC_CRITICAL:g} s at the
+                       closing speed (low TTC counts at any distance). Empty
+                       without any following
+  ttc_hh_per_h, ttc_ha_per_h, ttc_ah_per_h, ttc_aa_per_h  the same per pair type
+                       of follower and leader, FOLLOWER first (as Hu et al.
+                       2023 name pairs): H = a human driver or an ACC car (it
+                       looks like any car), A = a recognisable AV (cav,
+                       robotaxi, smoother from smoother_start on); ttc_ah_per_h
+                       = AVs behind humans.
+                       Each per hour of following of that pair type
+  tet_s_per_h          time exposed to TTC <= {TTC_CRITICAL:g} s (TET, Minderhoud & Bovy
+                       2001) per hour of car following [s/h]: 36 = 1 % of the
+                       following time spent below it
+  tet_hh_s_per_h, tet_ha_s_per_h, tet_ah_s_per_h, tet_aa_s_per_h  the same per
+                       pair type (follower first), per hour of following of
+                       that pair type
+  follow_hh_h, follow_ha_h, follow_ah_h, follow_aa_h  hours of car following of
+                       each pair type in the window (vehicle-hours): what the
+                       per-pair rates rest on
+  cutins_ahead_auto_per_h  lane changes per hour that put a vehicle directly in
+                       front of a recognisable AV (its new follower, within
+                       reaction_distance behind it: a change further ahead of
+                       it is no cut-in)
   wave_speed           speed of jam patterns along the ring [m/s]; < 0 = moving
                        backwards against the traffic, as stop-and-go waves do
   wave_speed_kmh       the same jam wave speed in km/h
@@ -339,7 +386,7 @@ measured columns (CSV) and how to read them
 MEAN_COLUMNS = ("cars", "queued", "longest_queue", "density", "mean_speed", "mean_free_speed", "speed_std",
                 "flux", "jam_fraction", "speed_deficit", "n_jams", *JAM_ORIGINS, "occupancy", "spacing_gini",
                 "clustering", "order_param", "order_baseline", "mean_trip_time", "demand_per_min",
-                "trucks", "truck_speed", "car_speed", "automated", "human_speed", "auto_speed")
+                "trucks", "truck_speed", "car_speed", "automated", "human_speed", "auto_speed", "in_cacc")
 # Columns of the sweep's printed table (means across seeds); OPEN_COLUMNS are added when a run is in open
 # mode, TRUCK_COLUMNS when a run has trucks.
 SUMMARY_COLUMNS = ("measured_density", "measured_mean_speed", "flux", "jam_fraction", "congestion_onset",
@@ -659,7 +706,50 @@ def _counters(sim: RingSim) -> dict[str, float | np.ndarray]:
             "arm_arrived": sim.arm_arrived.copy(), "arm_entered": sim.arm_entered.copy(),
             "queue_busy": sim.queue_busy.copy(), "arm_passed": sim.arm_passed.copy(),
             "arm_passed_outer": sim.arm_passed_outer.copy(), "arm_passed_trucks": sim.arm_passed_trucks.copy(),
-            "arm_entered_trucks": sim.arm_entered_trucks.copy(), "arm_entry_wait": sim.arm_entry_wait.copy()}
+            "arm_entered_trucks": sim.arm_entered_trucks.copy(), "arm_entry_wait": sim.arm_entry_wait.copy(),
+            # the automated vehicles' observers: safety layer, harsh braking by group, exposure, cut-ins, and per
+            # pair type the steps of following, the steps at low TTC and the TTC episodes
+            "aeb": sim.n_aeb, "emergency_auto": sim.n_emergency_auto, "auto_steps": sim.n_auto_steps,
+            "human_steps": sim.n_human_steps, "cutins_auto": sim.n_cutins_auto,
+            "pair_follow": sim.pair_follow_steps.copy(), "pair_ttc": sim.pair_ttc_steps.copy(),
+            "pair_episodes": sim.pair_ttc_episodes.copy()}
+
+
+# Summary columns of the automated vehicles' observers, in every summary (NaN where they do not apply).
+SAFETY_COLUMNS = ("cacc_share", "aeb_per_veh_h", "harsh_human_per_veh_h", "harsh_auto_per_veh_h", "ttc_per_h",
+                  *(f"ttc_{p.lower()}_per_h" for p in PAIR_TYPES), "tet_s_per_h",
+                  *(f"tet_{p.lower()}_s_per_h" for p in PAIR_TYPES), *(f"follow_{p.lower()}_h" for p in PAIR_TYPES),
+                  "cutins_ahead_auto_per_h")
+
+
+def safety_columns(sim: RingSim, now: dict, start: dict, span: float, mean: dict) -> dict:
+    """The automated vehicles' and the surrogate safety columns (SAFETY_COLUMNS) from the engine's exact counts
+    between :func:`_counters` ``start`` and ``now`` (``span`` s), and the window means ``mean`` (cacc_share).
+    Exposure is in vehicle-hours: steps x dt / 3600 (a run's dt is fixed: changing it rebuilds). A rate over an
+    exposure of 0 is NaN."""
+    hours = sim.cfg.dt / 3600.0  # (per vehicle-step)
+
+    def ratio(count, exposure) -> float:
+        return float(count / exposure) if exposure > 0 else float("nan")
+
+    def diff(key: str):
+        return now[key] - start[key]
+
+    auto_h, human_h = diff("auto_steps") * hours, diff("human_steps") * hours
+    follow_h = diff("pair_follow") * hours  # per pair type
+    low_s = diff("pair_ttc") * sim.cfg.dt  # [s] at TTC <= TTC_CRITICAL
+    episodes = diff("pair_episodes")
+    row = {"cacc_share": ratio(mean["in_cacc"], mean["automated"]),
+           "aeb_per_veh_h": ratio(diff("aeb"), auto_h),
+           "harsh_human_per_veh_h": ratio(diff("emergency") - diff("emergency_auto"), human_h),
+           "harsh_auto_per_veh_h": ratio(diff("emergency_auto"), auto_h),
+           "ttc_per_h": ratio(episodes.sum(), follow_h.sum())}
+    row.update({f"ttc_{p.lower()}_per_h": ratio(episodes[k], follow_h[k]) for k, p in enumerate(PAIR_TYPES)})
+    row["tet_s_per_h"] = ratio(low_s.sum(), follow_h.sum())
+    row.update({f"tet_{p.lower()}_s_per_h": ratio(low_s[k], follow_h[k]) for k, p in enumerate(PAIR_TYPES)})
+    row.update({f"follow_{p.lower()}_h": float(follow_h[k]) for k, p in enumerate(PAIR_TYPES)})
+    row["cutins_ahead_auto_per_h"] = 3600.0 * diff("cutins_auto") / span
+    return row
 
 
 def measured_names(names) -> dict[str, str]:
@@ -744,6 +834,7 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int], tap
            for k in range(LANE_SD_LANES)},
         **subject_columns(sim, now, start, t0,
                           tap if tap is not None or not sim.subject else SubjectTap.from_logs(sim, t0)),
+        **safety_columns(sim, now, start, span, mean),
     }
     # Measurements named like a parameter (density, mean_speed, ...) must not overwrite its setting.
     renames = measured_names(row)
@@ -1099,8 +1190,8 @@ def plan_repeats(design: Design, jobs: list[tuple], configs: list[SimConfig], se
 
 def _sample_groups(args: argparse.Namespace) -> list[str] | None:
     """--sample-groups as the tabs name them, in tab order ("drivers , ROAD" -> ["Road", "Drivers"]), or
-    None for the default groups (presets.DEFAULT_GROUPS: every group but AVs and Coop); ValueError for an
-    unknown one."""
+    None for the default groups (presets.DEFAULT_GROUPS: every group but AVs, Coop and Smoothers); ValueError for
+    an unknown one."""
     from roundabout_sim import presets
 
     if not args.sample_groups:
@@ -1111,7 +1202,7 @@ def _sample_groups(args: argparse.Namespace) -> list[str] | None:
 def _sample(given: list[tuple[str, str]], base: Base, args: argparse.Namespace,
             parser: argparse.ArgumentParser) -> Design:
     """``--sample N`` points: a Latin hypercube over the --vary ranges, else over the plausible ranges
-    (presets.RANDOM_RANGES) of every parameter (but the AVs and Coop tabs', which only --sample-groups
+    (presets.RANDOM_RANGES) of every parameter (but the AVs, Coop and Smoothers tabs', which only --sample-groups
     draws: presets.OPT_IN_GROUPS), or of the --sample-groups ones, not set explicitly.
 
     Without --vary every plausible range is cut into N strata, each sampled
@@ -1193,7 +1284,7 @@ def _add_param_flags(parser: argparse.ArgumentParser) -> None:
                                     f"{spec.help}".replace("%", "%%"))
         else:
             group.add_argument(*flags, dest=spec.name, default=None, metavar="X",
-                               help=f"{spec.label}{unit}, {spec.lo:g}-{spec.hi:g} "
+                               help=f"{spec.label}{unit}, {range_text(spec)} "
                                     f"(default {getattr(defaults, spec.name):g}). {spec.help}".replace("%", "%%"))
 
 
@@ -1220,8 +1311,21 @@ def _describe(cfg: SimConfig) -> str:
     trucks = f", {100 * cfg.truck_share:g} % trucks of {cfg.truck_length:g} m" if cfg.truck_share > 0 else ""
     if cfg.auto_share > 0:
         brands = f" of {cfg.companies} companies" if cfg.companies > 1 else ""
-        gap = f" (time gap x {cfg.robotaxi_headway:g})" if cfg.auto_kind == "robotaxi" else ""
+        gap = {"robotaxi": f" (time gap x {cfg.robotaxi_headway:g})",
+               "acc": f" (time gap {cfg.acc_headway:g} s, dead time {cfg.acc_delay:g} s)",
+               "cav": f" (CACC {cfg.cav_headway:g} s, strings of <= {cfg.platoon_max}, cooperation {cfg.coop_class}"
+                      + (f", {cfg.coop_between} between companies" if cfg.companies > 1 and cfg.coop_between != "same"
+                         else "") + ")"}[cfg.auto_kind]
+        if cfg.companies > 1 and cfg.brand_spread > 0 and cfg.auto_kind != "robotaxi":
+            brands += f", brand spread {cfg.brand_spread:g}"
         trucks += f", {100 * cfg.auto_share:g} % automated: {cfg.auto_kind}{gap}{brands}"
+    if cfg.smoothers > 0:
+        law = {"followerstopper": f"FollowerStopper at {cfg.smoother_speed:g} m/s", "pi": "PI with saturation",
+               "quiet": "quiet placebo"}[cfg.smoother_law]
+        lane = "" if cfg.n_lanes == 1 else " round the lanes" if cfg.smoother_lane < 0 else \
+            f" in lane {min(cfg.smoother_lane, cfg.n_lanes - 1) + 1}"
+        start = f" from {cfg.smoother_start:g} s" if cfg.smoother_start > 0 else ""
+        trucks += f", {cfg.smoothers} smoother{'s' * (cfg.smoothers != 1)} ({law}{start}){lane}"
     reaction = f" ± {cfg.reaction_std:g}" if cfg.reaction_std > 0 else ""
     headway = f" ± {cfg.headway_std:g}" if cfg.headway_std > 0 else ""
     return (f"{_road(cfg)}, radius {cfg.radius:g} m{road}, car {cfg.car_length:g} m{trucks} | "
@@ -1251,6 +1355,19 @@ def _peak_note(t0: float, t1: float) -> None:
         print(f"note: the peak demand profile averages {factor:.2f} x the entrance chance over the measured "
               f"{t0:g}-{t1:g} s, not 1 (only over whole {PEAK_PERIOD / 60:g}-minute cycles); demand_per_min "
               "gives the demand actually offered")
+
+
+def _smoother_start_note(t0: float, configs: list[SimConfig], fix: Callable[[float], str]) -> None:
+    """Warn when wave smoothers switch on after the measured window starts at ``t0``: the summary then averages
+    their drivers' driving (smoother_start: Stern et al. 2018 let the waves form first) with the controlled time.
+    ``fix(latest start)``: how to start the window after it."""
+    late = sorted({cfg.smoother_start for cfg in configs if cfg.smoothers > 0 and cfg.smoother_start > t0})
+    if late:
+        runs = sum(cfg.smoothers > 0 and cfg.smoother_start > t0 for cfg in configs)
+        some = "the run's" if len(configs) == 1 else f"{runs} of the {len(configs)} runs'"
+        starts = _value_text(late[0]) + (f"-{_value_text(late[-1])}" if len(late) > 1 else "")
+        print(f"note: {some} smoothers switch on (smoother_start {starts} s) after the measured window starts at "
+              f"{t0:g} s: up to {late[-1] - t0:g} s of it is their drivers' driving; {fix(late[-1])}")
 
 
 def _label(name: str, value) -> str:
@@ -1304,6 +1421,8 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     print(f"Simulating {args.duration:g} s (seed {cfg.seed}{origin}): {_plain(_describe(cfg))}")
     if _open(cfg) and cfg.demand_profile == "peak":
         _peak_note(late_from, args.duration)
+    _smoother_start_note(late_from, [cfg], lambda start: f"a --duration of {2 * start:g} s or more (the summary "
+                                                         "covers its second half) measures controlled time only")
     t_wall = time.time()
     sim, rec, summary, car_speeds = _simulate(cfg, args.duration, args.interval, late_from, keep_speeds=True)
 
@@ -1374,7 +1493,19 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             f"mean ({_pct(summary['automated'] / summary['cars'] if summary['cars'] else float('nan'), 0)} % of the "
             f"vehicles; {100 * cfg.auto_share:g} % of the new ones are {cfg.auto_kind})"),
            ("Mean speed, human / automated", f"{_fmt(summary['human_speed'])} / {_fmt(summary['auto_speed'])}",
-            "m/s")] if cfg.auto_share > 0 else []),
+            "m/s"),
+           *([("Following by CACC", _pct(summary["cacc_share"]), "% of the automated vehicles' time")]
+             if cfg.auto_kind == "cav" else [])]
+          if cfg.auto_share > 0 else []),
+        # (the safety measures: with any automated vehicle, wave smoothers too, under their controllers)
+        *([("Safety layer (AEB)", _fmt(summary["aeb_per_veh_h"], 1), "interventions per automated vehicle-hour"),
+           ("Harsh braking, human / automated",
+            f"{_fmt(summary['harsh_human_per_veh_h'], 2)} / {_fmt(summary['harsh_auto_per_veh_h'], 2)}",
+            "episodes per vehicle-hour"),
+           (f"TTC <= {TTC_CRITICAL:g} s, HH / HA / AH / AA",
+            " / ".join(_fmt(summary[f"ttc_{p.lower()}_per_h"], 1) for p in PAIR_TYPES),
+            "episodes per hour of following (follower first; A = recognisable AV)")]
+          if cfg.auto_share > 0 or cfg.smoothers > 0 else []),
         ("Flux (whole ring)", _fmt(summary["flux"], 3), "cars/s"),
         ("Flux (detector)", _fmt(summary["detector_flux"], 3), "cars/s"),
         ("Jammed cars (congestion)", _pct(summary["jam_fraction"]),
@@ -1451,7 +1582,17 @@ IDLE_FIX = {"open mode only": "add --set traffic_mode=open, or vary traffic_mode
             "dry road": "set road_condition to wet, snow or ice, or vary it too",
             "capacity test": "set subject_arm=off: the capacity test fixes every route",
             "no automated vehicles": "set auto_share above 0",
-            "no robotaxis": "set auto_kind=robotaxi and auto_share above 0, or vary them too"}
+            "no robotaxis": "set auto_kind=robotaxi and auto_share above 0, or vary them too",
+            "no ACC cars": "set auto_kind=acc and auto_share above 0, or vary them too",
+            "no CAVs": "set auto_kind=cav and auto_share above 0, or vary them too",
+            "no ACC cars or CAVs": "set auto_kind to acc or cav and auto_share above 0, or vary them too",
+            "no cooperation": "set coop_class to A or higher, or vary it too",
+            "no strings": "set platoon_max above 1, or vary it too",
+            "one company": "set companies above 1, or vary it too",
+            "companies alike": "set brand_spread above 0 (acc or cav) or coop_between=none (cav), or vary them too",
+            "no smoothers": "set smoothers above 0, or vary it too",
+            "no FollowerStopper": "set smoother_law=followerstopper, or vary it too",
+            "one lane": "set n_lanes above 1, or vary it too"}
 
 
 def idle_notes(names, configs: list[SimConfig]) -> list[str]:
@@ -1509,6 +1650,8 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         print(f"Base settings: {setup.text()}{then}")
     if any(_open(cfg) and cfg.demand_profile == "peak" for cfg in configs):
         _peak_note(args.warmup, args.warmup + args.measure)
+    _smoother_start_note(args.warmup, configs,
+                         lambda start: f"a --warmup of {start:g} s or more measures controlled time only")
     for note in idle_notes(design.names, configs):
         print(f"note: {note}")
     if design.kind == "plan" and (repeats := plan_repeats(design, jobs, configs, args.seeds)):
@@ -1616,7 +1759,8 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
             how = f"{len(design.points)} random points (Latin hypercube over the given ranges)"
         else:
             groups = _sample_groups(args)
-            drawn = f"the {and_join(groups)} settings" if groups else "every setting but the AVs and Coop ones"
+            drawn = f"the {and_join(groups)} settings" if groups else \
+                "every setting but the AVs, Coop and Smoothers ones"
             how = f"{len(design.points)} random points (Latin hypercube over the plausible ranges of {drawn})"
         kind = "random sample" if design.kind == "sample" else "plan"
         if nothing:
@@ -2330,6 +2474,8 @@ def cmd_view(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from roundabout_sim.presets import OPT_IN_GROUPS  # (the tabs a random design leaves out unless named)
+
     parser = argparse.ArgumentParser(prog="python -m roundabout_sim.experiments",
                                      description=f"{__doc__}\n{DEFINITIONS}",
                                      formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
@@ -2388,12 +2534,13 @@ def build_parser() -> argparse.ArgumentParser:
                        help="N random design points (seeded by --seed), a Latin hypercube: each --vary range is "
                             "cut into N strata, each sampled once on the slider step (a range holding no more "
                             "slider values than N, and a comma list, are dealt out evenly). Without --vary: over "
-                            "the plausible ranges (presets.RANDOM_RANGES) of every parameter but the AVs and "
-                            "Coop tabs' (or of --sample-groups) not given with --set or its flag")
+                            "the plausible ranges (presets.RANDOM_RANGES) of every parameter but the "
+                            f"{and_join(OPT_IN_GROUPS)} tabs' (or of --sample-groups) not given with --set or its "
+                            "flag")
     sweep.add_argument("--sample-groups", dest="sample_groups", metavar="G1,G2",
                        help="--sample without --vary: draw only the parameters of these groups (the viewer's "
-                            f"tabs: {', '.join(dict.fromkeys(p.group for p in PARAMS))}; by default all but AVs "
-                            "and Coop, which are drawn only when named)")
+                            f"tabs: {', '.join(dict.fromkeys(p.group for p in PARAMS))}; by default all but "
+                            f"{and_join(OPT_IN_GROUPS)}, which are drawn only when named)")
     sweep.add_argument("--seeds", type=int, default=3, help="repetitions per point (default 3)")
     sweep.add_argument("--seed", type=cli.seed_arg, default=0,
                        help="base seed, a whole number >= 0; run k of each point uses base + k")

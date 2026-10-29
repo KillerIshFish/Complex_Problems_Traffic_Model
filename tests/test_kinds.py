@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from roundabout_sim import presets
-from roundabout_sim.config import IDLE_WHY, PARAM_BY_NAME, SimConfig, inactive_reason
+from roundabout_sim.config import IDLE_WHY, PARAM_BY_NAME, PARAMS, SimConfig, inactive_reason
 from roundabout_sim.engine import (ACC, ACC_GAP_SHARES, ACC_GAPS, AUTO_KINDS, AUTO_LAWS, CAV, CONNECTED, DRIVERLESS,
                                    GENERATORS, HUMAN, KIND_NAMES, QUEUE_FIELDS, RECOGNISABLE, ROBOTAXI, SMOOTHER,
                                    SUBJECT_ARM, SUBJECT_QUEUE, RingSim)
@@ -75,7 +75,7 @@ def test_kind_codes_names_and_sets():
     assert AUTO_KINDS == {"acc": ACC, "cav": CAV, "robotaxi": ROBOTAXI}
     assert set(AUTO_KINDS) == set(PARAM_BY_NAME["auto_kind"].choices) and SimConfig().auto_kind == "cav"
     assert RECOGNISABLE == {CAV, ROBOTAXI, SMOOTHER} and DRIVERLESS == {CAV, ROBOTAXI} and CONNECTED == {CAV}
-    assert set(AUTO_LAWS) == set(AUTO_KINDS.values())  # every automated kind has a law (S1: all the IDM)
+    assert set(AUTO_LAWS) == set(AUTO_KINDS.values()) | {SMOOTHER}  # every automated kind has a law, smoothers too
     assert {"rng_kinds", "rng_kinds_test"} <= set(GENERATORS)
     assert {"queue_kinds", "queue_companies", "queue_acc_gaps"} <= set(QUEUE_FIELDS)
     assert ACC_GAPS == (1.1, 1.6, 2.2) and sum(ACC_GAP_SHARES) == pytest.approx(1.0)
@@ -152,9 +152,12 @@ def test_the_human_streams_draw_the_same_whatever_the_share():
     assert human.any() and robot.any()
     for name in ("truck", "lc_cool", "exit_at", "theta", "uid"):
         np.testing.assert_array_equal(getattr(plain, name)[plain.alive], getattr(auto, name)[auto.alive])
-    for name in ("z", "z_react", "z_gap"):  # the humans' own; the robotaxis' masked to 0
+    for name in ("z", "z_react", "z_gap"):  # the humans' own; the robotaxis' masked to 0 (but their time gap's)
         np.testing.assert_array_equal(getattr(plain, name)[human], getattr(auto, name)[human])
-        assert (getattr(auto, name)[robot] == 0).all() and (getattr(plain, name)[robot] != 0).any()
+        if name == "z_gap":  # a robotaxi keeps the time-gap temperament it drew (Hu et al. 2023 Sec. III-B)
+            np.testing.assert_array_equal(getattr(auto, name)[robot], getattr(plain, name)[robot])
+        else:
+            assert (getattr(auto, name)[robot] == 0).all() and (getattr(plain, name)[robot] != 0).any()
     for sim in (plain, auto):
         sim.step(600)
     assert plain.rng_demand.bit_generator.state == auto.rng_demand.bit_generator.state
@@ -241,7 +244,8 @@ def test_automated_vehicles_are_one_software_without_noise():
     assert auto.sum() > 5 and human.sum() > 5
     slots = np.flatnonzero(auto)
     assert np.unique(sim.desired_speed(slots)).size == 1 and np.unique(sim.headway[auto]).size == 1
-    assert sim.headway[auto][0] == sim.eff.time_headway and (sim.delay[auto] == 6).all()
+    # (an ACC car: ACC time gap and its dead time ACC dead time, 0.5 s, not a driver's: the controllers' settings)
+    assert sim.headway[auto][0] == sim.cfg.acc_headway and (sim.delay[auto] == 5).all()
     assert np.unique(sim.headway[human]).size > 1 and np.unique(sim.delay[human]).size > 1
     runs = [RingSim(cfg.updated(auto_share=1.0, driver_noise=noise)) for noise in (0.0, 0.8)]
     for run in runs:
@@ -276,8 +280,8 @@ def test_the_automated_command_is_a_dispatch_by_kind(monkeypatch):
     vehicles; each kind goes to its law (AUTO_LAWS), with that kind's cars only."""
     calls = []
     sim = RingSim(SimConfig(seed=71, auto_share=0.5, auto_kind="cav", n_arms=0, n_lanes=1, density=40))
-    real = sim._law_idm
-    monkeypatch.setattr(sim, "_law_idm", lambda slots, *a: calls.append(slots.copy()) or real(slots, *a))
+    real = sim._law_cav  # (a CAV's law: PATH CACC behind a cooperating CAV, else the ACC law)
+    monkeypatch.setattr(sim, "_law_cav", lambda slots, *a: calls.append(slots.copy()) or real(slots, *a))
     sim.step()
     assert len(calls) == 1 and (sim.kind[calls[0]] == CAV).all()
     assert calls[0].size == int((sim.alive & (sim.kind == CAV)).sum())
@@ -326,7 +330,10 @@ def test_settings_say_why_they_do_nothing():
         assert inactive_reason(name, plain) == "no automated vehicles"
     assert inactive_reason("auto_share", plain) == ""
     cav = SimConfig(auto_share=0.3)
-    assert inactive_reason("auto_kind", cav) == inactive_reason("companies", cav) == ""
+    assert inactive_reason("auto_kind", cav) == ""
+    # (Companies acts once the companies drive differently: brand_spread or coop_between, config.companies_differ)
+    assert inactive_reason("companies", cav) == "companies alike"
+    assert inactive_reason("companies", cav.updated(brand_spread=0.2)) == ""
     for cfg in (plain, plain.updated(auto_kind="robotaxi"), cav):
         assert inactive_reason("robotaxi_headway", cfg) == "no robotaxis"
     assert inactive_reason("robotaxi_headway", cav.updated(auto_kind="robotaxi")) == ""
@@ -342,15 +349,17 @@ def test_invalid_values_are_refused(bad):
 
 
 def test_random_settings_leave_the_av_tabs_alone_unless_named():
-    """--random / --sample draw every group but AVs and Coop by default (human-only designs reproduce); named,
-    those are drawn like any other, on their slider steps."""
-    assert presets.OPT_IN_GROUPS == ("AVs", "Coop") and set(presets.DEFAULT_GROUPS) == \
-        set(presets.GROUPS) - {"AVs", "Coop"}
-    av_names = {"auto_share", "auto_kind", "robotaxi_headway", "companies"}
+    """--random / --sample draw every group but AVs and Coop (and Smoothers) by default (human-only designs
+    reproduce); named, those are drawn like any other, on their slider steps."""
+    assert presets.OPT_IN_GROUPS == ("AVs", "Coop", "Smoothers") and set(presets.DEFAULT_GROUPS) == \
+        set(presets.GROUPS) - {"AVs", "Coop", "Smoothers"}
+    av_names = {p.name for p in PARAMS if p.group in ("AVs", "Coop")}  # (the ACC/CACC and cooperation ones too)
+    assert {"auto_share", "auto_kind", "robotaxi_headway", "companies", "acc_headway", "coop_class"} <= av_names
     for seed in range(20):
         assert not set(presets.random_changes(seed)) & av_names
     assert not set(presets.plausible_ranges()) & av_names
-    assert presets.plausible_ranges(["Coop"]) == {"companies": [1, 2, 3, 4]}
+    assert presets.plausible_ranges(["Coop"])["companies"] == [1, 2, 3, 4]
+    assert set(presets.plausible_ranges(["Coop"])) == {p.name for p in PARAMS if p.group == "Coop"}
     shares = []
     for seed in range(200):
         drawn = presets.random_changes(seed, ["AVs", "coop"])

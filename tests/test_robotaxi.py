@@ -1,8 +1,8 @@
 """The robotaxi (SPEC 2, Hu et al. 2023, Waymo Open Dataset): the IDM with its direct leader at a driver's time
 gap x robotaxi_headway (a truck body x TRUCK_HEADWAY_FACTOR on top) and a standstill gap ROBOTAXI_S0_EXTRA
-longer, a driver's acceleration and comfortable braking, no noise, no spread between robotaxis, the reaction
-delay of the Reaction time setting; its steady state is the IDM equilibrium with those values, and a ring of
-robotaxis settles there."""
+longer, a driver's acceleration and comfortable braking, no noise, the drivers' time-gap spread but no spread of
+desired speed or reaction, the reaction delay of the Reaction time setting; its steady state is the IDM
+equilibrium with those values, and a ring of robotaxis settles there."""
 
 from __future__ import annotations
 
@@ -33,8 +33,12 @@ def test_time_gap_standstill_gap_acceleration_and_delay():
     car, truck = live & ~sim.truck, live & sim.truck
     assert (sim.kind[live] == ROBOTAXI).all() and car.any() and truck.any()
     T, a = sim.eff.time_headway, sim.eff.max_accel
-    assert (sim.headway[car] == 1.4 * T).all()  # the setting x the factor, no spread
-    assert (sim.headway[truck] == TRUCK_HEADWAY_FACTOR * (1.4 * T)).all()  # the truck body on top
+    # The driver's time gap with its spread (robotaxis keep their time-gap temperament: Hu et al. 2023 Sec. III-B
+    # find Waymo's time-headway variance comparable to drivers') x the factor; the truck body on top.
+    own = np.maximum(0.5 * T, T + sim.z_gap * sim.eff.headway_std)
+    assert (sim.z_gap[live] != 0).all() and np.unique(sim.headway[car]).size > 1
+    assert (sim.headway[car] == (1.4 * own)[car]).all()
+    assert (sim.headway[truck] == TRUCK_HEADWAY_FACTOR * (1.4 * own)[truck]).all()
     assert (sim.s0[live] == 1.5 + ROBOTAXI_S0_EXTRA).all()  # a truck too
     assert (sim.accel[car] == a).all() and (sim.accel[truck] == TRUCK_ACCEL_FACTOR * a).all()
     assert (sim.delay[live] == 7).all()  # Reaction time, no spread
@@ -42,7 +46,8 @@ def test_time_gap_standstill_gap_acceleration_and_delay():
     assert np.unique(v0).size == 1 and v0[0] == min(sim.eff.mean_speed, np.sqrt(sim.eff.lateral_accel * sim.radii[0]))
     # The road condition scales its time gap like a driver's (the robotaxi weather policy is S3's).
     assert not sim.set(road_condition="wet")
-    assert sim.headway[car] == pytest.approx(1.4 * sim.eff.time_headway) and sim.eff.time_headway > T
+    wet = np.maximum(0.5 * sim.eff.time_headway, sim.eff.time_headway + sim.z_gap * sim.eff.headway_std)
+    assert sim.headway[car] == pytest.approx(1.4 * wet[car]) and sim.eff.time_headway > T
     # Humans beside them keep their own spread and the plain standstill gap.
     mixed = robotaxis(auto_share=0.5, min_gap=1.5, density=40, **SPREAD)
     human = mixed.alive & (mixed.kind == HUMAN)

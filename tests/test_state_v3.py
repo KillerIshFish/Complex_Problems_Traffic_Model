@@ -24,7 +24,9 @@ from tests.test_state_migration import as_version_1, trajectory
 # What version 2 (S0) added; everything else in ADDED came with version 3.
 V2_NAMES = {"weather_scale", "subject_arm", "anticipation", "arm_passed", "arm_passed_outer", "arm_passed_trucks",
             "arm_entered_trucks", "arm_entry_wait", "n_topped_up", "conflict_log"}
-V3_NAMES = set(ADDED) - V2_NAMES
+V3_NAMES = {"auto_share", "auto_kind", "robotaxi_headway", "companies", "rng_kinds", "rng_kinds_test", "kind",
+            "company", "acc_gap", "a_now", "s0", "queue_kinds", "queue_companies", "queue_acc_gaps"}
+LATER = set(ADDED) - V2_NAMES - V3_NAMES  # (version 4 on: the ACC/CACC controllers, test_state_v4)
 OPEN = dict(traffic_mode="open", entry_rate=0.25, n_lanes=2, truck_share=0.1, follow_up=2.5, min_gap=1.5)
 
 
@@ -33,9 +35,10 @@ def as_version_2(sim_state: dict) -> dict:
     conflict_log entries of 4 fields (time, arm, lane, uid)."""
     meta, arrays = copy.deepcopy(sim_state["meta"]), dict(sim_state["arrays"])
     meta["version"] = 2
-    for name in V3_NAMES:
+    for name in V3_NAMES | LATER:
         meta["config"].pop(name, None)
         meta["generators"].pop(name, None)
+        meta["counters"].pop(name, None)
         arrays.pop(name, None)
         arrays.pop(f"{name}_count", None)
     log = arrays["conflict_log"]
@@ -59,9 +62,8 @@ def assert_human_fills(old: RingSim) -> None:
 
 # ------------------------------------------------------------------ the registry
 def test_version_3_registers_the_kinds():
-    assert STATE_VERSION == 3 and state.FORMAT_VERSION == 1
-    assert {"auto_share", "auto_kind", "robotaxi_headway", "companies", "rng_kinds", "rng_kinds_test", "kind",
-            "company", "acc_gap", "a_now", "s0", "queue_kinds", "queue_companies", "queue_acc_gaps"} == V3_NAMES
+    assert STATE_VERSION >= 3 and state.FORMAT_VERSION == 1  # (version 4 added the controllers: LATER)
+    assert V3_NAMES <= set(ADDED) and not LATER & V3_NAMES
     assert ADDED["rng_kinds"] == 3 and ADDED["rng_kinds_test"] == (3, 1)
     assert set(V3_NAMES) & set(CAR_ARRAYS) == {"kind", "company", "acc_gap", "a_now", "s0"}
     assert isinstance(ADDED["s0"], FromState) and ADDED["kind"] == HUMAN and ADDED["company"] == -1
@@ -116,7 +118,7 @@ def test_a_version_2_file_resumes_in_the_viewer_with_its_charts(new_app, tmp_pat
     rows["arrays"] = {**rows["arrays"], "values": rows["arrays"]["values"][:, keep],
                       "kinds": rows["arrays"]["kinds"][:, keep]}
     meta = {**saved.meta, "sim": v2["meta"], "rec": rows["meta"],
-            "settings": {k: v for k, v in saved.meta["settings"].items() if k not in V3_NAMES}}
+            "settings": {k: v for k, v in saved.meta["settings"].items() if k not in V3_NAMES | LATER}}
     old = tmp_path / "v2_state.npz"
     np.savez(old, meta_json=np.array(json.dumps(meta)), **{f"sim.{k}": v for k, v in v2["arrays"].items()},
              **{f"rec.{k}": v for k, v in rows["arrays"].items()})

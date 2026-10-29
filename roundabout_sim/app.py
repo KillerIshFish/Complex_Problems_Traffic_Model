@@ -52,9 +52,9 @@ import pygame
 
 from roundabout_sim import cli, metrics, palette, presets, state
 from roundabout_sim.config import (NEEDS_NONZERO, PARAM_BY_NAME, PARAMS, ParamSpec, SimConfig, coerce,
-                                   inactive_reason, same_value)
-from roundabout_sim.engine import (AUTO_KINDS, HUMAN, KIND_NAMES, MAX_DECEL, MAX_QUEUE, RESUME_FRACTION,
-                                   SLOW_FRACTION, SUBJECT_ARM, TRUCK_ACCEL_FACTOR, TRUCK_HEADWAY_FACTOR,
+                                   inactive_reason, range_text, same_value)
+from roundabout_sim.engine import (AUTO_KINDS, CAV, HUMAN, KIND_NAMES, MAX_DECEL, MAX_QUEUE, RESUME_FRACTION,
+                                   SLOW_FRACTION, SMOOTHER, SUBJECT_ARM, TRUCK_ACCEL_FACTOR, TRUCK_HEADWAY_FACTOR,
                                    TRUCK_SPEED_FACTOR, TRUCK_WIDTH, TWO_PI, RingSim, StateError)
 from roundabout_sim.textfmt import (DISPLAY_DIGITS, decimals, format_number, plural,  # noqa: F401 (also app's API)
                                     value_text)
@@ -93,7 +93,8 @@ VIEW_PARAMS = {p.name: p for p in (
               "Simulation steps (of dt each) per drawn frame. Keys + and -."),
     ParamSpec("colour_mode", "Car colour", 0, 0, 0, "", "View",
               "speed: own speed / free speed; desired: driver's desired speed (slow to fast); "
-              "lane: which lane; type: car or truck; kind: human driver or automated (acc, cav, robotaxi). Key C.",
+              "lane: which lane; type: car or truck; kind: human driver or automated (acc, cav, robotaxi, smoother). "
+              "Key C.",
               choices=("speed", "desired", "lane", "type", "kind")),
     ParamSpec("spacetime_mode", "Space-time colour", 0, 0, 0, "", "View",
               "speed: mean speed at each angle / the cars' mean free speed; occupancy: share of lane "
@@ -125,9 +126,9 @@ BUTTONS = (
                                      "a published experiment, a design guide or traffic counts), keeping the seed. "
                                      "Rebuilds the roundabout and clears the charts; the tabs then change it as usual. "
                                      "On the command line: --preset NAME."),
-    ("randomize", "Randomize all (X)", "Give every setting a plausible random value (the AVs and Coop tabs only with "
-                                       "Shift+X there): real-world ranges, linked as on real roundabouts (the radius "
-                                       "follows the lanes, the demand the capacity, ...). "
+    ("randomize", "Randomize all (X)", "Give every setting a plausible random value (the AVs, Coop and Smoothers tabs "
+                                       "only with Shift+X there): real-world ranges, linked as on real roundabouts "
+                                       "(the radius follows the lanes, the demand the capacity, ...). "
                                        "Each press draws a fresh seed, shown in the help box and kept with the "
                                        "settings: --random SEED starts with the same ones (X). Shift+X randomizes only "
                                        "the settings of the tab shown."),
@@ -137,7 +138,7 @@ BUTTON_ROWS = (("pause", "step", "reset", "brake"), ("clear", "screenshot", "csv
 # The button at the end of each parameter tab (Shift+X).
 RANDOM_TAB_HELP = ("Give the {group} settings plausible random values, linked to the current settings of the other "
                    "tabs, with a fresh seed shown in the help box (Shift+X). Randomize all (X) draws every setting "
-                   "but those of the AVs and Coop tabs.")
+                   "but those of the AVs, Coop and Smoothers tabs.")
 PRESET_HELP = ("Preset {i} of {n}: {title}. {description}{source} Click the title or the arrows for another; Apply "
                "preset starts it (details below).")
 PRESET_TEXT_HELP = ("{title}: what it is, its settings (by parameter name, as --set takes them), the notes (caveats, "
@@ -162,8 +163,12 @@ TAB_HELP = {
     "Lane chg": "Show the lane-changing parameters.",
     "Start": "Show the initial-state parameters: how the cars are spaced at the start.",
     "AVs": "Show the automated-vehicle parameters: their share of the new vehicles (changing it rebuilds the "
-           "roundabout), their kind and the robotaxis' time gap.",
-    "Coop": "Show the cooperation parameters: how many companies the automated vehicles belong to.",
+           "roundabout), their kind, the robotaxis' time gap and the ACC and CACC time gaps and dead time.",
+    "Coop": "Show the cooperation parameters: how many companies the automated vehicles belong to, how far CAVs "
+            "cooperate within and between companies, how much the companies' settings differ and how long a CACC "
+            "string may grow.",
+    "Smoothers": "Show the wave-smoother parameters: how many drivers' cars an automated controller takes over to "
+                 "damp stop-and-go waves, its law and set speed, when it switches on and in which lane.",
     PRESETS_TAB: "Show the presets: settings of real roundabouts and ring-road experiments, with their sources and "
                  "notes, and random settings.",
 }
@@ -413,9 +418,9 @@ def random_origin(seed: int, groups, values: dict, base: dict | None = None, see
 
 
 def opt_in_values(cfg: SimConfig) -> dict:
-    """``cfg``'s settings of the tabs a draw of every tab leaves alone (presets.OPT_IN_GROUPS: AVs, Coop). An
-    origin of all tabs holds them too, so that a change to one counts and one not at its default is named as
-    given (--random SEED starts with them only with their flags)."""
+    """``cfg``'s settings of the tabs a draw of every tab leaves alone (presets.OPT_IN_GROUPS: AVs, Coop,
+    Smoothers). An origin of all tabs holds them too, so that a change to one counts and one not at its default is
+    named as given (--random SEED starts with them only with their flags)."""
     return {p.name: getattr(cfg, p.name) for p in PARAMS if p.group in presets.OPT_IN_GROUPS}
 
 
@@ -1761,7 +1766,7 @@ class App(Messages):
             self._clear_history()
         what = "Random settings" if groups is None else f"Random {', '.join(groups)} settings"
         self.markers.append((self.sim.time, f"{what}, seed {seed}"))
-        if groups is None:  # the AVs and Coop tabs are kept, not drawn: given with --random, as their flags would be
+        if groups is None:  # the opt-in tabs are kept, not drawn: given with --random, as their flags would be
             kept = opt_in_values(self.sim.cfg)
             given = [n for n, v in kept.items() if not same_value(v, getattr(SimConfig(), n))]
             self.origin = random_origin(seed, None, {**changes, **kept}, given=given)
@@ -2064,11 +2069,18 @@ class App(Messages):
         lines = [f"{kind} {sim.uid[slot]}  ·  lane {sim.lane[slot] + 1}  ·  {sim.length[slot]:g} m long",
                  f"{sim.v[slot]:.1f} m/s of {v0:.1f} desired",
                  f"time gap {sim.headway[slot]:.2f} s  ·  reaction {sim.delay[slot] * sim.cfg.dt:.1f} s"]
-        if sim.kind[slot] != HUMAN or sim.cfg.auto_share > 0:  # (who drives, once there can be automated ones)
+        if sim.kind[slot] != HUMAN or sim.automated:  # (who drives, once there can be automated ones)
             company = int(sim.company[slot])
             lines.append("human driver" if sim.kind[slot] == HUMAN else
                          f"automated: {KIND_NAMES[sim.kind[slot]]}  ·  standstill gap {sim.s0[slot]:.2f} m"
                          + (f"  ·  company {company + 1} of {sim.cfg.companies}" if company >= 0 else ""))
+            if sim.kind[slot] == CAV:  # its place in its CACC string (engine RingSim._string_positions)
+                pos, most = int(sim.string_pos[slot]), int(sim.cfg.platoon_max)
+                lines.append("no cooperating CAV ahead: ACC law" if pos <= 1 else
+                             f"CACC: string member {pos} of at most {most}" if pos <= most else
+                             "CACC: leads the next string (the one too many), at the gap between strings")
+            if sim.kind[slot] == SMOOTHER:  # what drives it now (engine RingSim._law_smoother)
+                lines.append(self._smoother_line(slot))
         if np.isfinite(sim.exit_at[slot]):
             moving_out = bool(sim.must_move_out(np.array([slot]))[0])
             lines.append(f"exits in {(sim.exit_at[slot] - sim.travel[slot]) * sim.r_out:.0f} m"
@@ -2084,6 +2096,19 @@ class App(Messages):
         for i, text in enumerate(lines):
             f.blit(self.screen, text, (box.x + pad, box.y + pad + i * f.line("small")), "small",
                    UI["text"] if i == 0 else UI["text2"])
+
+    def _smoother_line(self, slot: int) -> str:
+        """The hover line of a wave smoother: its driver until Smoother start, the quiet placebo, or its law and
+        command speed (the driver's IDM beyond the gap cap is not told apart)."""
+        sim = self.sim
+        cfg = sim.cfg
+        if sim.time < cfg.smoother_start:
+            return f"smoother: its driver drives until {cfg.smoother_start:g} s"
+        if cfg.smoother_law == "quiet":
+            return "smoother (placebo): its driver's model, no noise"
+        law = f"FollowerStopper at {cfg.smoother_speed:g} m/s" if cfg.smoother_law == "followerstopper" else \
+            "PI with saturation"
+        return f"smoother: {law}, command {sim.v_cmd[slot]:.1f} m/s, no reaction delay"
 
     def _gradient(self, kind: str, w: int, h: int) -> pygame.Surface:
         key = (kind, w, h)
@@ -2859,7 +2884,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.add_argument(*flags, dest=spec.name, choices=spec.choices, help=text)
         else:
             unit = f" {spec.unit}" if spec.unit else ""
-            parser.add_argument(*flags, dest=spec.name, type=float, metavar=f"{spec.lo:g}-{spec.hi:g}{unit}",
+            parser.add_argument(*flags, dest=spec.name, type=float, metavar=f"{range_text(spec, '-')}{unit}",
                                 help=text)
     args = parser.parse_args(argv)
     if args.preset is not None:
@@ -2922,7 +2947,7 @@ def origin_from_args(args: argparse.Namespace) -> dict | None:
         return preset_origin(args.preset)
     if getattr(args, "random", None) is not None:
         changes = _flag_settings(args)
-        # (--random leaves the AVs and Coop tabs alone: their values are the defaults or the flags given)
+        # (--random leaves the AVs, Coop and Smoothers tabs alone: their values are the defaults or the flags given)
         drawn = {**presets.random_changes(args.random, fixed=changes), **opt_in_values(config_from_args(args))}
         return random_origin(args.random, None, drawn, given=[n for n in drawn if n in changes])
     return None

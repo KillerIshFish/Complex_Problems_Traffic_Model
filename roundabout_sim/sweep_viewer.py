@@ -54,9 +54,11 @@ import pygame
 import pygame.gfxdraw
 
 from roundabout_sim import cli, palette, state
-from roundabout_sim.config import (NEEDS_KIND, NEEDS_NONZERO, NEEDS_WEATHER, PARAM_BY_NAME, PARAMS, TEST_FIXED,
+from roundabout_sim.config import (NEEDS_COMPANIES, NEEDS_CONTROLLER, NEEDS_COOP, NEEDS_FS, NEEDS_KIND, NEEDS_LANES,
+                                   NEEDS_NONZERO, NEEDS_STRINGS, NEEDS_WEATHER, PARAM_BY_NAME, PARAMS, TEST_FIXED,
                                    SimConfig, axis_label, changed_settings, coerce, idle_note, inactive_inputs,
                                    inactive_reason)
+from roundabout_sim.engine import PAIR_TYPES, TTC_CRITICAL
 from roundabout_sim.experiments import range_values
 from roundabout_sim.metrics import LOS_LIMITS
 from roundabout_sim.textfmt import base_text, format_number, plural, significant, value_text
@@ -263,6 +265,16 @@ COLUMN_LABELS = {
     "trucks": "Trucks on the ring", "truck_speed": "Truck speed (m/s)", "car_speed": "Car speed (m/s)",
     "automated": "Automated vehicles on the ring", "human_speed": "Human-driven speed (m/s)",
     "auto_speed": "Automated vehicles' speed (m/s)",
+    "cacc_share": "Automated time following by CACC (0-1)",
+    "aeb_per_veh_h": "Safety-layer interventions (per automated veh-h)",
+    "harsh_human_per_veh_h": "Harsh braking, human-driven (per veh-h)",
+    "harsh_auto_per_veh_h": "Harsh braking, automated (per veh-h)",
+    "ttc_per_h": f"TTC ≤ {TTC_CRITICAL:g} s episodes (per h following)",
+    **{f"ttc_{p.lower()}_per_h": f"TTC ≤ {TTC_CRITICAL:g} s episodes, {p} (per h following)" for p in PAIR_TYPES},
+    "tet_s_per_h": f"Time at TTC ≤ {TTC_CRITICAL:g} s (s per h following)",
+    **{f"tet_{p.lower()}_s_per_h": f"Time at TTC ≤ {TTC_CRITICAL:g} s, {p} (s per h following)" for p in PAIR_TYPES},
+    **{f"follow_{p.lower()}_h": f"Car following, {p} (veh-h)" for p in PAIR_TYPES},
+    "cutins_ahead_auto_per_h": "Cut-ins ahead of AVs (per h)",
     "detector_flux": "Detector flux (cars/s)", "occupancy": "Area covered (0-1)",
     "jams_following": "Jams, front car following (count)", "jams_merge": "Jams, front car moving out (count)",
     "jams_exit": "Jams, front car exiting (count)", "jams_entry": "Jams, front car just entered (count)",
@@ -903,7 +915,21 @@ IDLE_FIX = {"open mode only": "pick Traffic mode too (with open), or start from 
             "capacity test": "pick Capacity test too (with off), or start from base settings without it",
             "no automated vehicles": "pick Automated share too, or start from base settings with automated vehicles",
             "no robotaxis": "pick Automated share and AV kind (with robotaxi) too, or start from base settings "
-                            "with robotaxis"}
+                            "with robotaxis",
+            "no ACC cars": "pick Automated share and AV kind (with acc) too, or start from base settings with ACC cars",
+            "no CAVs": "pick Automated share and AV kind (with cav) too, or start from base settings with CAVs",
+            "no ACC cars or CAVs": "pick Automated share and AV kind (with acc or cav) too, or start from base "
+                                   "settings with ACC cars or CAVs",
+            "no cooperation": "pick Cooperation too (with A or higher), or start from base settings where CAVs "
+                              "cooperate",
+            "no strings": "pick Max string length too, or start from base settings with strings of 2 or more",
+            "one company": "pick Companies too, or start from base settings with two or more companies",
+            "companies alike": "pick Brand spread or Between companies too, or start from base settings where the "
+                               "companies drive differently",
+            "no smoothers": "pick Smoothers too, or start from base settings with smoothers",
+            "no FollowerStopper": "pick Smoother law too (with followerstopper), or start from base settings with "
+                                  "FollowerStopper smoothers",
+            "one lane": "pick Lanes too, or start from base settings with two or more lanes"}
 
 
 def param_help(spec, chosen: bool, idle: str = "") -> str:
@@ -968,6 +994,12 @@ def help_texts() -> list[str]:
             or NEEDS_KIND.get(spec.name, ("", ""))[1] or ("dry road" if spec.name in NEEDS_WEATHER else "")
         texts += [param_help(spec, True), param_help(spec, False, idle), f"{setting_label(spec.name)}: {spec.help}",
                   SLICE_HELP.format(label=setting_label(spec.name))]
+        # (the automated vehicles' settings have further reasons: config.inactive_reason)
+        texts += [param_help(spec, False, reason) for names, reason in
+                  ((NEEDS_CONTROLLER, "no ACC cars or CAVs"), (NEEDS_COOP, "no cooperation"),
+                   (NEEDS_STRINGS, "no strings"), (NEEDS_COMPANIES, "one company"), (("companies",), "companies alike"),
+                   (NEEDS_FS, "no FollowerStopper"), (NEEDS_LANES, "one lane"))
+                  if spec.name in names]
     texts.append(idle_text({setting_label(n): "open mode only" for n in ("entry_rate", "demand_imbalance",
                                                                          "demand_profile")}))
     texts += [param_help(PARAM_BY_NAME[name], False, "capacity test") for name in TEST_FIXED]

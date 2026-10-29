@@ -60,14 +60,16 @@ def trajectory(sim: RingSim) -> tuple:
 def test_the_registry_names_only_saved_things_with_matching_defaults():
     defaults = SimConfig()
     saved = (CONFIG_FIELDS | set(ARM_ARRAYS) | set(COUNTERS) | set(FLOAT_TOTALS) | set(EVENT_LOGS) | set(GENERATORS)
-             | set(CAR_ARRAYS) | set(engine.QUEUE_FIELDS))  # (S1: per-car arrays and queue fields are filled too)
+             | set(CAR_ARRAYS) | set(engine.QUEUE_FIELDS)  # (S1: per-car arrays and queue fields are filled too)
+             | set(engine.PAIR_ARRAYS)  # (version 4: the counts per follower-leader pair type)
+             | {"speed_hist"})  # (version 4 too: the smoothers' speed history, rows x slots like acc_hist)
     assert set(ADDED) <= saved
     for name, fill in ADDED.items():
         if name in CONFIG_FIELDS:
             assert fill == getattr(defaults, name) and type(fill) is type(getattr(defaults, name)), name
     assert {"weather_scale", "subject_arm", "anticipation", "arm_passed", "arm_passed_outer", "arm_entered_trucks",
             "n_topped_up", "conflict_log"} <= set(ADDED)
-    assert STATE_VERSION == 3 and state.FORMAT_VERSION == 1
+    assert STATE_VERSION == 4 and state.FORMAT_VERSION == 1
     assert ADDED["anticipation"] == engine.ANTICIPATION == SimConfig().anticipation
 
 
@@ -180,7 +182,8 @@ def test_chart_keys_added_since_are_filled_for_the_lanes_the_rows_have():
                    for k in original if not k.startswith("lane") or "std" not in k)
     assert metrics.added_keys(names) == {}
     assert metrics.added_keys(["time", "lane0_cars", "lane1_cars"]).keys() == {
-        "lane0_speed_std", "lane1_speed_std", "automated", "human_speed", "auto_speed"}  # (S1 added the last three)
+        "lane0_speed_std", "lane1_speed_std", "automated", "human_speed", "auto_speed",  # (S1 added these three,
+        "in_cacc"}  # version 4 this one)
 
 
 def test_a_key_some_rows_have_and_others_lack_is_still_damaged():

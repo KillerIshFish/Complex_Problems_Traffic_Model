@@ -15,8 +15,8 @@ single-lane 18.25 m radius, the Etoile's exit chance 0.17); the viewers show
 them exactly.
 
 ``random_changes`` draws a plausible value for every parameter (or for the
-given groups; the automated-vehicle and cooperation tabs only when named,
-OPT_IN_GROUPS) from ``RANDOM_RANGES``: real-world distributions rather than the
+given groups; the automated-vehicle, cooperation and smoother tabs only when
+named, OPT_IN_GROUPS) from ``RANDOM_RANGES``: real-world distributions rather than the
 whole slider ranges, linked where real roundabouts link them (the radius
 follows the lane count, the demand the layout's capacity, ...). It is
 reproducible by seed, and its values sit on the sliders' steps.
@@ -59,7 +59,7 @@ DEFAULTS = SimConfig()
 GROUPS: tuple[str, ...] = tuple(dict.fromkeys(p.group for p in PARAMS))  # slider groups, in tab order
 # Groups drawn only when named (random_changes, plausible_ranges; --random and --sample draw the others by
 # default), so human-only random settings and designs stay what they were before automated vehicles (SPEC 0.4).
-OPT_IN_GROUPS = ("AVs", "Coop")
+OPT_IN_GROUPS = ("AVs", "Coop", "Smoothers")
 DEFAULT_GROUPS: tuple[str, ...] = tuple(g for g in GROUPS if g not in OPT_IN_GROUPS)
 FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SimConfig))  # every SimConfig field, also those without a slider
 
@@ -933,6 +933,47 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
     "companies": Choice((1, 2, 3, 4), (0.4, 0.3, 0.2, 0.1),
                         "Operators or brands sharing the roundabout: one in a fleet-only deployment, a few as "
                         "brands mix (weights assumed)."),
+    "acc_headway": Numeric(0.9, 1.5, 1.1,
+                           "Production ACC cars' shortest settings, 0.9-1.5 s (openACC, Makridis et al. 2021 Sec. "
+                           "4.1); 1.1 s is the gap Milanes & Shladover 2014 fitted the PATH law at and the setting "
+                           "50.4 % of PATH drivers chose (Liu et al. 2018 p. 21)."),
+    "acc_delay": Numeric(0.2, 0.6, 0.5,
+                         "Fitted dead times of production ACC cars: 0.15-0.99 s, median 0.47 s at the shortest "
+                         "settings (Gunter et al. 2019 Table II), on the slider's 0.1 s steps, up to the model's 0.6 s "
+                         "cap (Gunter's longer ones go with gains 3-20 x smaller than the PATH law's; derived)."),
+    "cav_headway": Numeric(0.6, 1.1, 0.7,
+                           "CACC time gaps PATH drivers chose: 0.6 s 57 %, 0.7 s 24 %, 0.9 s 7 %, 1.1 s 12 % (Liu et "
+                           "al. 2018 p. 22); 0.7 s in FHWA-OR-RD-22-11's roundabout runs (p. 108)."),
+    "platoon_max": Choice((5, 8, 10), (0.2, 0.5, 0.3),
+                          "8 in FHWA-OR-RD-22-11 Sec. 6.2.2.1 with the same CACC, 10 in Liu et al. 2018 (p. 24) and "
+                          "the FHWA freeway runs; 5 a cautious operator (assumption; weights assumed)."),
+    "coop_class": Choice(("none", "A", "B", "C", "D"), (0.15, 0.25, 0.35, 0.15, 0.1),
+                         "SAE J3216 classes: B (intent-sharing) was the HCM 7 CAV basis (CACC and V2V route-conflict "
+                         "anticipation, FHWA-OR-RD-22-11 Sec. 7.2.2); none for unconnected AVs, C/D for "
+                         "agreement-seeking and infrastructure-led cooperation (weights assumed)."),
+    "coop_between": Choice(("same", "none", "A"), (0.4, 0.3, 0.3),
+                           "Whether brands cooperate as within a fleet, not at all, or by status-sharing only "
+                           "(assumption: no deployment data; weights assumed)."),
+    "brand_spread": Numeric(0.0, 0.6, 0.3,
+                            "How much brands' ACC settings differ: 0.6 around 1.3 s spans the 0.54-2.05 s time gaps "
+                            "Gunter et al. 2019 (Table II) fitted over production cars; 0 = alike (typical "
+                            "assumed)."),
+    # Wave smoothers (OPT_IN_GROUPS too)
+    "smoothers": Choice((1, 2, 3, 4), (0.4, 0.3, 0.2, 0.1),
+                        "One automated car among 21 damped the waves of a 260 m ring (Stern et al. 2018 Sec. 2.1, "
+                        "Table 3); a few for longer or multi-lane rings (assumption; weights assumed)."),
+    "smoother_law": Choice(("followerstopper", "pi", "quiet"), (0.5, 0.3, 0.2),
+                           "Stern et al. 2018's two controllers (FollowerStopper, Exp. A; PI with saturation, Exp. C) "
+                           "and the noise-free placebo (weights assumed)."),
+    "smoother_speed": Numeric(6.5, 8.0, 7.5,
+                              "The set speeds Stern et al. 2018 tried in Exp. A (Sec. 4.2): 6.5, 7.0, 7.5 and 8.0 m/s; "
+                              "7.5 was best (near the ring's mean speed)."),
+    "smoother_start": Numeric(0.0, 300.0, 130.0,
+                              "Stern et al. 2018 switched the controller on once the waves had formed (Exp. A: waves "
+                              "from 79 s, control from 126 s, Tables 1 and 3); 0 = from the start (range assumed)."),
+    "smoother_lane": Choice((-1, 0, 1), (0.5, 0.3, 0.2),
+                            "Spread round the lanes, the innermost or the next (no deployment data on multi-lane "
+                            "rings; weights assumed)."),
 }
 
 # Ring radius [m] by lane count: radius = across / 2 - (lanes - 0.5) x 3.5 m lanes, rounded to the slider's
@@ -1079,8 +1120,8 @@ def _hcm_entry_rate(vc: float, n_lanes: int, n_arms: int, exit_prob: float, imba
 def random_changes(seed: int, groups: Iterable[str] | str | None = None, *, base: SimConfig | None = None,
                    fixed: Mapping[str, object] | None = None) -> dict:
     """A plausible random value for every parameter (or those of the slider ``groups``), reproducible by seed.
-    "Every" is that of DEFAULT_GROUPS: the automated vehicles' and cooperation tabs (OPT_IN_GROUPS) are drawn
-    only when ``groups`` names them, so a draw of the human settings is what it was before them.
+    "Every" is that of DEFAULT_GROUPS: the automated vehicles', cooperation and smoother tabs (OPT_IN_GROUPS) are
+    drawn only when ``groups`` names them, so a draw of the human settings is what it was before them.
 
     Values come from RANDOM_RANGES, sit on the slider steps (so the viewer
     shows them exactly) and give a valid SimConfig. Some are linked, as on real

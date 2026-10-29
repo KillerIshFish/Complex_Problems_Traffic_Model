@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from roundabout_sim.config import PARAM_BY_NAME, coerce
+from roundabout_sim.config import PARAM_BY_NAME, coerce, range_text
 from roundabout_sim.textfmt import short_value
 
 ROOT = Path(__file__).resolve().parents[1]  # the folder holding the package (importable by a child process)
@@ -74,7 +74,7 @@ def range_note(name: str, value) -> str:
     """'note: n_lanes=9 is outside the usual range 1-5' for a value off its slider's range ("" else)."""
     spec = PARAM_BY_NAME.get(name)
     if spec and not spec.choices and not spec.lo <= value <= spec.hi:
-        return f"note: {name}={value:g} is outside the usual range {spec.lo:g}-{spec.hi:g}"
+        return f"note: {name}={value:g} is outside the usual range {range_text(spec)}"
     return ""
 
 
@@ -105,7 +105,8 @@ def add_base_flags(parser: argparse.ArgumentParser, overrides: str, seed_note: s
                             f"ignored); {overrides} given with it override its values")
     group.add_argument("--random", type=seed_arg, metavar="SEED",
                        help="start from plausible random values of every parameter (but the automated "
-                            "vehicles' and cooperation ones, which keep their defaults), drawn with this seed"
+                            "vehicles', cooperation and smoother ones, which keep their defaults), drawn with this "
+                            "seed"
                             f"{seed_note}; {overrides} given with it stay as given and the settings linked to "
                             "them follow (e.g. with --traffic-mode open, an open-mode start density)")
     parser.add_argument("--list-presets", action=ListPresetsAction, help=LIST_PRESETS_HELP)

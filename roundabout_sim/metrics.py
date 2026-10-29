@@ -36,6 +36,8 @@ Vehicles
     cav, robotaxi); ``human_speed`` / ``auto_speed`` - mean speed of the
     human-driven and of the automated vehicles (NaN if there are none). Trucks
     count by their kind; smoothers count in neither.
+  * ``in_cacc`` - CAVs following a cooperating CAV by the CACC law right now
+    (string members, RingSim.string_pos >= 2).
 
 Lanes
   * ``lane{k}_cars``, ``lane{k}_speed``, ``lane{k}_speed_std`` - cars on lane
@@ -117,8 +119,10 @@ MAX_CATCH_UP = 1_000_000
 # reads these keys with row.get, so a row made elsewhere without them still draws.
 ADDED_KEYS: dict[str, float] = {
     "lane{k}_speed_std": float("nan"),
-    # S1 (state version 3): rows saved before had no automated vehicle (their speeds by kind are not known)
+    # state version 3: rows saved before had no automated vehicle (their speeds by kind are not known)
     "automated": 0.0, "human_speed": float("nan"), "auto_speed": float("nan"),
+    # state version 4: rows saved before had no CACC strings
+    "in_cacc": 0.0,
 }
 AUTO_CODES = tuple(AUTO_KINDS.values())  # the kinds counted as automated (``automated``, ``auto_speed``)
 
@@ -367,7 +371,8 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
                    jam_fraction=nan, speed_deficit=nan, n_jams=0, jams_following=0, jams_merge=0,
                    jams_exit=0, jams_entry=0, jams_other=0, occupancy=0.0, clustering=nan,
                    order_param=nan, order_angle=nan, order_baseline=nan, spacing_gini=nan,
-                   trucks=0, truck_speed=nan, car_speed=nan, automated=0, human_speed=nan, auto_speed=nan)
+                   trucks=0, truck_speed=nan, car_speed=nan, automated=0, human_speed=nan, auto_speed=nan,
+                   in_cacc=0)
     else:
         v = sim.v[idx]
         v_free = sim.desired_speed(idx)
@@ -406,6 +411,7 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
             automated=n_auto,
             human_speed=float(v[human].mean()) if human.any() else float("nan"),
             auto_speed=float(v[auto].mean()) if n_auto else float("nan"),
+            in_cacc=int((sim.string_pos[idx] >= 2).sum()),
         )
     span = min(t, window)
     stops = _count_since(sim.stop_log, t - window, count_at=1)
