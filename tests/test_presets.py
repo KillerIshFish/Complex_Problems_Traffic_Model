@@ -21,6 +21,8 @@ from tests.helpers import assert_valid, strata
 DEFAULTS = SimConfig()
 NAMES = presets.names()
 PARAM_NAMES = [p.name for p in PARAMS]
+# What a draw without groups gives: every group but the automated vehicles' and cooperation tabs (S1).
+DRAWN_NAMES = [p.name for p in PARAMS if p.group in presets.DEFAULT_GROUPS]
 OPEN_PRESETS = [n for n in NAMES if presets.apply(n).traffic_mode == "open"]
 CHOICES = [n for n, spec in presets.RANDOM_RANGES.items() if isinstance(spec, presets.Choice)]
 DRAWS = 3000  # seeds of the random-settings checks
@@ -41,7 +43,7 @@ def in_range(name: str, value) -> bool:
 
 @pytest.fixture(scope="module")
 def draws() -> list[dict]:
-    return [presets.random_changes(seed) for seed in range(DRAWS)]
+    return [presets.random_changes(seed, presets.GROUPS) for seed in range(DRAWS)]  # (every group, AVs too)
 
 
 # ------------------------------------------------------------------ presets
@@ -271,7 +273,8 @@ def test_random_changes_are_reproducible_by_seed():
     first = presets.random_changes(11)
     assert first == presets.random_changes(11)
     other = presets.random_changes(12)
-    assert sum(first[n] != other[n] for n in PARAM_NAMES) > len(PARAM_NAMES) // 2
+    assert list(first) == DRAWN_NAMES  # (the AVs and Coop tabs only when named)
+    assert sum(first[n] != other[n] for n in DRAWN_NAMES) > len(DRAWN_NAMES) // 2
     assert presets.random_changes(np.int64(11)) == first
     np.random.seed(0)
     expected = np.random.random()
@@ -297,8 +300,9 @@ def test_randomizing_one_group_draws_only_its_parameters(group):
     changes = presets.random_changes(8, [group])
     assert list(changes) == [p.name for p in PARAMS if p.group == group]
     # each parameter has its own stream: on top of the full draw, a group draw gives the same values
-    full = presets.random_changes(8)
+    full = presets.random_changes(8, presets.GROUPS)
     assert presets.random_changes(8, [group], base=presets.random_config(8)) == {k: full[k] for k in changes}
+    assert presets.random_changes(8) == {k: v for k, v in full.items() if k in DRAWN_NAMES}
     SimConfig().updated(**changes)
 
 
@@ -545,7 +549,8 @@ def test_latin_hypercube_edge_cases():
 
 
 def test_latin_hypercube_over_the_plausible_ranges_gives_valid_settings():
-    ranges = presets.plausible_ranges()
+    assert list(presets.plausible_ranges()) == DRAWN_NAMES
+    ranges = presets.plausible_ranges(presets.GROUPS)
     assert list(ranges) == PARAM_NAMES
     rows = presets.latin_hypercube(40, ranges, seed=2)
     for row in rows:

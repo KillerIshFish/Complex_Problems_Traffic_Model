@@ -15,7 +15,8 @@ single-lane 18.25 m radius, the Etoile's exit chance 0.17); the viewers show
 them exactly.
 
 ``random_changes`` draws a plausible value for every parameter (or for the
-given groups) from ``RANDOM_RANGES``: real-world distributions rather than the
+given groups; the automated-vehicle and cooperation tabs only when named,
+OPT_IN_GROUPS) from ``RANDOM_RANGES``: real-world distributions rather than the
 whole slider ranges, linked where real roundabouts link them (the radius
 follows the lane count, the demand the layout's capacity, ...). It is
 reproducible by seed, and its values sit on the sliders' steps.
@@ -56,6 +57,10 @@ from roundabout_sim.textfmt import plain, short_value
 
 DEFAULTS = SimConfig()
 GROUPS: tuple[str, ...] = tuple(dict.fromkeys(p.group for p in PARAMS))  # slider groups, in tab order
+# Groups drawn only when named (random_changes, plausible_ranges; --random and --sample draw the others by
+# default), so human-only random settings and designs stay what they were before automated vehicles (SPEC 0.4).
+OPT_IN_GROUPS = ("AVs", "Coop")
+DEFAULT_GROUPS: tuple[str, ...] = tuple(g for g in GROUPS if g not in OPT_IN_GROUPS)
 FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SimConfig))  # every SimConfig field, also those without a slider
 
 
@@ -914,6 +919,20 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
     "init_spacing": Choice(("uniform", "random", "clustered"), (0.5, 0.4, 0.1),
                            "The ring experiments started evenly spaced (Sugiyama, Stern); real traffic is random "
                            "(weights assumed)."),
+    # Automated vehicles and cooperation (OPT_IN_GROUPS: drawn only when their tab is asked for)
+    "auto_share": Numeric(0.0, 1.0, 0.2,
+                          "The research range: FHWA-OR-RD-22-11 Table 1.7 gives the HCM 7 CAV factors at 0-100 % "
+                          "in 20 % steps. Today's shares are near 0; typical 0.2, a near-term mix (assumption)."),
+    "auto_kind": Choice(("cav", "robotaxi", "acc"), (0.4, 0.3, 0.3),
+                        "One automated kind per run: connected AVs (the HCM 7 CAV basis), driverless robotaxis "
+                        "(Waymo, Hu et al. 2023) or driver-supervised ACC cars (weights assumed)."),
+    "robotaxi_headway": Numeric(1.0, 1.6, 1.3,
+                                "Waymo's median time headway over the human one: 3.49 / 2.69 s = 1.30 (mean ratio "
+                                "1.26; Hu et al. 2023 Sec. III-B, Fig. 5; derived). 1 = as close as drivers, 1.6 a "
+                                "more cautious fleet (assumption; Hu's AV jam spacing is 1.27 x a driver's)."),
+    "companies": Choice((1, 2, 3, 4), (0.4, 0.3, 0.2, 0.1),
+                        "Operators or brands sharing the roundabout: one in a fleet-only deployment, a few as "
+                        "brands mix (weights assumed)."),
 }
 
 # Ring radius [m] by lane count: radius = across / 2 - (lanes - 0.5) x 3.5 m lanes, rounded to the slider's
@@ -1007,8 +1026,9 @@ def _clip(value: float, spec: Numeric) -> float:
 
 
 def _groups(groups: Iterable[str] | str | None) -> set[str]:
+    """``groups`` as GROUPS names them (any case); None: DEFAULT_GROUPS (every group but the OPT_IN_GROUPS)."""
     if groups is None:
-        return set(GROUPS)
+        return set(DEFAULT_GROUPS)
     by_key = {g.lower(): g for g in GROUPS}
     wanted = [groups] if isinstance(groups, str) else list(groups)
     unknown = [g for g in wanted if str(g).lower() not in by_key]
@@ -1018,8 +1038,8 @@ def _groups(groups: Iterable[str] | str | None) -> set[str]:
 
 
 def group_names(groups: Iterable[str] | str | None = None) -> list[str]:
-    """``groups`` as GROUPS names them (any case), in tab order; all of them for None. ValueError for an
-    unknown one."""
+    """``groups`` as GROUPS names them (any case), in tab order; DEFAULT_GROUPS for None (the OPT_IN_GROUPS
+    only when named). ValueError for an unknown one."""
     wanted = _groups(groups)
     return [g for g in GROUPS if g in wanted]
 
@@ -1059,6 +1079,8 @@ def _hcm_entry_rate(vc: float, n_lanes: int, n_arms: int, exit_prob: float, imba
 def random_changes(seed: int, groups: Iterable[str] | str | None = None, *, base: SimConfig | None = None,
                    fixed: Mapping[str, object] | None = None) -> dict:
     """A plausible random value for every parameter (or those of the slider ``groups``), reproducible by seed.
+    "Every" is that of DEFAULT_GROUPS: the automated vehicles' and cooperation tabs (OPT_IN_GROUPS) are drawn
+    only when ``groups`` names them, so a draw of the human settings is what it was before them.
 
     Values come from RANDOM_RANGES, sit on the slider steps (so the viewer
     shows them exactly) and give a valid SimConfig. Some are linked, as on real
@@ -1180,7 +1202,8 @@ def random_config(seed: int, *, base: SimConfig | None = None, groups: Iterable[
 
 
 def plausible_ranges(groups: Iterable[str] | str | None = None) -> dict[str, tuple | list]:
-    """RANDOM_RANGES as :func:`latin_hypercube` ranges: (lo, hi) or the list of choices."""
+    """RANDOM_RANGES as :func:`latin_hypercube` ranges: (lo, hi) or the list of choices (of DEFAULT_GROUPS'
+    parameters unless ``groups`` names others)."""
     wanted = _groups(groups)
     out: dict[str, tuple | list] = {}
     for p in PARAMS:

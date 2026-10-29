@@ -764,10 +764,10 @@ def test_vehicle_controls_and_colour_key(make_app, monkeypatch):
     assert app.markers[-1][1] == "Road condition dry→ice"
     frames(app, 3)
     seen = []
-    for _ in range(4):  # C cycles the four car colours
+    for _ in range(5):  # C cycles the five car colours (S1 added "kind")
         app.handle(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_c, mod=0, unicode="", scancode=0))
         seen.append(app.colour_mode)
-    assert seen == ["desired", "lane", "type", "speed"]
+    assert seen == ["desired", "lane", "type", "kind", "speed"]
 
 
 @pytest.mark.parametrize("size", [(1100, 700), (1920, 1080)])

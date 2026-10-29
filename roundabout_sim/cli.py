@@ -104,7 +104,8 @@ def add_base_flags(parser: argparse.ArgumentParser, overrides: str, seed_note: s
                        help="start from a real-world preset (see --list-presets; name or title, case and - _ "
                             f"ignored); {overrides} given with it override its values")
     group.add_argument("--random", type=seed_arg, metavar="SEED",
-                       help="start from plausible random values of every parameter, drawn with this seed"
+                       help="start from plausible random values of every parameter (but the automated "
+                            "vehicles' and cooperation ones, which keep their defaults), drawn with this seed"
                             f"{seed_note}; {overrides} given with it stay as given and the settings linked to "
                             "them follow (e.g. with --traffic-mode open, an open-mode start density)")
     parser.add_argument("--list-presets", action=ListPresetsAction, help=LIST_PRESETS_HELP)

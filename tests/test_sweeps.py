@@ -362,7 +362,7 @@ def test_sample_without_vary_is_a_latin_hypercube_over_the_plausible_ranges(tmp_
     df, meta, _ = sweep(tmp_path, capsys, "--sample", "8", "--seeds", "1", "--warmup", "0", "--measure", "0.2",
                         "--workers", "1", name="all")
     groups = {p.name: p.group for p in PARAMS}
-    assert len({groups[v["name"]] for v in meta["varied"]}) == len(set(groups.values()))
+    assert {groups[v["name"]] for v in meta["varied"]} == set(presets.DEFAULT_GROUPS)  # (AVs, Coop: when named)
     assert sorted(df["n_lanes"].value_counts()) == [1, 1, 2, 2, 2]
     assert sorted(df["road_condition"].value_counts()) == [2, 2, 2, 2]
     assert strata(df["density"], 5, 110, 8) == list(range(8))
@@ -785,4 +785,4 @@ def test_sample_groups_are_named_as_the_tabs_name_them(tmp_path, capsys, no_figu
                        "--warmup", "0", "--measure", "0.5", "--workers", "1")
     assert meta["sample_groups"] == ["Road", "Drivers"]
     assert "plausible ranges of the Road and Drivers settings)" in no_figures[0].kwargs["subtitle"]
-    assert presets.group_names("lane CHG") == ["Lane chg"] and presets.group_names(None) == list(presets.GROUPS)
+    assert presets.group_names("lane CHG") == ["Lane chg"] and presets.group_names(None) == list(presets.DEFAULT_GROUPS)

@@ -278,10 +278,10 @@ def test_keyboard_shortcuts(make_app):
     assert app.steps_per_frame == 1
 
     seen = []
-    for _ in range(4):  # C cycles the car colours
+    for _ in range(5):  # C cycles the car colours (S1 added "kind")
         frame(app, key(pygame.K_c))
         seen.append(app.colour_mode)
-    assert seen == ["desired", "lane", "type", "speed"]
+    assert seen == ["desired", "lane", "type", "kind", "speed"]
 
     frame(app, key(pygame.K_b))  # B brakes a random car for 3 s
     assert len(app.brakes) == 1

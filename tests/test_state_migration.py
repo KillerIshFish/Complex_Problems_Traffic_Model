@@ -59,14 +59,15 @@ def trajectory(sim: RingSim) -> tuple:
 # ------------------------------------------------------------------ the registry
 def test_the_registry_names_only_saved_things_with_matching_defaults():
     defaults = SimConfig()
-    saved = CONFIG_FIELDS | set(ARM_ARRAYS) | set(COUNTERS) | set(FLOAT_TOTALS) | set(EVENT_LOGS) | set(GENERATORS)
-    assert set(ADDED) <= saved and not set(ADDED) & set(CAR_ARRAYS)  # (per-car arrays are never filled)
+    saved = (CONFIG_FIELDS | set(ARM_ARRAYS) | set(COUNTERS) | set(FLOAT_TOTALS) | set(EVENT_LOGS) | set(GENERATORS)
+             | set(CAR_ARRAYS) | set(engine.QUEUE_FIELDS))  # (S1: per-car arrays and queue fields are filled too)
+    assert set(ADDED) <= saved
     for name, fill in ADDED.items():
         if name in CONFIG_FIELDS:
             assert fill == getattr(defaults, name) and type(fill) is type(getattr(defaults, name)), name
     assert {"weather_scale", "subject_arm", "anticipation", "arm_passed", "arm_passed_outer", "arm_entered_trucks",
             "n_topped_up", "conflict_log"} <= set(ADDED)
-    assert STATE_VERSION == 2 and state.FORMAT_VERSION == 1
+    assert STATE_VERSION == 3 and state.FORMAT_VERSION == 1
     assert ADDED["anticipation"] == engine.ANTICIPATION == SimConfig().anticipation
 
 
@@ -178,7 +179,8 @@ def test_chart_keys_added_since_are_filled_for_the_lanes_the_rows_have():
         assert all(row[k] == original[k] or np.isnan(row[k]) and np.isnan(original[k])
                    for k in original if not k.startswith("lane") or "std" not in k)
     assert metrics.added_keys(names) == {}
-    assert metrics.added_keys(["time", "lane0_cars", "lane1_cars"]).keys() == {"lane0_speed_std", "lane1_speed_std"}
+    assert metrics.added_keys(["time", "lane0_cars", "lane1_cars"]).keys() == {
+        "lane0_speed_std", "lane1_speed_std", "automated", "human_speed", "auto_speed"}  # (S1 added the last three)
 
 
 def test_a_key_some_rows_have_and_others_lack_is_still_damaged():

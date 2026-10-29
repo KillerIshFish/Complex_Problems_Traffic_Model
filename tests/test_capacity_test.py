@@ -47,7 +47,7 @@ def test_hand_placed_cars_pass_the_entry_points_they_reach():
     sim.exit_at[slots] = np.inf
     old = sim.theta[slots].copy()
     sim.step()
-    passed = [(sim.uid[slots].tolist().index(uid), arm, lane) for _, arm, lane, uid in sim.conflict_log]
+    passed = [(sim.uid[slots].tolist().index(uid), arm, lane) for _, arm, lane, uid, _ in sim.conflict_log]
     # just before arm 2 (outer lane) and arm 0 (inner lane): passed; on arm 1's point or far off: not
     assert sorted(passed) == [(0, 2, 1), (1, 0, 0), (4, 1, 1)]
     assert sorted((i, a) for i, a, _ in passed) == sorted(expected_passes(old, sim.theta[slots], e))
@@ -69,11 +69,11 @@ def test_every_pass_is_logged_once_as_the_detector_counts_them():
         new = np.array([sim.theta[pos[u]] if a else o for u, o, a in zip(uid, old, alive)])
         # (a leaver gone this step reached no entry point: its exit comes first)
         want += [(t, arm, int(uid[i])) for i, arm in expected_passes(old, new, sim.entry_angle) if alive[i]]
-    got = [(t, arm, uid) for t, arm, _, uid in sim.conflict_log]
+    got = [(t, arm, uid) for t, arm, _, uid, _ in sim.conflict_log]
     assert sorted(got) == sorted(want) and len(got) > 300
     assert sim.arm_passed.sum() == len(got) and np.bincount([a for _, a, _ in got], minlength=5).tolist() == \
         sim.arm_passed.tolist()
-    assert sim.arm_passed_outer.sum() == sum(lane == sim.outer for _, _, lane, _ in sim.conflict_log)
+    assert sim.arm_passed_outer.sum() == sum(lane == sim.outer for _, _, lane, *_ in sim.conflict_log)
 
 
 def test_the_conflict_log_is_an_observer_and_is_pruned():
@@ -121,7 +121,7 @@ def test_the_subject_queue_never_empties_and_counts_no_arrivals(subject_run):
 def test_every_car_leaves_at_the_first_exit_after_the_subject_entrance(subject_run):
     sim, entrants, _ = subject_run
     assert {arm for _, arm, _ in sim.exit_log} == {(SUBJECT_ARM + 1) % sim.n_arms}
-    at_subject = [uid for _, arm, _, uid in sim.conflict_log if arm == SUBJECT_ARM]
+    at_subject = [uid for _, arm, _, uid, _ in sim.conflict_log if arm == SUBJECT_ARM]
     assert not set(at_subject) & entrants  # the subject's own entrants never pass its entry point
     assert max(np.unique(at_subject, return_counts=True)[1]) == 1  # every other car passes it once
     # so its conflicting flow is the other entrances' entry flow (less the cars still on their way)

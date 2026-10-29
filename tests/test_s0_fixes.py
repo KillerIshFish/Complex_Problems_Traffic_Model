@@ -143,7 +143,7 @@ def test_two_lane_routes_leave_room_to_move_out():
         new = np.flatnonzero(sim.alive & (sim.entered_at == t) & (sim.theta == sim.entry_angle[SUBJECT_ARM]))
         entrants |= set(sim.uid[new].tolist())
     assert {arm for _, arm, _ in sim.exit_log} == {e} and sim.n_missed == 0
-    at_subject = [uid for _, arm, _, uid in sim.conflict_log if arm == SUBJECT_ARM]
+    at_subject = [uid for _, arm, _, uid, _ in sim.conflict_log if arm == SUBJECT_ARM]
     assert not set(at_subject) & entrants and max(np.unique(at_subject, return_counts=True)[1]) == 1
     # lane use at the conflict point is the drivers' own, not all on the outer lane
     assert 0 < sim.arm_passed_outer[SUBJECT_ARM] < sim.arm_passed[SUBJECT_ARM]

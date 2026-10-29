@@ -53,9 +53,9 @@ import pygame
 from roundabout_sim import cli, metrics, palette, presets, state
 from roundabout_sim.config import (NEEDS_NONZERO, PARAM_BY_NAME, PARAMS, ParamSpec, SimConfig, coerce,
                                    inactive_reason, same_value)
-from roundabout_sim.engine import (MAX_DECEL, MAX_QUEUE, RESUME_FRACTION, SLOW_FRACTION, SUBJECT_ARM,
-                                   TRUCK_ACCEL_FACTOR, TRUCK_HEADWAY_FACTOR, TRUCK_SPEED_FACTOR, TRUCK_WIDTH, TWO_PI,
-                                   RingSim, StateError)
+from roundabout_sim.engine import (AUTO_KINDS, HUMAN, KIND_NAMES, MAX_DECEL, MAX_QUEUE, RESUME_FRACTION,
+                                   SLOW_FRACTION, SUBJECT_ARM, TRUCK_ACCEL_FACTOR, TRUCK_HEADWAY_FACTOR,
+                                   TRUCK_SPEED_FACTOR, TRUCK_WIDTH, TWO_PI, RingSim, StateError)
 from roundabout_sim.textfmt import (DISPLAY_DIGITS, decimals, format_number, plural,  # noqa: F401 (also app's API)
                                     value_text)
 from roundabout_sim.ui import (FONT_FACE, MIN_WINDOW, STATUS_LINES, Fonts, Messages, clamp_resize,  # noqa: F401
@@ -93,7 +93,8 @@ VIEW_PARAMS = {p.name: p for p in (
               "Simulation steps (of dt each) per drawn frame. Keys + and -."),
     ParamSpec("colour_mode", "Car colour", 0, 0, 0, "", "View",
               "speed: own speed / free speed; desired: driver's desired speed (slow to fast); "
-              "lane: which lane; type: car or truck. Key C.", choices=("speed", "desired", "lane", "type")),
+              "lane: which lane; type: car or truck; kind: human driver or automated (acc, cav, robotaxi). Key C.",
+              choices=("speed", "desired", "lane", "type", "kind")),
     ParamSpec("spacetime_mode", "Space-time colour", 0, 0, 0, "", "View",
               "speed: mean speed at each angle / the cars' mean free speed; occupancy: share of lane "
               f"covered in each of the {metrics.SECTORS} sectors.", choices=("speed", "occupancy")),
@@ -124,8 +125,9 @@ BUTTONS = (
                                      "a published experiment, a design guide or traffic counts), keeping the seed. "
                                      "Rebuilds the roundabout and clears the charts; the tabs then change it as usual. "
                                      "On the command line: --preset NAME."),
-    ("randomize", "Randomize all (X)", "Give every setting a plausible random value: real-world ranges, linked as on "
-                                       "real roundabouts (the radius follows the lanes, the demand the capacity, ...). "
+    ("randomize", "Randomize all (X)", "Give every setting a plausible random value (the AVs and Coop tabs only with "
+                                       "Shift+X there): real-world ranges, linked as on real roundabouts (the radius "
+                                       "follows the lanes, the demand the capacity, ...). "
                                        "Each press draws a fresh seed, shown in the help box and kept with the "
                                        "settings: --random SEED starts with the same ones (X). Shift+X randomizes only "
                                        "the settings of the tab shown."),
@@ -134,7 +136,8 @@ BUTTON_ROWS = (("pause", "step", "reset", "brake"), ("clear", "screenshot", "csv
                ("save_state", "load_state", "sweep"))
 # The button at the end of each parameter tab (Shift+X).
 RANDOM_TAB_HELP = ("Give the {group} settings plausible random values, linked to the current settings of the other "
-                   "tabs, with a fresh seed shown in the help box (Shift+X). Randomize all (X) draws every setting.")
+                   "tabs, with a fresh seed shown in the help box (Shift+X). Randomize all (X) draws every setting "
+                   "but those of the AVs and Coop tabs.")
 PRESET_HELP = ("Preset {i} of {n}: {title}. {description}{source} Click the title or the arrows for another; Apply "
                "preset starts it (details below).")
 PRESET_TEXT_HELP = ("{title}: what it is, its settings (by parameter name, as --set takes them), the notes (caveats, "
@@ -158,6 +161,9 @@ TAB_HELP = {
     "Drivers": "Show the driver parameters: speeds, reactions, following and noise, and how much drivers differ.",
     "Lane chg": "Show the lane-changing parameters.",
     "Start": "Show the initial-state parameters: how the cars are spaced at the start.",
+    "AVs": "Show the automated-vehicle parameters: their share of the new vehicles (changing it rebuilds the "
+           "roundabout), their kind and the robotaxis' time gap.",
+    "Coop": "Show the cooperation parameters: how many companies the automated vehicles belong to.",
     PRESETS_TAB: "Show the presets: settings of real roundabouts and ring-road experiments, with their sources and "
                  "notes, and random settings.",
 }
@@ -168,6 +174,9 @@ def tab_help(group: str) -> str:
 
 
 TYPE_COLOURS = (palette.SERIES[0], palette.SERIES[1])  # car, truck ("type" car colours)
+# "kind" car colours, by engine kind code: human drivers grey (palette.MID, the speed scale's middle: they recede),
+# each automated kind a categorical colour of its own (never those of "type", so the modes do not read alike).
+KIND_COLOURS = (palette.MID, palette.SERIES[3], palette.SERIES[2], palette.SERIES[4], palette.SERIES[6])
 TRUCK_TEXT = (f"Trucks are drawn to scale, {TRUCK_WIDTH:g} m wide; they accelerate at {TRUCK_ACCEL_FACTOR:g}× a car's "
               f"rate, want {TRUCK_SPEED_FACTOR:g}× their driver's desired speed and keep a "
               f"{TRUCK_HEADWAY_FACTOR:g}× longer time gap.")
@@ -401,6 +410,13 @@ def random_origin(seed: int, groups, values: dict, base: dict | None = None, see
     return {"random": int(seed), "groups": None if full else list(groups),
             "seeds": None if full else {g: int((seeds or {}).get(g, seed)) for g in groups},
             "values": dict(values), "given": list(given) if full else [], "base": None if full else base}
+
+
+def opt_in_values(cfg: SimConfig) -> dict:
+    """``cfg``'s settings of the tabs a draw of every tab leaves alone (presets.OPT_IN_GROUPS: AVs, Coop). An
+    origin of all tabs holds them too, so that a change to one counts and one not at its default is named as
+    given (--random SEED starts with them only with their flags)."""
+    return {p.name: getattr(cfg, p.name) for p in PARAMS if p.group in presets.OPT_IN_GROUPS}
 
 
 def _whole(value) -> bool:
@@ -1745,10 +1761,16 @@ class App(Messages):
             self._clear_history()
         what = "Random settings" if groups is None else f"Random {', '.join(groups)} settings"
         self.markers.append((self.sim.time, f"{what}, seed {seed}"))
-        self.origin = self.drawn_origin(seed, groups, changes, previous)
+        if groups is None:  # the AVs and Coop tabs are kept, not drawn: given with --random, as their flags would be
+            kept = opt_in_values(self.sim.cfg)
+            given = [n for n, v in kept.items() if not same_value(v, getattr(SimConfig(), n))]
+            self.origin = random_origin(seed, None, {**changes, **kept}, given=given)
+        else:
+            self.origin = self.drawn_origin(seed, groups, changes, previous)
         self._layout_panel()
         how = "rebuilt" if rebuilt else "changed live"
-        again = (f"python -m roundabout_sim --random {seed} starts with them" if groups is None else
+        again = (f"python -m roundabout_sim --random {seed}"
+                 f"{''.join(f' --{n} {value_text(kept[n])}' for n in given)} starts with them" if groups is None else
                  "linked to the settings of the other tabs")
         self._say(f"{what}, seed {seed}: {len(changed)} of {len(changes)} changed, {how} ({again}). "
                   f"{'X' if groups is None else 'Shift+X'} again draws others.", 8.0)
@@ -1976,6 +1998,8 @@ class App(Messages):
             return np.array(palette.SERIES)[snap["lane"] % len(palette.SERIES)]
         if self.colour_mode == "type":
             return np.array(TYPE_COLOURS)[snap["truck"].astype(int)]
+        if self.colour_mode == "kind":
+            return np.array(KIND_COLOURS)[snap["kind"].astype(int)]
         if self.colour_mode == "desired":
             # Temperament z sets the desired speed; with no spread every driver is the same.
             spread = 1.0 if self.sim.cfg.speed_std > 0 else 0.0
@@ -2040,6 +2064,11 @@ class App(Messages):
         lines = [f"{kind} {sim.uid[slot]}  ·  lane {sim.lane[slot] + 1}  ·  {sim.length[slot]:g} m long",
                  f"{sim.v[slot]:.1f} m/s of {v0:.1f} desired",
                  f"time gap {sim.headway[slot]:.2f} s  ·  reaction {sim.delay[slot] * sim.cfg.dt:.1f} s"]
+        if sim.kind[slot] != HUMAN or sim.cfg.auto_share > 0:  # (who drives, once there can be automated ones)
+            company = int(sim.company[slot])
+            lines.append("human driver" if sim.kind[slot] == HUMAN else
+                         f"automated: {KIND_NAMES[sim.kind[slot]]}  ·  standstill gap {sim.s0[slot]:.2f} m"
+                         + (f"  ·  company {company + 1} of {sim.cfg.companies}" if company >= 0 else ""))
         if np.isfinite(sim.exit_at[slot]):
             moving_out = bool(sim.must_move_out(np.array([slot]))[0])
             lines.append(f"exits in {(sim.exit_at[slot] - sim.travel[slot]) * sim.r_out:.0f} m"
@@ -2078,6 +2107,10 @@ class App(Messages):
         elif self.colour_mode == "type":
             car = [("text", "Vehicle:", T), ("box", TYPE_COLOURS[0]), ("text", "car", T2),
                    ("box", TYPE_COLOURS[1]), ("text", "truck", T2)]
+        elif self.colour_mode == "kind":
+            car = [("text", "Kind:", T)]
+            for code in self._kinds_shown():
+                car += [("box", KIND_COLOURS[code]), ("text", KIND_NAMES[code], T2)]
         else:
             car = [("text", "Lane:", T)]
             for lane in range(self.sim.n_lanes):
@@ -2088,6 +2121,15 @@ class App(Messages):
                 [("text", "Inner band, lane covered:", T), ("text", "0", T2), ("grad", "seq", gw),
                  ("text", f"{jam:.0f}% (jam)", T2)],
                 [("arrow", UI["text2"]), ("text", "bunching", T)]]
+
+    def _kinds_shown(self) -> list[int]:
+        """The kinds the "kind" legend names: human drivers, the run's automated kind (while there can be
+        automated vehicles) and any other kind on the ring, by code."""
+        sim = self.sim
+        codes = {HUMAN, *np.unique(sim.kind[sim.alive]).tolist()}
+        if sim.cfg.auto_share > 0:
+            codes.add(AUTO_KINDS[sim.cfg.auto_kind])
+        return sorted(codes)
 
     def _parts_width(self, parts: list[tuple]) -> int:
         f, sp = self.fonts, round(5 * self.s)
@@ -2880,7 +2922,8 @@ def origin_from_args(args: argparse.Namespace) -> dict | None:
         return preset_origin(args.preset)
     if getattr(args, "random", None) is not None:
         changes = _flag_settings(args)
-        drawn = presets.random_changes(args.random, fixed=changes)
+        # (--random leaves the AVs and Coop tabs alone: their values are the defaults or the flags given)
+        drawn = {**presets.random_changes(args.random, fixed=changes), **opt_in_values(config_from_args(args))}
         return random_origin(args.random, None, drawn, given=[n for n in drawn if n in changes])
     return None
 

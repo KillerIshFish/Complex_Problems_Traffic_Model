@@ -32,6 +32,10 @@ Congestion ("how jammed is it?")
 Vehicles
   * ``trucks`` - trucks on the ring; ``truck_speed`` / ``car_speed`` - mean
     speed of the trucks and of the other vehicles (NaN if there are none).
+  * ``automated`` - automated vehicles on the ring (the auto_share kinds: acc,
+    cav, robotaxi); ``human_speed`` / ``auto_speed`` - mean speed of the
+    human-driven and of the automated vehicles (NaN if there are none). Trucks
+    count by their kind; smoothers count in neither.
 
 Lanes
   * ``lane{k}_cars``, ``lane{k}_speed``, ``lane{k}_speed_std`` - cars on lane
@@ -96,7 +100,8 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
-from roundabout_sim.engine import LOG_HORIZON, SLOW_FRACTION, SUBJECT_ARM, TRUCK_WIDTH, TWO_PI, RingSim, StateError
+from roundabout_sim.engine import (AUTO_KINDS, HUMAN, LOG_HORIZON, SLOW_FRACTION, SUBJECT_ARM, TRUCK_WIDTH, TWO_PI,
+                                   RingSim, StateError)
 
 SECTORS = 24  # sectors for the clustering index and the occupancy ring
 SPACETIME_BINS = 180  # 2-degree bins for the space-time diagram
@@ -110,7 +115,12 @@ MAX_CATCH_UP = 1_000_000
 # Recorder.load_state fills a key only when no saved row has it (one that some rows lack is damaged). A key
 # with "{k}" stands for one per lane, filled for the lanes the rows have (their lane{k}_cars). Viewer code
 # reads these keys with row.get, so a row made elsewhere without them still draws.
-ADDED_KEYS: dict[str, float] = {"lane{k}_speed_std": float("nan")}
+ADDED_KEYS: dict[str, float] = {
+    "lane{k}_speed_std": float("nan"),
+    # S1 (state version 3): rows saved before had no automated vehicle (their speeds by kind are not known)
+    "automated": 0.0, "human_speed": float("nan"), "auto_speed": float("nan"),
+}
+AUTO_CODES = tuple(AUTO_KINDS.values())  # the kinds counted as automated (``automated``, ``auto_speed``)
 
 
 RATE_WINDOW = 30.0  # [s] default window for rolling rates
@@ -357,7 +367,7 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
                    jam_fraction=nan, speed_deficit=nan, n_jams=0, jams_following=0, jams_merge=0,
                    jams_exit=0, jams_entry=0, jams_other=0, occupancy=0.0, clustering=nan,
                    order_param=nan, order_angle=nan, order_baseline=nan, spacing_gini=nan,
-                   trucks=0, truck_speed=nan, car_speed=nan)
+                   trucks=0, truck_speed=nan, car_speed=nan, automated=0, human_speed=nan, auto_speed=nan)
     else:
         v = sim.v[idx]
         v_free = sim.desired_speed(idx)
@@ -369,6 +379,9 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
         road_area = sim.total_lane_length * cfg.lane_width
         truck = sim.truck[idx]
         n_trucks = int(truck.sum())
+        kind = sim.kind[idx]
+        human, auto = kind == HUMAN, np.isin(kind, AUTO_CODES)
+        n_auto = int(auto.sum())
         row.update(
             mean_speed=float(v.mean()),
             mean_free_speed=float(v_free.mean()),
@@ -390,6 +403,9 @@ def snapshot(sim: RingSim, window: float = RATE_WINDOW) -> dict:
             trucks=n_trucks,
             truck_speed=float(v[truck].mean()) if n_trucks else float("nan"),
             car_speed=float(v[~truck].mean()) if n_trucks < n else float("nan"),
+            automated=n_auto,
+            human_speed=float(v[human].mean()) if human.any() else float("nan"),
+            auto_speed=float(v[auto].mean()) if n_auto else float("nan"),
         )
     span = min(t, window)
     stops = _count_since(sim.stop_log, t - window, count_at=1)

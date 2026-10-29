@@ -62,6 +62,12 @@ class SimConfig:
     politeness: float = 0.3  # MOBIL weight on the gain/loss of other drivers
     # --- Initial state --------------------------------------------------------
     init_spacing: str = "uniform"  # "uniform", "random" or "clustered"
+    # --- Automated vehicles (changing the share or kind rebuilds the roundabout; see engine KIND_NAMES) ----
+    auto_share: float = 0.0  # share of the new vehicles that are automated, all of the kind auto_kind
+    auto_kind: str = "cav"  # "cav", "robotaxi" or "acc": the one automated kind of a run
+    robotaxi_headway: float = 1.3  # robotaxis' time gap as a multiple of a driver's (Hu et al. 2023; live)
+    # --- Cooperation ----------------------------------------------------------
+    companies: int = 1  # companies (brands) the automated vehicles belong to, evenly at random
     # --- Numerics -------------------------------------------------------------
     dt: float = 0.1  # [s] time step
     seed: int | None = None
@@ -80,12 +86,14 @@ class SimConfig:
             raise ValueError("; ".join(problems))
         positive = ("radius", "lane_width", "car_length", "car_width", "truck_length", "dt", "mean_speed",
                     "time_headway", "min_gap", "max_accel", "comfort_decel", "lateral_accel",
-                    "turn_speed", "entry_gap", "follow_up", "reaction_distance")
+                    "turn_speed", "entry_gap", "follow_up", "reaction_distance", "robotaxi_headway")
         problems = [f"{name} must be > 0" for name in positive if not getattr(self, name) > 0]
-        for name, low in (("n_lanes", 1), ("n_arms", 0), ("max_queue", 1), ("anticipation", 1)):
+        for name, low in (("n_lanes", 1), ("n_arms", 0), ("max_queue", 1), ("anticipation", 1), ("companies", 1)):
             value = getattr(self, name)
             if not (float(value).is_integer() and value >= low):
                 problems.append(f"{name} must be a whole number >= {low}")
+        if self.companies > 127:  # (each vehicle's company is an int8: 0 to companies - 1)
+            problems.append("companies must be at most 127")
         if self.seed is not None and not (isinstance(self.seed, Integral) and not isinstance(self.seed, bool)
                                           and self.seed >= 0):
             problems.append("seed must be None or a whole number >= 0")
@@ -93,7 +101,7 @@ class SimConfig:
                      "lane_change_rate", "politeness", "entry_rate", "weather_scale"):
             if not getattr(self, name) >= 0:
                 problems.append(f"{name} must be >= 0")
-        for name in ("exit_prob", "demand_imbalance", "truck_share"):
+        for name in ("exit_prob", "demand_imbalance", "truck_share", "auto_share"):
             if not 0 <= getattr(self, name) <= 1:
                 problems.append(f"{name} must be between 0 and 1")
         for spec in PARAMS:
@@ -269,6 +277,29 @@ PARAMS: tuple[ParamSpec, ...] = (
               "Near the jam threshold an uneven start can lock in jams an even start never forms; "
               "elsewhere its effect fades within a minute or two.",
               reset=True, choices=("uniform", "random", "clustered")),
+    # Automated vehicles (engine: kinds, the monotone coupling of their draws, RingSim._automated_command)
+    ParamSpec("auto_share", "Automated share", 0.0, 1.0, 0.05, "", "AVs",
+              "Share of the new vehicles that are automated, all of the AV kind (each new vehicle is one by chance, "
+              "a truck too). They follow only the car in front, without noise, and alike: one software, no spread "
+              "of desired speed, time gap or reaction. At the same seed a higher share automates the same vehicles "
+              "and more. Entries and lane changes are a driver's for now.", reset=True),
+    ParamSpec("auto_kind", "AV kind", 0, 0, 0, "", "AVs",
+              "Kind of the automated vehicles. robotaxi: driverless, following at a longer time gap (Robotaxi "
+              "time gap) and a 1.94 m longer standstill gap, accelerating and braking like a driver (Hu et al. "
+              "2023, Waymo data). acc: driver-supervised cruise control; cav: connected and automated. For now "
+              "both drive like a robotaxi at a driver's gaps.", reset=True, choices=("cav", "robotaxi", "acc")),
+    # 1.3 = Waymo's median time headway over the human one, 3.49 / 2.69 s (Hu et al. 2023 Sec. III-B, Fig. 5:
+    # lognormal mu 1.25 vs 0.99; *derived*); its mean ratio is 1.26. 1.0-1.6: as close as drivers up to a more
+    # cautious fleet (*assumption*; Hu's AV jam spacing is 1.27 x the human one, 10.0 vs 7.88 m, Sec. III-C).
+    ParamSpec("robotaxi_headway", "Robotaxi time gap", 1.0, 1.6, 0.05, "", "AVs",
+              "Robotaxis' time gap as a multiple of a driver's Following time gap (a truck body keeps 1.5 x on top). "
+              "1.3: Waymo's median time headway, 3.49 s against 2.69 s for drivers (Hu et al. 2023, Waymo Open "
+              "Dataset); 1 = as close as drivers. Applies at once."),
+    # Cooperation
+    ParamSpec("companies", "Companies", 1, 4, 1, "", "Coop",
+              "Companies (brands) the automated vehicles belong to: each new one joins one at random, all equally "
+              "likely. Until cooperation between vehicles is modelled the company only labels them (hover a car "
+              "to see it).", reset=True),
 )
 
 PARAM_BY_NAME = {p.name: p for p in PARAMS}
@@ -333,7 +364,11 @@ def axis_label(name: str) -> str:
 NEEDS_NONZERO = {"truck_length": ("truck_share", "no trucks"),
                  **{name: ("n_arms", "no entrances") for name in ("exit_prob", "entry_gap", "follow_up", "turn_speed",
                                                                   "entry_rate", "demand_profile", "demand_imbalance",
-                                                                  "max_queue", "subject_arm")}}
+                                                                  "max_queue", "subject_arm")},
+                 **{name: ("auto_share", "no automated vehicles") for name in ("auto_kind", "companies")}}
+# Settings that act only on automated vehicles of one kind: (the kind, the reason shown while there are none, for
+# want of automated vehicles (auto_share = 0) or of that kind: one reason, so a sweep of either still warns).
+NEEDS_KIND = {"robotaxi_headway": ("robotaxi", "no robotaxis")}
 # Settings that act only off a dry road: the weather effect scales the wet, snow and ice factors (dry are all 1).
 NEEDS_WEATHER = ("weather_scale",)
 # Settings the capacity test (subject_arm on, in open mode with entrances) overrides: it fixes every route.
@@ -346,14 +381,19 @@ IDLE_WHY = {  # (reason, one setting or several) -> what it says about every run
     "dry road": ("does nothing on a dry road", "do nothing on a dry road", "every run here is on a dry road"),
     "capacity test": ("does nothing in the capacity test (it fixes every route)",
                       "do nothing in the capacity test (it fixes every route)", "every run here runs it"),
+    "no automated vehicles": ("does nothing without automated vehicles", "do nothing without automated vehicles",
+                              "every run here has auto_share = 0"),
+    "no robotaxis": ("acts only on robotaxis", "act only on robotaxis",
+                     "no run here has any (auto_kind = robotaxi with auto_share above 0)"),
 }
 
 
 def inactive_reason(name: str, cfg: SimConfig) -> str:
     """Why the setting ``name`` has no effect with the settings ``cfg`` ("" if it has one): "open mode
-    only" (``applies_in``), "no entrances" or "no trucks" (NEEDS_NONZERO), "dry road" (NEEDS_WEATHER), or
-    "capacity test" (TEST_FIXED). The main viewer tags its controls with it; the sweep tools warn of a varied
-    setting that does nothing in every run."""
+    only" (``applies_in``), "no entrances", "no trucks" or "no automated vehicles" (NEEDS_NONZERO), "no
+    robotaxis" (NEEDS_KIND: no automated vehicle of the kind, auto_share 0 included), "dry road"
+    (NEEDS_WEATHER), or "capacity test" (TEST_FIXED); what it reads: :func:`inactive_inputs`. The main viewer
+    tags its controls with it; the sweep tools warn of a varied setting that does nothing in every run."""
     spec = PARAM_BY_NAME.get(name)
     if spec is not None and spec.applies_in and cfg.traffic_mode != spec.applies_in:
         return f"{spec.applies_in} mode only"
@@ -361,11 +401,29 @@ def inactive_reason(name: str, cfg: SimConfig) -> str:
         other, reason = NEEDS_NONZERO[name]
         if not getattr(cfg, other) > 0:
             return reason
+    if name in NEEDS_KIND and not (cfg.auto_share > 0 and cfg.auto_kind == NEEDS_KIND[name][0]):
+        return NEEDS_KIND[name][1]
     if name in NEEDS_WEATHER and cfg.road_condition == "dry":
         return "dry road"
     if name in TEST_FIXED and cfg.subject_arm == "on" and cfg.traffic_mode == "open" and cfg.n_arms > 0:
         return "capacity test"
     return ""
+
+
+def inactive_inputs(name: str) -> set[str]:
+    """The settings other than ``name`` that :func:`inactive_reason` reads for it (kept in step with it): those
+    that must vary, together, for ``name`` to act in a sweep whose base settings leave it idle."""
+    spec = PARAM_BY_NAME.get(name)
+    inputs = {"traffic_mode"} if spec is not None and spec.applies_in else set()
+    if name in NEEDS_NONZERO:
+        inputs.add(NEEDS_NONZERO[name][0])
+    if name in NEEDS_KIND:
+        inputs |= {"auto_share", "auto_kind"}
+    if name in NEEDS_WEATHER:
+        inputs.add("road_condition")
+    if name in TEST_FIXED:
+        inputs |= {"subject_arm", "traffic_mode", "n_arms"}
+    return inputs - {name}
 
 
 def idle_note(names: list[str], reason: str) -> str:

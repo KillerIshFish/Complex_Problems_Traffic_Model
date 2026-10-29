@@ -54,6 +54,20 @@ full without arrivals and every car leaves at the first exit after it (with 2+
 lanes the first far enough on to leave from any lane), so each car from the
 other entrances passes it exactly once and its conflicting flow is their entry
 flow, set by the Entrance chance (SUBJECT_*; the experiments' subject_* columns).
+
+Every vehicle has a ``kind`` (KIND_NAMES: a human driver, or an automated
+vehicle of the run's ``auto_kind``) and, if automated, a ``company``. An
+``auto_share`` of the new vehicles are automated: each new vehicle draws three
+uniforms of a stream of its own (``rng_kinds``; the capacity test's top-up
+``rng_kinds_test``) when it is created, so at the same seed a higher share
+automates the same vehicles and more (monotone coupling), and the other streams
+draw exactly what they draw without automated vehicles (a vehicle's human draws
+are made and then masked). Automated vehicles
+follow only the car in front, without noise and without a spread between them
+(one software), with their kind's own time gap and standstill gap
+(``_set_driving``) and command (``_automated_command``); the truck body is
+independent of the kind (truck factors apply on top). With ``auto_share`` 0
+nothing is drawn and every run is the model without kinds, bit for bit.
 """
 
 from __future__ import annotations
@@ -96,30 +110,84 @@ TEMPERAMENT_CLIP = 2.5  # per-driver draws are standard normals clipped to +- th
 SUBJECT_ARM = 0
 SUBJECT_QUEUE = 10
 
+# Vehicle kinds (per-car ``kind``, int8): a human driver (HUMAN) or one of four automated kinds. A run's automated
+# vehicles are all of one kind (auto_kind: ACC, CAV or ROBOTAXI), an auto_share of the new vehicles; smoothers
+# (wave-dampening automated vehicles) come separately, as a count.
+HUMAN, ACC, CAV, ROBOTAXI, SMOOTHER = range(5)
+KIND_NAMES = ("human", "acc", "cav", "robotaxi", "smoother")  # by code
+AUTO_KINDS = {"acc": ACC, "cav": CAV, "robotaxi": ROBOTAXI}  # auto_kind -> its code (the auto_share kinds)
+RECOGNISABLE = frozenset({CAV, ROBOTAXI, SMOOTHER})  # drivers can tell them apart (an ACC car looks like any car)
+DRIVERLESS = frozenset({CAV, ROBOTAXI})  # nobody in them takes over (stalls, the AV weather policy)
+CONNECTED = frozenset({CAV})  # talk to each other (V2V: CACC strings, cooperation)
+# A robotaxi keeps a standstill gap this much longer than a driver's [m] (Hu et al. 2023, Waymo Open Dataset:
+# jam spacings 10.0 m for an AV behind a human against 7.88 m for a human behind a human, Sec. III-C, Table IV,
+# less the vehicle lengths the IDM calibration implies, 4.78 and 4.6 m, Sec. IV-B: 5.22 - 3.28 m; *derived*).
+ROBOTAXI_S0_EXTRA = 1.94
+# A CAV's time gap when it follows in ACC mode (no cooperating CAV ahead; used from S2 on): the gaps the
+# drivers of the PATH ACC cars chose and how often (Liu et al. 2018 p. 21, from Nowakowski et al. 2010: 1.1 s
+# 50.4 %, 1.6 s 18.5 %, 2.2 s 31.1 %; mean 1.53 s, *derived*). Each vehicle's third kind uniform picks one.
+ACC_GAPS = (1.1, 1.6, 2.2)  # [s]
+ACC_GAP_SHARES = (0.504, 0.185, 0.311)
+ACC_GAP_EDGES = (0.504, 0.689)  # the uniform's bounds between them (cumulative shares)
+# Each automated kind's longitudinal law (RingSim._automated_command calls RingSim._law_<name> for its cars).
+# robotaxi: the IDM with the direct leader (Hu et al. 2023 calibrate the IDM to Waymo's following, Sec. IV).
+# acc, cav: *interim*, replaced by S2 (the PATH ACC law, Milanes & Shladover 2014 Eq. 5; PATH CACC behind a
+# cooperating CAV, Liu et al. 2018 Eqs. 35-38): the same automated IDM with a driver's mean time gap and standstill
+# gap (direct leader, no noise, no spread). The one place that choice is made.
+AUTO_LAWS = {ROBOTAXI: "idm", ACC: "idm", CAV: "idm"}
+# A consequence of the robotaxi's values, not tuned (*derived*): at the SAME density its longer T and s0 give a
+# lower IDM equilibrium speed, where the plain IDM is linearly string-unstable even without a reaction delay
+# (S = f_v^2/2 - f_dv f_v - f_s, Hu et al. 2023 Eqs. 7-10, >= 0 stable: single-lane ring of radius 60 m at
+# density 60, -0.025 for robotaxis against +0.030 for drivers; stern2018 -0.123 against -0.006). So rings of
+# robotaxis at a fixed density form stop-and-go waves (the delay only worsens them), the reverse of Hu's Table XI
+# (Sec. IV-C: the AV-HV pairs are the least string-unstable), which compares each group at its own observed
+# equilibrium, not at equal density. Read fixed-density ring results with robotaxis in that light.
+
 # Per-car arrays, one value per slot (RingSim._alloc); the acceleration history acc_hist holds one row
 # per step of history on top.
 CAR_ARRAYS = ("alive", "lane", "theta", "travel", "v", "z", "exit_at", "born", "lat", "lc_cool", "noise",
               "brake_until", "uid", "moving", "emergency_until", "stuck", "entered_at", "inserted_at", "truck",
-              "length", "z_react", "z_gap", "accel", "headway", "delay")
+              "length", "z_react", "z_gap", "accel", "headway", "delay", "kind", "company", "acc_gap", "s0",
+              "a_now")
 # Saved states (RingSim.state_dict): the layout version, and what they hold besides the per-car arrays.
-STATE_VERSION = 2  # 1: before the capacity test; 2: + it, conflict points, weather strength and anticipation
+STATE_VERSION = 3  # 1: before the capacity test; 2: + it, conflict points, weather strength and anticipation;
+# 3: + vehicle kinds and companies (their draws, settings, queue fields and per-car arrays) and conflict_log's kind
 ARM_ARRAYS = {"queue": int, "entry_cool": np.int64, "arm_arrived": np.int64, "arm_entered": np.int64,
               "queue_busy": float, "arm_passed": np.int64, "arm_passed_outer": np.int64,
               "arm_passed_trucks": np.int64, "arm_entered_trucks": np.int64,
               "arm_entry_wait": float}  # one value per entrance, and its dtype
+# What each queued vehicle carries besides its arrival time (queue_times), in the same order: saved as one array
+# per field (every entrance's queue in turn) and a count per entrance, read back as Python values of the type.
+QUEUE_FIELDS = {"queue_trucks": bool, "queue_kinds": int, "queue_companies": int, "queue_acc_gaps": float}
 COUNTERS = ("n_entered", "n_exited", "n_missed", "n_lane_changes", "n_emergency", "n_stops", "n_arrived",
             "n_blocked", "n_gave_up", "n_topped_up")  # whole numbers
 FLOAT_TOTALS = ("entry_wait_total",)  # sums of floats (each kept in its own accumulation order)
 EVENT_LOGS = ("detector_log", "exit_log", "lane_change_log", "emergency_log", "stop_log", "arrival_log",
               "entry_log", "blocked_log", "gave_up_log", "conflict_log")  # tuples starting with the time
 # (lane_change_log: plain times)
-GENERATORS = ("rng", "rng_demand", "rng_drivers")  # every random stream
+GENERATORS = ("rng", "rng_demand", "rng_drivers", "rng_kinds", "rng_kinds_test")  # every random stream
+
+
+class FromState:
+    """An ADDED fill that is no constant: ``fill(sim)`` works it out from the restored simulation (its settings
+    and the arrays restored or filled before it), for a name whose right value in an older state depends on
+    that state (a per-car array that follows from the settings, say)."""
+
+    def __init__(self, fill, why: str):
+        self.fill, self.why = fill, why
+
+    def __repr__(self) -> str:
+        return f"FromState({self.why})"
+
+
 # Everything saved that was added after version 1, with what a state of an older version gets for it (the
 # setting's default, zero counts, an empty log): RingSim._from_state fills only these names, and only into a
 # state of an older version (a state of this version that lacks one is damaged). Settings (SimConfig fields:
-# the value is the default), ARM_ARRAYS (the value per entrance), COUNTERS and FLOAT_TOTALS, EVENT_LOGS (an
-# empty log) and GENERATORS (k: the stream is default_rng([seed, k])). Each stage that changes the saved
-# layout adds its names here and raises STATE_VERSION.
+# the value is the default), ARM_ARRAYS (the value per entrance), QUEUE_FIELDS (the value per queued vehicle),
+# CAR_ARRAYS (the value per slot, or a FromState fill), COUNTERS and FLOAT_TOTALS, EVENT_LOGS (an empty log)
+# and GENERATORS (k: the stream is default_rng([seed, k]); a tuple: default_rng([seed, *k]), a sub-stream).
+# Each stage that changes the saved layout adds its names here and raises STATE_VERSION. (Fields added to the
+# entries of a log: LOG_WIDENED.)
 ADDED: dict[str, object] = {
     # version 2: the capacity test, conflict points, weather strength and anticipation
     "weather_scale": 1.0, "subject_arm": "off", "anticipation": ANTICIPATION,  # settings
@@ -127,6 +195,19 @@ ADDED: dict[str, object] = {
     "arm_entry_wait": 0.0,
     "n_topped_up": 0,  # counter
     "conflict_log": (),  # event log
+    # version 3: vehicle kinds and companies (every vehicle of an older state is a human driver)
+    "auto_share": 0.0, "auto_kind": "cav", "robotaxi_headway": 1.3, "companies": 1,  # settings
+    "queue_kinds": HUMAN, "queue_companies": -1, "queue_acc_gaps": np.nan,  # per queued vehicle
+    "kind": HUMAN, "company": -1, "acc_gap": np.nan, "a_now": 0.0,  # per car
+    # (a driver's standstill gap is the setting's, whatever it was: worked out again, not a constant)
+    "s0": FromState(lambda sim: sim._standstill_gaps(np.arange(sim.cap)), "min_gap of the state's settings"),
+    "rng_kinds": 3,  # the kind draws' stream: default_rng([seed, 3])
+    "rng_kinds_test": (3, 1),  # ...and its sub-stream for the capacity test's top-up: default_rng([seed, 3, 1])
+}
+# Fields added to the entries of an event log since version 1: (the entries' width now, what an older state's
+# shorter entries get on the end). A state of this version must hold entries of the full width.
+LOG_WIDENED: dict[str, tuple[int, tuple]] = {
+    "conflict_log": (5, (HUMAN,)),  # version 3: + the passing vehicle's kind (an older state's: human drivers)
 }
 
 # Heavy vehicles (trucks): multiples of a car driver's setting. Truck drivers keep a car's standstill gap
@@ -346,6 +427,13 @@ class RingSim:
         # Vehicle types and drivers' own reaction times and time gaps: a stream of their own too, so
         # with every vehicle a car and every driver alike the run is the same as without them.
         self.rng_drivers = np.random.default_rng([self.seed, 2])
+        # Each new vehicle's kind, company and ACC-fallback gap (_draw_kinds): drawn only when auto_share > 0, so
+        # without automated vehicles nothing changes, and with them every other stream draws what it would.
+        self.rng_kinds = np.random.default_rng([self.seed, 3])
+        # ...but the capacity test's top-up from a sub-stream of its own: how many it adds follows the subject
+        # entries (the dynamics), so on rng_kinds it would shift every later arrival's draws once two runs
+        # differ, and the conflicting stream's kinds would stop nesting across shares (_top_up).
+        self.rng_kinds_test = np.random.default_rng([self.seed, 3, 1])
         self._update_effective()
         self.time = 0.0
         self.steps = 0
@@ -356,8 +444,12 @@ class RingSim:
         self.queue = np.zeros(n, dtype=int)  # cars waiting at each entrance
         # Arrival time of every queued car, oldest first: len(queue_times[arm]) == queue[arm] always.
         self.queue_times: list[deque[float]] = [deque() for _ in range(n)]
-        # Whether each queued vehicle is a truck (drawn when it joins), in the same order.
+        # Whether each queued vehicle is a truck (drawn when it joins), in the same order; and its kind, company
+        # and ACC-fallback gap (_draw_kinds, also drawn when it joins: QUEUE_FIELDS).
         self.queue_trucks: list[deque[bool]] = [deque() for _ in range(n)]
+        self.queue_kinds: list[deque[int]] = [deque() for _ in range(n)]
+        self.queue_companies: list[deque[int]] = [deque() for _ in range(n)]
+        self.queue_acc_gaps: list[deque[float]] = [deque() for _ in range(n)]
         self.entry_cool = np.zeros(n, dtype=np.int64)  # steps until each entrance may let its next car in
         self.demand_weight = self._demand_weights()
 
@@ -391,7 +483,8 @@ class RingSim:
         self.entry_log: deque[tuple[float, int, float]] = deque()  # (time, arm, queue wait)
         self.blocked_log: deque[tuple[float, int]] = deque()  # (time, arm) arrivals turned away
         self.gave_up_log: deque[tuple[float, int]] = deque()  # (time, arm) queued cars that gave up
-        self.conflict_log: deque[tuple[float, int, int, int]] = deque()  # (time, arm, lane, uid) at an entry point
+        # (time, arm, lane, uid, kind) of each vehicle passing an entry point (its conflict point)
+        self.conflict_log: deque[tuple[float, int, int, int, int]] = deque()
         # Once a second: (time, arm_arrived, arm_entered, queue_busy) copies, for rolling ratios.
         self.entrance_log: deque[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = deque(
             [(0.0, self.arm_arrived.copy(), self.arm_entered.copy(), self.queue_busy.copy())])
@@ -459,6 +552,8 @@ class RingSim:
         idle = {"truck_length"} if old.truck_share == 0 and new_cfg.truck_share == 0 else set()
         if not (self._can_test(old) or self._can_test(new_cfg)):
             idle.add("subject_arm")
+        if old.auto_share == 0 and new_cfg.auto_share == 0:  # (no vehicle is automated, before or after)
+            idle |= {"auto_kind", "companies"}
         # Geometry/numerics fields without a slider (lane_width, dt, ...) also rebuild.
         rebuild = any((PARAM_BY_NAME[k].reset if k in PARAM_BY_NAME else k != "seed")
                       and getattr(old, k) != v for k, v in changes.items() if k not in idle)
@@ -476,9 +571,11 @@ class RingSim:
             self.rng = np.random.default_rng(self.seed)
             self.rng_demand = np.random.default_rng([self.seed, 1])
             self.rng_drivers = np.random.default_rng([self.seed, 2])
+            self.rng_kinds = np.random.default_rng([self.seed, 3])
+            self.rng_kinds_test = np.random.default_rng([self.seed, 3, 1])
         alive = np.flatnonzero(self.alive)
-        # Every driver keeps their temperaments; their own time gap, acceleration and reaction
-        # delay follow the new settings and road condition at once.
+        # Every driver keeps their temperaments; their own time gap, acceleration, standstill gap and
+        # reaction delay follow the new settings and road condition at once (a robotaxi's Robotaxi time gap too).
         self._update_effective()
         self._set_driving(alive)
         if new_cfg.exit_prob != old.exit_prob and not self.subject:  # (the capacity test's routes ignore it)
@@ -526,10 +623,20 @@ class RingSim:
         self.length = np.zeros(cap)  # [m] car_length or truck_length
         self.z_react = np.zeros(cap)  # temperaments ~ N(0, 1): own reaction time = setting + z * spread
         self.z_gap = np.zeros(cap)  # ...and own time gap
+        # Kind (HUMAN ... SMOOTHER), company (0 to companies - 1; -1 for human drivers and smoothers) and the
+        # CAV's ACC-fallback time gap [s] (ACC_GAPS; NaN when nothing was drawn): drawn at spawn from rng_kinds.
+        self.kind = np.zeros(cap, dtype=np.int8)
+        self.company = np.full(cap, -1, dtype=np.int8)
+        self.acc_gap = np.full(cap, np.nan)
         # Derived from those and the effective settings (_set_driving), so the step need not.
         self.accel = np.zeros(cap)  # [m/s2] max acceleration
         self.headway = np.zeros(cap)  # [s] IDM time gap
         self.delay = np.zeros(cap, dtype=np.int64)  # [steps] reaction delay
+        self.s0 = np.zeros(cap)  # [m] standstill gap
+        # [m/s2] Acceleration the car realised in the last step ((v_new - v) / dt: after the braking limit, a
+        # stop and the no-overlap constraint; *model*): what a CACC law's gap-error derivative and a smoother's
+        # speed tracking take as the car's own acceleration.
+        self.a_now = np.zeros(cap)
 
     def _grow(self, need: int) -> None:
         old = {name: getattr(self, name) for name in CAR_ARRAYS}
@@ -546,8 +653,9 @@ class RingSim:
         :meth:`from_state` turns it back into a simulation that carries on bit
         for bit as this one would. It holds the settings, seed, clock and
         generation; every per-car array (CAR_ARRAYS), the acceleration history
-        and its pointer; the queues with each queued car's arrival time and
-        vehicle type; the entrance cooldowns, counters, event logs and
+        and its pointer; the queues with each queued car's arrival time,
+        vehicle type, kind, company and ACC-fallback gap (QUEUE_FIELDS); the
+        entrance cooldowns, counters, event logs and
         once-a-second entrance totals; the uid counter, the fill and prune
         timers and the vehicles the density control still has to place; the
         lane index cache; and the bit-generator state of every random stream
@@ -560,11 +668,11 @@ class RingSim:
         logs = {}
         for name in EVENT_LOGS:
             arrays[name], logs[name] = _pack_log(getattr(self, name))
-        # Each queue's arrival times (and vehicle types), all entrances in one array, and how many each has.
-        arrays["queue_times"] = np.array([t for fifo in self.queue_times for t in fifo], dtype=float)
-        arrays["queue_times_count"] = np.array([len(fifo) for fifo in self.queue_times], dtype=np.int64)
-        arrays["queue_trucks"] = np.array([truck for fifo in self.queue_trucks for truck in fifo], dtype=bool)
-        arrays["queue_trucks_count"] = np.array([len(fifo) for fifo in self.queue_trucks], dtype=np.int64)
+        # Each queue's arrival times (and what its vehicles carry), all entrances in one array, and how many each has.
+        for name, kind in (("queue_times", float), *QUEUE_FIELDS.items()):
+            queues = getattr(self, name)
+            arrays[name] = np.array([value for fifo in queues for value in fifo], dtype=kind)
+            arrays[f"{name}_count"] = np.array([len(fifo) for fifo in queues], dtype=np.int64)
         k = len(self.entrance_log)
         arrays["entrance_log_time"] = np.array([entry[0] for entry in self.entrance_log], dtype=float)
         for i, (part, dtype) in enumerate((("arrived", np.int64), ("entered", np.int64), ("busy", float)), start=1):
@@ -630,8 +738,9 @@ class RingSim:
         self.seed = int(meta["seed"])
         generators = meta["generators"]
         for name in GENERATORS:
-            setattr(self, name, np.random.default_rng([self.seed, ADDED[name]]) if fill(name, generators)
-                    else _generator(generators[name]))
+            key = ADDED.get(name)
+            setattr(self, name, np.random.default_rng([self.seed, *(key if isinstance(key, tuple) else (key,))])
+                    if fill(name, generators) else _generator(generators[name]))
         self._update_effective()
         self.time, self.steps, self.generation = float(meta["time"]), int(meta["steps"]), int(meta["generation"])
         if not (np.isfinite(self.time) and self.time >= 0 and self.steps >= 0 and self.generation >= 0):
@@ -642,11 +751,14 @@ class RingSim:
             setattr(self, name, np.full(n, ADDED[name], dtype=dtype) if fill(name, arrays)
                     else _array(arrays, name, (n,), dtype))
         self.demand_weight = self._demand_weights()
-        for name, dtype in (("queue_times", float), ("queue_trucks", bool)):
+        for name, dtype in (("queue_times", float), *QUEUE_FIELDS.items()):
+            if fill(name, arrays):  # (an older state's queued vehicles: one fill each, whatever count it holds)
+                setattr(self, name, [deque([ADDED[name]] * max(int(q), 0)) for q in self.queue])
+                continue
             parts = _split(_array(arrays, name, None, dtype), _array(arrays, f"{name}_count", (n,), np.int64), name)
             setattr(self, name, [deque(part.tolist()) for part in parts])
         if (self.queue < 0).any() or any(len(fifo) != q for fifo, q in zip(self.queue_times, self.queue)) \
-                or any(len(fifo) > q for fifo, q in zip(self.queue_trucks, self.queue)):
+                or any(len(fifo) > q for name in QUEUE_FIELDS for fifo, q in zip(getattr(self, name), self.queue)):
             raise StateError("the queues do not match their arrival times and vehicle types")
         counters = meta["counters"]
         for name in COUNTERS:
@@ -659,6 +771,13 @@ class RingSim:
             else:
                 setattr(self, name, _unpack_log(name, _array(arrays, name, None, float), list(meta["logs"][name]),
                                                 plain=name == "lane_change_log"))
+        for name, (width, extra) in LOG_WIDENED.items():  # entries given fields since: an older state's get the fills
+            log = getattr(self, name)
+            short = len(log[0]) if log else width
+            if short != width:
+                if version == STATE_VERSION or not width - len(extra) <= short < width:
+                    raise StateError(f"{name} holds entries of {short} fields, expected {width}")
+                setattr(self, name, deque(entry + extra[short - width:] for entry in log))
         when = _array(arrays, "entrance_log_time", None, float)
         k = when.shape[0] if when.ndim == 1 else -1
         parts = [_array(arrays, f"entrance_log_{part}", (k, n), dtype)
@@ -677,8 +796,17 @@ class RingSim:
         if cap < 1 or np.shape(arrays.get("alive")) != (cap,) or not 0 <= self._hist_ptr < self._hist_len:
             raise StateError("the car arrays' size or history pointer is out of range")  # (before allocating)
         self._alloc(cap)
+        derived = []  # FromState fills, worked out once every other array is in place
         for name in CAR_ARRAYS:
-            getattr(self, name)[:] = _array(arrays, name, (cap,), getattr(self, name).dtype)
+            if fill(name, arrays):
+                if isinstance(ADDED[name], FromState):
+                    derived.append(name)
+                else:
+                    getattr(self, name)[:] = ADDED[name]
+            else:
+                getattr(self, name)[:] = _array(arrays, name, (cap,), getattr(self, name).dtype)
+        for name in derived:
+            getattr(self, name)[:] = ADDED[name].fill(self)
         self.acc_hist[:] = _array(arrays, "acc_hist", (self._hist_len, cap), float)
         counts = _array(arrays, "lanes_count", (self.n_lanes,), np.int64)
         order = _array(arrays, "lanes_order", None, np.int64)
@@ -777,17 +905,21 @@ class RingSim:
         """The effective settings for the road condition, and whether vehicles and drivers differ.
 
         ``uniform_length``: every vehicle is a car (no trucks), so lengths are
-        the one ``car_length``. ``alike``: also every driver keeps the same
-        time gap and reaction time. Then the dynamics use plain numbers, which
-        keeps the arithmetic, and the speed, of a model without trucks or
-        driver spread; otherwise they use each vehicle's own values. Also
-        whether the capacity test is on (``subject``).
+        the one ``car_length``. ``automated``: there can be automated vehicles
+        (auto_share > 0), which drive by their kind's rules. ``alike``: neither,
+        and every driver keeps the same time gap and reaction time. Then the
+        dynamics use plain numbers, which keeps the arithmetic, and the speed,
+        of a model without trucks, kinds or driver spread; otherwise they use
+        each vehicle's own values (the standstill gap only with automated
+        vehicles: ``_driving``). Also whether the capacity test is on
+        (``subject``). All from the settings, never per step.
         """
         cfg = self.cfg
         self.eff = effective(cfg)
         self.subject = cfg.subject_arm == "on" and self._can_test(cfg)  # the capacity test (subject_arm)
         self.uniform_length = cfg.truck_share == 0
-        self.alike = self.uniform_length and cfg.headway_std == 0 and cfg.reaction_std == 0
+        self.automated = cfg.auto_share > 0
+        self.alike = self.uniform_length and cfg.headway_std == 0 and cfg.reaction_std == 0 and not self.automated
 
     def _draw_trucks(self, k: int) -> np.ndarray:
         """Whether each of ``k`` new vehicles is a truck (chance ``truck_share``, from rng_drivers)."""
@@ -799,28 +931,82 @@ class RingSim:
         waiting = self._pending[:k]
         return np.concatenate((np.array(waiting, dtype=bool), self._draw_trucks(k - len(waiting))))
 
+    def _draw_kinds(self, k: int, rng: np.random.Generator | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(kind, company, ACC-fallback gap [s]) of ``k`` new vehicles, in the order they are created.
+
+        With auto_share > 0 each draws three uniforms u1, u2, u3 from rng_kinds
+        (``rng``: the capacity test's top-up gives rng_kinds_test) (in that
+        order, vehicle after vehicle), whatever it turns out to be:
+        automated (of the kind auto_kind) iff u1 < auto_share; company
+        floor(u2 x companies) if automated, else -1; its ACC-fallback gap
+        ACC_GAPS picked by u3 (Liu 2018's shares). So a vehicle's draws never
+        depend on the share, and at the same seed a higher share automates the
+        same vehicles and more (monotone coupling). With auto_share 0 nothing is
+        drawn: human drivers, no company, no gap (NaN).
+        """
+        if not self.automated or k <= 0:
+            return np.zeros(k, dtype=np.int8), np.full(k, -1, dtype=np.int8), np.full(k, np.nan)
+        cfg = self.cfg
+        u = (self.rng_kinds if rng is None else rng).random((k, 3))
+        auto = u[:, 0] < cfg.auto_share
+        kind = np.where(auto, AUTO_KINDS[cfg.auto_kind], HUMAN).astype(np.int8)
+        company = np.where(auto, np.minimum(np.floor(u[:, 1] * cfg.companies), cfg.companies - 1), -1).astype(np.int8)
+        gap = np.asarray(ACC_GAPS)[np.searchsorted(ACC_GAP_EDGES, u[:, 2], side="right")]
+        return kind, company, gap
+
+    def _queue_kinds(self, arm: int, kinds: tuple[np.ndarray, np.ndarray, np.ndarray], k: int | None = None) -> None:
+        """Put the first ``k`` (default all) of ``kinds`` (:meth:`_draw_kinds`) at the back of an entrance's
+        queue fields, beside their trucks and arrival times (as Python values)."""
+        for name, values in zip(("queue_kinds", "queue_companies", "queue_acc_gaps"), kinds):
+            getattr(self, name)[arm].extend(values[:k].tolist())
+
     def _set_driving(self, i) -> None:
-        """Each driver's own time gap, max acceleration and reaction delay (in steps), from their
-        temperaments, their vehicle and the effective settings.
+        """Each driver's own time gap, max acceleration, standstill gap and reaction delay (in steps),
+        from their temperaments, their vehicle, their kind and the effective settings.
 
         Time gap: Following time gap + z * spread, at least HEADWAY_FLOOR of the
-        setting, times TRUCK_HEADWAY_FACTOR in a truck. Reaction time: Reaction
-        time + z * spread within 0-MAX_REACTION, rounded to whole steps.
+        setting, times robotaxi_headway for a robotaxi, times TRUCK_HEADWAY_FACTOR
+        in a truck. Reaction time: Reaction time + z * spread within
+        0-MAX_REACTION, rounded to whole steps. Standstill gap: _standstill_gaps.
+        An automated vehicle's temperaments are 0 (_spawn), so it gets the
+        settings themselves (one software, no spread: *assumption*, though Hu
+        et al. 2023 Sec. III-B find Waymo's time-headway variance comparable to
+        drivers'; see _spawn); its acceleration and
+        comfortable braking are a driver's (a robotaxi's too: Hu et al. 2023 Table
+        X finds no significant difference) and its reaction delay is Reaction time
+        (a robotaxi's too, *assumption*: Hu's longer response time, 2.42 against
+        1.80 s, Sec. III-D Table V, is a stimulus-to-response time that includes
+        its longer time gap, not a slower reaction). acc and cav get nothing of
+        their own here yet: see _automated_command.
         """
         cfg, eff = self.cfg, self.eff
         own_gap = np.maximum(HEADWAY_FLOOR * eff.time_headway, eff.time_headway + self.z_gap[i] * eff.headway_std)
+        if self.automated:
+            own_gap = np.where(self.kind[i] == ROBOTAXI, cfg.robotaxi_headway * own_gap, own_gap)
         truck = self.truck[i]
         self.headway[i] = np.where(truck, TRUCK_HEADWAY_FACTOR * own_gap, own_gap)
         self.accel[i] = np.where(truck, TRUCK_ACCEL_FACTOR * eff.max_accel, eff.max_accel)
+        self.s0[i] = self._standstill_gaps(i)
         reaction = np.clip(cfg.reaction_time + self.z_react[i] * cfg.reaction_std, 0.0, MAX_REACTION)
         self.delay[i] = np.rint(reaction / cfg.dt).astype(np.int64)
 
+    def _standstill_gaps(self, i) -> np.ndarray:
+        """[m] The standstill gap of the vehicles in ``i``: Standstill gap, ROBOTAXI_S0_EXTRA more for a robotaxi
+        (a truck keeps its driver's: see TRUCK_*; the road condition never scales it, ROAD_SCALED)."""
+        return self._kind_s0(self.kind[i])
+
+    def _kind_s0(self, kind) -> np.ndarray:
+        """[m] The standstill gap of vehicles of these kinds (codes): see _standstill_gaps."""
+        min_gap = self.cfg.min_gap
+        return np.where(kind == ROBOTAXI, min_gap + ROBOTAXI_S0_EXTRA, min_gap)
+
     def _driving(self, slots):
-        """(max acceleration, time gap) of the drivers in ``slots`` for the IDM: plain numbers
-        while every driver is alike, else arrays aligned with ``slots``."""
+        """(max acceleration, time gap, standstill gap) of the drivers in ``slots`` for the IDM: plain
+        numbers while every driver is alike, else arrays aligned with ``slots`` (the standstill gap stays
+        the plain min_gap while no vehicle can be automated, so the human model keeps its arithmetic)."""
         if self.alike:
-            return self.eff.max_accel, self.eff.time_headway
-        return self.accel[slots], self.headway[slots]
+            return self.eff.max_accel, self.eff.time_headway, self.cfg.min_gap
+        return self.accel[slots], self.headway[slots], self.s0[slots] if self.automated else self.cfg.min_gap
 
     def _pair_length(self, behind, ahead):
         """[m] Distance between the centres of two vehicles bumper to bumper: half of each one's length."""
@@ -874,23 +1060,24 @@ class RingSim:
             free[over] = -b * (1 - (v0[over] / v[over]) ** (4 * a_over / b))
         return free
 
-    def _interaction(self, v, gap, v_lead, a, T) -> np.ndarray:
+    def _interaction(self, v, gap, v_lead, a, T, s0=None) -> np.ndarray:
         """IDM braking towards a leader ``gap`` metres (bumper to bumper) ahead, for drivers
-        with max acceleration ``a`` and time gap ``T`` (numbers, or aligned with ``v``)."""
-        cfg = self.cfg
+        with max acceleration ``a``, time gap ``T`` and standstill gap ``s0`` (numbers, or aligned
+        with ``v``; ``s0`` by default Standstill gap)."""
         b = self.eff.comfort_decel
-        s_star = cfg.min_gap + np.maximum(0.0, v * T + v * (v - v_lead) / (2 * np.sqrt(a * b)))
+        s0 = self.cfg.min_gap if s0 is None else s0
+        s_star = s0 + np.maximum(0.0, v * T + v * (v - v_lead) / (2 * np.sqrt(a * b)))
         return a * (s_star / np.maximum(gap, 0.1)) ** 2
 
     def _idm(self, v, v0, gap, v_lead, slots) -> np.ndarray:
         """IDM acceleration towards one leader for the drivers in ``slots`` (aligned with
         ``v``). ``gap`` is bumper to bumper; leaders beyond the reaction distance (or
         ``inf``) are ignored."""
-        a, T = self._driving(slots)
+        a, T, s0 = self._driving(slots)
         v = np.asarray(v, dtype=float)
         seen = np.isfinite(gap) & (gap <= self.cfg.reaction_distance)
         return self._free_acc(v, v0, a) - np.where(seen, self._interaction(v, np.where(seen, gap, 1.0), v_lead,
-                                                                           a, T), 0.0)
+                                                                           a, T, s0), 0.0)
 
     def _car_following(self, idx, v, v0, ld, g, lead, gap) -> np.ndarray:
         """Car-following acceleration with multi-anticipation (as in Treiber's
@@ -904,37 +1091,75 @@ class RingSim:
         a few cars ahead, which damps stop-and-go waves. Arrays are aligned with
         ``idx``; ``ld``/``g`` are each car's leader slot and bumper gap, and
         ``lead``/``gap`` the full-size arrays from :meth:`_index_lanes`.
-        Each driver uses their own acceleration and time gap; the distance to
-        the j-th car ahead counts the real lengths of the cars in between.
+        Each driver uses their own acceleration, time gap and standstill gap;
+        the distance to the j-th car ahead counts the real lengths of the cars
+        in between. Automated vehicles react to their direct leader only
+        (*model*: what their sensors track; Hu et al. 2023 calibrate the plain
+        IDM to Waymo's following, and the ACC and CACC laws use it too).
         """
         cfg = self.cfg
-        a, T = self._driving(idx)
+        a, T, s0 = self._driving(idx)
         seen = np.isfinite(g) & (g <= cfg.reaction_distance)
         v_lead = np.where(ld >= 0, self.v[np.maximum(ld, 0)], v)
-        braking = np.where(seen, self._interaction(v, np.where(seen, g, 1.0), v_lead, a, T), 0.0)
+        braking = np.where(seen, self._interaction(v, np.where(seen, g, 1.0), v_lead, a, T, s0), 0.0)
         weight = seen.astype(float)
         cars_ahead = np.bincount(self.lane[idx], minlength=self.n_lanes)[self.lane[idx]] - 1
         car, gaps = np.maximum(ld, 0), g.copy()
         between = 0.0  # [m] summed lengths of the cars passed so far (vehicles of mixed lengths)
+        anticipating = seen  # who looks beyond the car in front
+        if self.automated:
+            anticipating = seen & (self.kind[idx] == HUMAN)
         for j in range(2, int(cfg.anticipation) + 1):
             gaps = gaps + gap[car]  # summed bumper gaps to the j-th car ahead
             if not self.uniform_length:
                 between = between + self.length[car]
             car = lead[car]
             reach = gaps + ((j - 1) * cfg.car_length if self.uniform_length else between)
-            sees = seen & (j <= cars_ahead) & (reach <= cfg.reaction_distance)
+            sees = anticipating & (j <= cars_ahead) & (reach <= cfg.reaction_distance)
             if not sees.any():
                 break
             w = 1.0 / j**2
-            braking += np.where(sees, w * self._interaction(v, gaps / j, self.v[car], a, T), 0.0)
+            braking += np.where(sees, w * self._interaction(v, gaps / j, self.v[car], a, T, s0), 0.0)
             weight += np.where(sees, w, 0.0)
         return self._free_acc(v, v0, a) - np.where(weight > 0, braking / np.maximum(weight, 1e-12), 0.0)
 
+    def _automated_command(self, idx, v, v0, ld, g, acc) -> None:
+        """The automated vehicles' commands in place of ``acc`` (aligned with ``idx``: what
+        :meth:`_car_following` gave every car), each kind by its law in AUTO_LAWS (``_law_<name>``).
+        ``v``, ``v0``, ``ld``, ``g``: as there. Called only while automated vehicles are possible; what
+        follows in ``_move`` applies on top of each kind's law: cooperative merging (_make_room_to_leave),
+        then :meth:`_automated_limits`, then the reaction delay, the braking limit and the no-overlap
+        constraint as for every car. S2 adds the ACC/CACC and smoothers' laws here; the clip of every command
+        to [-max_decel, accel] and the safety layer go in _automated_limits, not here (merging can lower a
+        command again)."""
+        kind = self.kind[idx]
+        for code, law in AUTO_LAWS.items():
+            m = np.flatnonzero(kind == code)
+            if m.size:
+                acc[m] = getattr(self, f"_law_{law}")(idx[m], v[m], v0[m], ld[m], g[m], acc[m])
+
+    def _automated_limits(self, idx, acc, a_idm) -> None:
+        """The last word on the automated vehicles' commands in ``acc`` (aligned with ``idx``, in place): after
+        cooperative merging, before the harsh-braking check (``over_braking``) and the reaction delay.
+        ``a_idm``: what _car_following gave each car before _automated_command, for an automated car the IDM
+        towards its direct leader with its own T and s0 (its anticipation terms are masked). S2 clips each
+        automated command to [-max_decel, accel] and then applies the safety layer, a = min(a, a_idm) where
+        a_idm asks for more than comfortable braking (SPEC 2). Here and not in _automated_command because
+        _make_room_to_leave lowers a leaver's command to as little as -1.5 b and a yielding follower's to -b
+        (b: the effective comfort_decel), which on snow or ice can lie beyond the road's braking limit (a firm
+        Comfortable braking, or a Weather effect below 1). S1: nothing yet (every law is the IDM)."""
+
+    def _law_idm(self, slots, v, v0, ld, g, a_idm) -> np.ndarray:
+        """The IDM towards the direct leader with the car's own acceleration, time gap and standstill gap
+        (_set_driving): what _car_following gave an automated car (its anticipation terms are masked there)."""
+        return a_idm
+
     def equilibrium_speed(self, gap, v0, slots=None) -> np.ndarray:
         """Steady-state IDM speed for a bumper gap (used to start cars smoothly), for the
-        drivers in ``slots`` (aligned with ``gap``; default: the effective Following time gap)."""
+        drivers in ``slots`` (aligned with ``gap``; default: the effective Following time gap and
+        Standstill gap), with their own time gap and standstill gap."""
         cfg = self.cfg
-        T = self.eff.time_headway if slots is None else self._driving(slots)[1]
+        T, s0 = (self.eff.time_headway, cfg.min_gap) if slots is None else self._driving(slots)[1:]
         gap = np.asarray(gap, dtype=float)
         v0 = np.maximum(np.broadcast_to(np.asarray(v0, dtype=float), gap.shape), 0.1)
         lo, hi = np.zeros_like(gap), v0.copy()
@@ -942,9 +1167,9 @@ class RingSim:
         for _ in range(40):  # bisection on the IDM steady state (acceleration = 0)
             mid = 0.5 * (lo + hi)
             f = 1 - (mid / v0) ** 4 \
-                - np.where(seen, ((cfg.min_gap + mid * T) / np.maximum(gap, 0.1)) ** 2, 0)
+                - np.where(seen, ((s0 + mid * T) / np.maximum(gap, 0.1)) ** 2, 0)
             lo, hi = np.where(f > 0, mid, lo), np.where(f > 0, hi, mid)
-        return np.where(gap > cfg.min_gap, lo, 0.0)
+        return np.where(gap > s0, lo, 0.0)
 
     # ------------------------------------------------------ neighbourhood
     def _index_lanes(self, idx):
@@ -1014,15 +1239,22 @@ class RingSim:
         return out
 
     # ----------------------------------------------------------- spawning
-    def _spawn(self, lanes, angles, speeds, lat=None, trucks=None) -> np.ndarray:
-        """New vehicles centred at ``angles``; ``trucks`` says which are trucks (default: drawn).
-        Their drivers' temperaments come from rng_drivers (nothing extra from the main stream)."""
+    def _spawn(self, lanes, angles, speeds, lat=None, trucks=None, *, kinds=None) -> np.ndarray:
+        """New vehicles centred at ``angles``; ``trucks`` says which are trucks (default: drawn), ``kinds``
+        their (kind, company, ACC-fallback gap) arrays (default: drawn, :meth:`_draw_kinds`). Their drivers'
+        temperaments come from rng_drivers (nothing extra from the main stream). An automated vehicle draws
+        every temperament a driver in its place would and then sets it to 0: one software, the settings
+        themselves (*assumption*; for the time gap against the data: Hu et al. 2023 Sec. III-B find Waymo's
+        time-headway variance comparable to drivers', which they credit to its controller adapting to the
+        situation, a spread within one software that no fixed time gap per car reproduces), and every stream
+        but the kinds' (rng_kinds, rng_kinds_test) draws as without automated vehicles."""
         k = len(angles)
         free = np.flatnonzero(~self.alive)
         if free.size < k:
             self._grow(k - free.size)
             free = np.flatnonzero(~self.alive)
         i = free[:k]
+        self.kind[i], self.company[i], self.acc_gap[i] = self._draw_kinds(k) if kinds is None else kinds
         self.alive[i] = True
         self.lane[i] = lanes
         self.theta[i] = np.asarray(angles) % TWO_PI
@@ -1042,10 +1274,15 @@ class RingSim:
         self.entered_at[i] = -np.inf
         self.inserted_at[i] = -np.inf
         self.acc_hist[:, i] = 0.0
+        self.a_now[i] = 0.0
         self.truck[i] = self._draw_trucks(k) if trucks is None else trucks
         self.length[i] = np.where(self.truck[i], self.cfg.truck_length, self.cfg.car_length)
         self.z_react[i], self.z_gap[i] = np.clip(self.rng_drivers.standard_normal((2, k)),
                                                  -TEMPERAMENT_CLIP, TEMPERAMENT_CLIP)
+        if self.automated:  # automated: drawn as a driver's, then masked (desired speed, reaction, time gap)
+            auto = self.kind[i] != HUMAN
+            for name in ("z", "z_react", "z_gap"):
+                getattr(self, name)[i] = np.where(auto, 0.0, getattr(self, name)[i])
         self._set_driving(i)
         self._assign_routes(i)
         return i
@@ -1202,6 +1439,8 @@ class RingSim:
             "truck": self.truck[idx],
             "length": self.length[idx],
             "width": np.where(self.truck[idx], TRUCK_WIDTH, self.cfg.car_width),
+            "kind": self.kind[idx],  # KIND_NAMES codes
+            "company": self.company[idx],  # -1: none
         }
 
     # ------------------------------------------------------------ dynamics
@@ -1257,7 +1496,12 @@ class RingSim:
         g = gap[idx]
         v0 = self.target_speed(idx)
         acc_now = self._car_following(idx, v, v0, ld, g, lead, gap)
+        if self.automated:
+            a_idm = acc_now.copy()  # (an automated car's: the IDM towards its direct leader, its own T and s0)
+            self._automated_command(idx, v, v0, ld, g, acc_now)
         self._make_room_to_leave(idx, v, v0, acc_now)
+        if self.automated:
+            self._automated_limits(idx, acc_now, a_idm)
         # The driver model asking for more than the brakes can give (on this
         # road): harsh braking, typically over-reaction after a late or delayed response.
         max_decel = self.eff.max_decel
@@ -1277,7 +1521,10 @@ class RingSim:
             f = np.exp(-dt / NOISE_TAU)
             self.noise[idx] = f * self.noise[idx] + cfg.driver_noise * np.sqrt(1 - f * f) * \
                 self.rng.standard_normal(idx.size)
-            acc += self.noise[idx]
+            noise = self.noise[idx]
+            if self.automated:  # automated vehicles drive without it (drawn all the same, then masked)
+                noise = np.where(self.kind[idx] == HUMAN, noise, 0.0)
+            acc += noise
         # Physical braking limit; a car told to brake brakes hard, but no harder than the road allows.
         acc = np.where(braking, -min(PERTURB_DECEL, max_decel), np.maximum(acc, -max_decel))
 
@@ -1301,6 +1548,7 @@ class RingSim:
             ds = limited
         clamped = ds < planned - 1e-3
         v_new = np.where(clamped, np.minimum(v_new, ds / dt), v_new)
+        self.a_now[idx] = (v_new - v) / dt  # the acceleration each car realised this step (_alloc)
 
         # Harsh braking ("emergency"): the driver model asks for more than
         # the braking limit, or the no-overlap constraint has to stop the car
@@ -1343,9 +1591,9 @@ class RingSim:
 
     def _log_conflicts(self, idx, old, dtheta) -> None:
         """Log the circulating vehicles that passed an entrance's entry point this step (its conflict point
-        with the entering cars): ``conflict_log`` and the counts ``arm_passed`` (any lane),
-        ``arm_passed_outer`` (the outer lane) and ``arm_passed_trucks``. Observer only: it reads the
-        positions and draws nothing.
+        with the entering cars): ``conflict_log`` (time, arm, lane, uid, kind) and the counts ``arm_passed``
+        (any lane), ``arm_passed_outer`` (the outer lane) and ``arm_passed_trucks``. Observer only: it reads
+        the positions and draws nothing.
 
         A vehicle passes a point when the arc it drove this step, from just
         after where it was (``old``, aligned with ``idx``) to where it is now,
@@ -1369,7 +1617,7 @@ class RingSim:
             np.add.at(self.arm_passed_outer, arms[lanes == self.outer], 1)
             np.add.at(self.arm_passed_trucks, arms[self.truck[slots]], 1)
             self.conflict_log.extend(zip([self.time] * sub.size, arms.tolist(), lanes.tolist(),
-                                         self.uid[slots].tolist()))
+                                         self.uid[slots].tolist(), self.kind[slots].tolist()))
 
     def must_move_out(self, idx) -> np.ndarray:
         """Leavers not yet on the outer lane that are inside their lane-change zone."""
@@ -1447,17 +1695,20 @@ class RingSim:
         # Each leaver is replaced at a random entrance; if that queue is full the
         # replacement is slotted into the ring instead (by _sync_population).
         for arm in self.rng.integers(self.n_arms, size=leaving.size):
-            if self.queue[arm] < MAX_QUEUE:
+            if self.queue[arm] < MAX_QUEUE:  # (one that finds it full is created when it is slotted in)
                 self.queue[arm] += 1
                 self.queue_times[arm].append(self.time)
                 self.queue_trucks[arm].append(bool(self._draw_trucks(1)[0]))
+                self._queue_kinds(arm, self._draw_kinds(1))
                 self.n_arrived += 1
                 self.arm_arrived[arm] += 1
                 self.arrival_log.append((self.time, int(arm)))
 
     def _arrivals(self) -> None:
         """Open mode: cars arrive at each entrance at random (Poisson, from the demand
-        stream) and join its queue; those that find it full are turned away (blocked)."""
+        stream) and join its queue; those that find it full are turned away (blocked).
+        Every arrival draws its kind (blocked ones too, so the kinds' draws never depend
+        on the queues); trucks are drawn, as always, only for those that join."""
         if self.n_arms == 0 or self.cfg.entry_rate <= 0:
             return
         arrived = self.rng_demand.poisson(self.arrival_rates() * self.cfg.dt)
@@ -1467,9 +1718,11 @@ class RingSim:
         for arm in np.flatnonzero(arrived).tolist():
             k = int(arrived[arm])
             join = min(k, max(limit - int(self.queue[arm]), 0))
+            kinds = self._draw_kinds(k)
             self.queue[arm] += join
             self.queue_times[arm].extend([now] * join)
             self.queue_trucks[arm].extend(self._draw_trucks(join).tolist())
+            self._queue_kinds(arm, kinds, join)
             self.arrival_log.extend([(now, arm)] * k)
             if k > join:
                 self.n_blocked += k - join
@@ -1479,13 +1732,17 @@ class RingSim:
 
     def _top_up(self) -> None:
         """The capacity test (``subject``): fill the subject entrance's queue back up to SUBJECT_QUEUE cars,
-        each joining now (its queue wait counts from here) and a truck as often as an arrival is (from
-        rng_drivers). No arrival is drawn or counted: n_topped_up counts them instead."""
+        each joining now (its queue wait counts from here), a truck as often as an arrival is (from
+        rng_drivers) and of a kind as an arrival is (from rng_kinds_test, a stream of its own: how many join
+        follows the subject entries, so the n-th vehicle topped up and the n-th arrival at each other entrance
+        draw the same uniforms whatever the share, and the kinds of both stay nested across shares). No
+        arrival is drawn or counted: n_topped_up counts them instead."""
         k = SUBJECT_QUEUE - int(self.queue[SUBJECT_ARM])
         if k > 0:
             self.queue[SUBJECT_ARM] += k
             self.queue_times[SUBJECT_ARM].extend([self.time] * k)
             self.queue_trucks[SUBJECT_ARM].extend(self._draw_trucks(k).tolist())
+            self._queue_kinds(SUBJECT_ARM, self._draw_kinds(k, self.rng_kinds_test))
             self.n_topped_up += k
 
     def _drop_queued(self, arm: int, k: int) -> None:
@@ -1496,9 +1753,10 @@ class RingSim:
             self.queue[arm] -= k
             for _ in range(k):
                 self.queue_times[arm].pop()
-            trucks = self.queue_trucks[arm]
-            while len(trucks) > self.queue[arm]:  # (a queue edited by hand may hold fewer types)
-                trucks.pop()
+            for name in QUEUE_FIELDS:
+                carried = getattr(self, name)[arm]
+                while len(carried) > self.queue[arm]:  # (a queue edited by hand may hold fewer types)
+                    carried.pop()
             self.n_gave_up += k
             self.gave_up_log.extend([(self.time, int(arm))] * k)
 
@@ -1511,6 +1769,8 @@ class RingSim:
             return
         to_exit = (self.exit_at[ready] - self.travel[ready]) * self.r_out
         mandatory = self.must_move_out(ready)
+        # (Automated vehicles consider and make changes as drivers do, with the same rules and draws: *model*, no
+        # lane-change behaviour of their own.)
         considering = mandatory | (self.rng.random(ready.size) < cfg.lane_change_rate * cfg.dt)
         cars = ready[considering]
         if cars.size == 0:
@@ -1563,8 +1823,13 @@ class RingSim:
         forced = mandatory[k] & (opt < n)  # a leaver must move out
         # Braking a change may force on anyone: more for a leaver, never beyond what the road allows.
         b_safe = np.minimum(self.eff.comfort_decel * np.where(mandatory[k], 2.5, 1.5), self.eff.max_decel)
-        min_room = max(0.5 * cfg.min_gap, SAFE_MARGIN + 0.2)
-        safe = (front >= min_room) & (back >= min_room) & (a_f_new >= -b_safe) & (a_self >= -b_safe)
+        # Room kept to the new leader and from the new follower: half the standstill gap of the car behind each
+        # gap (the changer's ahead of it, the new follower's behind it), at least SAFE_MARGIN + 0.2 m.
+        room_front = room_back = max(0.5 * cfg.min_gap, SAFE_MARGIN + 0.2)
+        if self.automated:
+            room_front = np.maximum(0.5 * self.s0[c], SAFE_MARGIN + 0.2)
+            room_back = np.where(has_f, np.maximum(0.5 * self.s0[f], SAFE_MARGIN + 0.2), room_back)
+        safe = (front >= room_front) & (back >= room_back) & (a_f_new >= -b_safe) & (a_self >= -b_safe)
         gain = (a_self - acc[c]) + cfg.politeness * ((a_f_new - a_f_old) + (a_o_new - a_o_old))
         if cfg.lane_change_motive == "random":
             wants = np.ones(opt.size, dtype=bool)
@@ -1627,7 +1892,7 @@ class RingSim:
         arms = self.rng.permutation(ready)
         while arms.size:
             # Check the remaining arms together; after an entry, re-check the ones after it.
-            ok, v_in = self._entry_ok(self.entry_angle[arms], self._head_trucks(arms))
+            ok, v_in = self._entry_ok(self.entry_angle[arms], self._head_trucks(arms), self._head_s0(arms))
             hits = np.flatnonzero(ok)
             if hits.size == 0:
                 break
@@ -1638,7 +1903,7 @@ class RingSim:
             if truck:
                 self.arm_entered_trucks[arm] += 1
             slot = self._spawn(np.array([self.outer]), np.array([angle]), v_in[k:k + 1],
-                               lat=np.array([self.outer + 1.0]), trucks=np.array([truck]))
+                               lat=np.array([self.outer + 1.0]), trucks=np.array([truck]), kinds=self._pop_kinds(arm))
             self.entered_at[slot] = self.time
             self.queue[arm] -= 1
             wait = self.time - self.queue_times[arm].popleft()  # first come, first served
@@ -1654,6 +1919,15 @@ class RingSim:
             self._lanes[self.outer] = (np.insert(order, pos, slot[0]), np.insert(th, pos, angle % TWO_PI))
             arms = arms[k + 1:]
 
+    def _pop_kinds(self, arm: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(kind, company, ACC-fallback gap) of the vehicle at the head of an entrance's queue, as one-element
+        arrays for _spawn, taken off its queue fields (a human driver where a queue edited by hand lacks them:
+        the fills of an older state, ADDED)."""
+        return tuple(np.array([fifo.popleft() if fifo else ADDED[name]], dtype=getattr(self, per_car).dtype)
+                     for name, per_car in (("queue_kinds", "kind"), ("queue_companies", "company"),
+                                           ("queue_acc_gaps", "acc_gap"))
+                     for fifo in [getattr(self, name)[arm]])
+
     def _head_trucks(self, arms) -> np.ndarray | None:
         """Whether the vehicle at the head of each of these entrances' queues is a truck
         (None when every vehicle is a car)."""
@@ -1661,21 +1935,34 @@ class RingSim:
             return None
         return np.array([bool(self.queue_trucks[arm][0]) if self.queue_trucks[arm] else False for arm in arms])
 
-    def _entry_ok(self, angles: np.ndarray, trucks: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    def _head_s0(self, arms) -> np.ndarray | None:
+        """[m] The standstill gap of the vehicle at the head of each of these entrances' queues, by the kind its
+        queue carries (None while no vehicle can be automated: every one keeps Standstill gap)."""
+        if not self.automated:
+            return None
+        return self._kind_s0(np.array([self.queue_kinds[arm][0] if self.queue_kinds[arm] else HUMAN for arm in arms]))
+
+    def _entry_ok(self, angles: np.ndarray, trucks: np.ndarray | None = None,
+                  s0: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Whether a vehicle may enter the outer lane at each of ``angles`` (``trucks``: which are
-        trucks; None = all cars), and at what speed."""
+        trucks; None = all cars), and at what speed. The room it needs ahead is its own standstill gap
+        (``s0``; None = Standstill gap for all) + 1 m, and behind it the lag vehicle's own + 1 m: an entrant
+        let into less than its own (a robotaxi's is 1.94 m longer) would brake to a stand at the entry point
+        and hold up the next one (the entry rules by kind are S3's)."""
         cfg, eff = self.cfg, self.eff
         if trucks is None:
             length, v_in = cfg.car_length, np.full(angles.size, min(cfg.turn_speed, eff.mean_speed))
         else:
             length = np.where(trucks, cfg.truck_length, cfg.car_length)
             v_in = np.minimum(cfg.turn_speed, eff.mean_speed * np.where(trucks, TRUCK_SPEED_FACTOR, 1.0))
+        own = cfg.min_gap if s0 is None else s0
         nl, front, nf, back = self._neighbours_in(self.outer, angles, length)
         if nl[0] < 0:  # empty outer lane: room for anything shorter than the lane
-            return np.broadcast_to(length + cfg.min_gap <= self.lane_len[self.outer], angles.shape).copy(), v_in
+            return np.broadcast_to(length + own <= self.lane_len[self.outer], angles.shape).copy(), v_in
         vf = self.v[nf]
+        lag = cfg.min_gap if s0 is None else self.s0[nf]
         follower_ok = self._idm(vf, self.desired_speed(nf), back, v_in, nf) >= -eff.comfort_decel
-        ok = ((front >= cfg.min_gap + 1.0) & (back >= cfg.min_gap + 1.0)
+        ok = ((front >= own + 1.0) & (back >= lag + 1.0)
               & (back >= eff.entry_gap * vf) & follower_ok)
         return ok, np.where(front < 15.0, np.minimum(v_in, self.v[nl]), v_in)
 
@@ -1844,6 +2131,7 @@ class RingSim:
         slowed = slots[self.v[slots] > eq]
         self.v[slots] = np.minimum(self.v[slots], eq)
         self.acc_hist[:, slowed] = np.minimum(self.acc_hist[:, slowed], 0.0)
+        self.a_now[slowed] = np.minimum(self.a_now[slowed], 0.0)
         self.moving[slowed] &= self.v[slowed] >= SLOW_FRACTION * self.target_speed(slowed)
         self.inserted_at[slowed] = self.time
 

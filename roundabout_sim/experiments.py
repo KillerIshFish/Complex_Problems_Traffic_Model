@@ -247,6 +247,11 @@ measured columns (CSV) and how to read them
   trucks               trucks on the ring (mean); truck_speed / car_speed: mean
                        speed of the trucks and of the other vehicles (empty if
                        there are none)
+  automated            automated vehicles on the ring (mean): those of the
+                       auto_kind (acc, cav or robotaxi), auto_share of the new
+                       vehicles; human_speed / auto_speed: mean speed of the
+                       human-driven and of the automated vehicles (empty if
+                       there are none). A truck counts by its kind
   wave_speed           speed of jam patterns along the ring [m/s]; < 0 = moving
                        backwards against the traffic, as stop-and-go waves do
   wave_speed_kmh       the same jam wave speed in km/h
@@ -334,7 +339,7 @@ measured columns (CSV) and how to read them
 MEAN_COLUMNS = ("cars", "queued", "longest_queue", "density", "mean_speed", "mean_free_speed", "speed_std",
                 "flux", "jam_fraction", "speed_deficit", "n_jams", *JAM_ORIGINS, "occupancy", "spacing_gini",
                 "clustering", "order_param", "order_baseline", "mean_trip_time", "demand_per_min",
-                "trucks", "truck_speed", "car_speed")
+                "trucks", "truck_speed", "car_speed", "automated", "human_speed", "auto_speed")
 # Columns of the sweep's printed table (means across seeds); OPEN_COLUMNS are added when a run is in open
 # mode, TRUCK_COLUMNS when a run has trucks.
 SUMMARY_COLUMNS = ("measured_density", "measured_mean_speed", "flux", "jam_fraction", "congestion_onset",
@@ -589,7 +594,7 @@ class SubjectTap:
     def poll(self) -> None:
         sim, upto = self.sim, self._upto
         self.entries += [t for t, arm, _ in _logged_since(sim.entry_log, upto) if arm == SUBJECT_ARM]
-        self.passes += [t for t, arm, lane, _ in _logged_since(sim.conflict_log, upto)
+        self.passes += [t for t, arm, lane, *_ in _logged_since(sim.conflict_log, upto)
                         if arm == SUBJECT_ARM and lane == sim.outer]
         self._upto = sim.time  # (every event of the steps so far was logged at an earlier time)
 
@@ -706,7 +711,8 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int], tap
         if sim.open_demand else float("nan")  # closed mode has no demand of its own
     row = {
         **{k: mean[k] for k in ("cars", "queued", "density", "mean_speed", "mean_free_speed", "speed_std",
-                                "flux", "trucks", "truck_speed", "car_speed")},
+                                "flux", "trucks", "truck_speed", "car_speed", "automated", "human_speed",
+                                "auto_speed")},
         "detector_flux": float(settled["detector_flux"].mean()),
         "jam_fraction": mean["jam_fraction"],
         "congestion_onset": congestion_onset(frame),
@@ -1093,7 +1099,8 @@ def plan_repeats(design: Design, jobs: list[tuple], configs: list[SimConfig], se
 
 def _sample_groups(args: argparse.Namespace) -> list[str] | None:
     """--sample-groups as the tabs name them, in tab order ("drivers , ROAD" -> ["Road", "Drivers"]), or
-    None for every group; ValueError for an unknown one."""
+    None for the default groups (presets.DEFAULT_GROUPS: every group but AVs and Coop); ValueError for an
+    unknown one."""
     from roundabout_sim import presets
 
     if not args.sample_groups:
@@ -1104,7 +1111,8 @@ def _sample_groups(args: argparse.Namespace) -> list[str] | None:
 def _sample(given: list[tuple[str, str]], base: Base, args: argparse.Namespace,
             parser: argparse.ArgumentParser) -> Design:
     """``--sample N`` points: a Latin hypercube over the --vary ranges, else over the plausible ranges
-    (presets.RANDOM_RANGES) of every parameter, or of the --sample-groups ones, not set explicitly.
+    (presets.RANDOM_RANGES) of every parameter (but the AVs and Coop tabs', which only --sample-groups
+    draws: presets.OPT_IN_GROUPS), or of the --sample-groups ones, not set explicitly.
 
     Without --vary every plausible range is cut into N strata, each sampled
     once, and each list of choices (lanes, entrances, road condition, ...) is
@@ -1210,6 +1218,10 @@ def _road(cfg: SimConfig) -> str:
 def _describe(cfg: SimConfig) -> str:
     road = f", {cfg.road_condition} road" if cfg.road_condition != "dry" else ""
     trucks = f", {100 * cfg.truck_share:g} % trucks of {cfg.truck_length:g} m" if cfg.truck_share > 0 else ""
+    if cfg.auto_share > 0:
+        brands = f" of {cfg.companies} companies" if cfg.companies > 1 else ""
+        gap = f" (time gap x {cfg.robotaxi_headway:g})" if cfg.auto_kind == "robotaxi" else ""
+        trucks += f", {100 * cfg.auto_share:g} % automated: {cfg.auto_kind}{gap}{brands}"
     reaction = f" ± {cfg.reaction_std:g}" if cfg.reaction_std > 0 else ""
     headway = f" ± {cfg.headway_std:g}" if cfg.headway_std > 0 else ""
     return (f"{_road(cfg)}, radius {cfg.radius:g} m{road}, car {cfg.car_length:g} m{trucks} | "
@@ -1358,6 +1370,11 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             f"vehicles; {100 * cfg.truck_share:g} % of the new ones are trucks)"),
            ("Mean speed, cars / trucks", f"{_fmt(summary['car_speed'])} / {_fmt(summary['truck_speed'])}", "m/s")]
           if cfg.truck_share > 0 else []),
+        *([("Automated on the ring", _fmt(summary["automated"], 1),
+            f"mean ({_pct(summary['automated'] / summary['cars'] if summary['cars'] else float('nan'), 0)} % of the "
+            f"vehicles; {100 * cfg.auto_share:g} % of the new ones are {cfg.auto_kind})"),
+           ("Mean speed, human / automated", f"{_fmt(summary['human_speed'])} / {_fmt(summary['auto_speed'])}",
+            "m/s")] if cfg.auto_share > 0 else []),
         ("Flux (whole ring)", _fmt(summary["flux"], 3), "cars/s"),
         ("Flux (detector)", _fmt(summary["detector_flux"], 3), "cars/s"),
         ("Jammed cars (congestion)", _pct(summary["jam_fraction"]),
@@ -1432,7 +1449,9 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
 IDLE_FIX = {"open mode only": "add --set traffic_mode=open, or vary traffic_mode too",
             "no entrances": "set n_arms above 0", "no trucks": "set truck_share above 0",
             "dry road": "set road_condition to wet, snow or ice, or vary it too",
-            "capacity test": "set subject_arm=off: the capacity test fixes every route"}
+            "capacity test": "set subject_arm=off: the capacity test fixes every route",
+            "no automated vehicles": "set auto_share above 0",
+            "no robotaxis": "set auto_kind=robotaxi and auto_share above 0, or vary them too"}
 
 
 def idle_notes(names, configs: list[SimConfig]) -> list[str]:
@@ -1597,7 +1616,7 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
             how = f"{len(design.points)} random points (Latin hypercube over the given ranges)"
         else:
             groups = _sample_groups(args)
-            drawn = f"the {and_join(groups)} settings" if groups else "every setting"
+            drawn = f"the {and_join(groups)} settings" if groups else "every setting but the AVs and Coop ones"
             how = f"{len(design.points)} random points (Latin hypercube over the plausible ranges of {drawn})"
         kind = "random sample" if design.kind == "sample" else "plan"
         if nothing:
@@ -2369,11 +2388,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="N random design points (seeded by --seed), a Latin hypercube: each --vary range is "
                             "cut into N strata, each sampled once on the slider step (a range holding no more "
                             "slider values than N, and a comma list, are dealt out evenly). Without --vary: over "
-                            "the plausible ranges (presets.RANDOM_RANGES) of every parameter (or of "
-                            "--sample-groups) not given with --set or its flag")
+                            "the plausible ranges (presets.RANDOM_RANGES) of every parameter but the AVs and "
+                            "Coop tabs' (or of --sample-groups) not given with --set or its flag")
     sweep.add_argument("--sample-groups", dest="sample_groups", metavar="G1,G2",
                        help="--sample without --vary: draw only the parameters of these groups (the viewer's "
-                            f"tabs: {', '.join(dict.fromkeys(p.group for p in PARAMS))})")
+                            f"tabs: {', '.join(dict.fromkeys(p.group for p in PARAMS))}; by default all but AVs "
+                            "and Coop, which are drawn only when named)")
     sweep.add_argument("--seeds", type=int, default=3, help="repetitions per point (default 3)")
     sweep.add_argument("--seed", type=cli.seed_arg, default=0,
                        help="base seed, a whole number >= 0; run k of each point uses base + k")

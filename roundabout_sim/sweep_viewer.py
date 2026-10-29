@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import itertools
 import json
 import math
 import os
@@ -53,8 +54,9 @@ import pygame
 import pygame.gfxdraw
 
 from roundabout_sim import cli, palette, state
-from roundabout_sim.config import (NEEDS_NONZERO, NEEDS_WEATHER, PARAM_BY_NAME, PARAMS, TEST_FIXED, SimConfig,
-                                   axis_label, changed_settings, coerce, idle_note, inactive_reason)
+from roundabout_sim.config import (NEEDS_KIND, NEEDS_NONZERO, NEEDS_WEATHER, PARAM_BY_NAME, PARAMS, TEST_FIXED,
+                                   SimConfig, axis_label, changed_settings, coerce, idle_note, inactive_inputs,
+                                   inactive_reason)
 from roundabout_sim.experiments import range_values
 from roundabout_sim.metrics import LOS_LIMITS
 from roundabout_sim.textfmt import base_text, format_number, plural, significant, value_text
@@ -259,6 +261,8 @@ COLUMN_LABELS = {
     "measured_density": "Density, measured (veh/km/lane)", "mean_free_speed": "Mean desired speed (m/s)",
     "measured_speed_std": "Speed spread (std, m/s)", "speed_deficit": "Speed deficit (0-1)",
     "trucks": "Trucks on the ring", "truck_speed": "Truck speed (m/s)", "car_speed": "Car speed (m/s)",
+    "automated": "Automated vehicles on the ring", "human_speed": "Human-driven speed (m/s)",
+    "auto_speed": "Automated vehicles' speed (m/s)",
     "detector_flux": "Detector flux (cars/s)", "occupancy": "Area covered (0-1)",
     "jams_following": "Jams, front car following (count)", "jams_merge": "Jams, front car moving out (count)",
     "jams_exit": "Jams, front car exiting (count)", "jams_entry": "Jams, front car just entered (count)",
@@ -896,7 +900,10 @@ IDLE_FIX = {"open mode only": "pick Traffic mode too (with open), or start from 
             "no entrances": "pick Arms too, or start from base settings with entrances",
             "no trucks": "pick Truck share too, or start from base settings with trucks",
             "dry road": "pick Road condition too, or start from base settings off a dry road",
-            "capacity test": "pick Capacity test too (with off), or start from base settings without it"}
+            "capacity test": "pick Capacity test too (with off), or start from base settings without it",
+            "no automated vehicles": "pick Automated share too, or start from base settings with automated vehicles",
+            "no robotaxis": "pick Automated share and AV kind (with robotaxi) too, or start from base settings "
+                            "with robotaxis"}
 
 
 def param_help(spec, chosen: bool, idle: str = "") -> str:
@@ -958,7 +965,7 @@ def help_texts() -> list[str]:
               zip(MAX_POINTS, ("x axis (1st setting)", "series (one line per value)", "3rd setting"))]
     for spec in PARAMS:
         idle = f"{spec.applies_in} mode only" if spec.applies_in else NEEDS_NONZERO.get(spec.name, ("", ""))[1] \
-            or ("dry road" if spec.name in NEEDS_WEATHER else "")
+            or NEEDS_KIND.get(spec.name, ("", ""))[1] or ("dry road" if spec.name in NEEDS_WEATHER else "")
         texts += [param_help(spec, True), param_help(spec, False, idle), f"{setting_label(spec.name)}: {spec.help}",
                   SLICE_HELP.format(label=setting_label(spec.name))]
     texts.append(idle_text({setting_label(n): "open mode only" for n in ("entry_rate", "demand_imbalance",
@@ -1288,8 +1295,10 @@ class SweepViewer(Messages):
 
     def idle_reason(self, name: str) -> str:
         """Why the setting ``name`` would change nothing in any run of the sweep set up here ("" if it acts
-        in some): from the base settings (config.inactive_reason), unless another picked setting makes it
-        act (Traffic mode with open for the open-mode settings, Arms above 0, Truck share above 0)."""
+        in some): from the base settings (config.inactive_reason), unless the other picked settings make it
+        act in some combination of their values (Traffic mode with open for the open-mode settings, Arms
+        above 0, Truck share above 0; Automated share above 0 with AV kind robotaxi for Robotaxi time gap).
+        Only the picked settings it depends on are combined (config.inactive_inputs): a few runs to try."""
         try:
             base = SimConfig().updated(**{k: v for k, v in self.base.items() if k in SETTINGS})
         except (ValueError, TypeError):
@@ -1297,15 +1306,14 @@ class SweepViewer(Messages):
         reason = inactive_reason(name, base)
         if not reason:
             return ""
-        for var in self.form:
-            if var.name == name:
+        inputs = inactive_inputs(name)
+        picked = [var for var in self.form if var.name != name and var.name in inputs]
+        for values in itertools.product(*(var.values() for var in picked)):
+            try:
+                if not inactive_reason(name, base.updated(**{var.name: v for var, v in zip(picked, values)})):
+                    return ""
+            except (ValueError, TypeError):
                 continue
-            for value in var.values():
-                try:
-                    if not inactive_reason(name, base.updated(**{var.name: value})):
-                        return ""
-                except (ValueError, TypeError):
-                    continue
         return reason
 
     def form_variables(self) -> list[tuple[str, list]]:
