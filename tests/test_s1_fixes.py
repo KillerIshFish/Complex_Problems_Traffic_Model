@@ -58,25 +58,28 @@ def test_the_capacity_test_keeps_the_kinds_coupled_across_shares(kind):
 # ------------------------------------------------------------------ entries with the entrant's own s0
 class Entering(RingSim):
     """Records, for each vehicle let in, the bumper gap ahead of it and its own standstill gap (the room
-    _entry_ok asks for is that + 1 m)."""
+    _entry_ok asks for is that + 1 m). (Changed on purpose in S3: _entries asks _entry_check, which _entry_ok
+    wraps, with lags=True for the observers: passed through.)"""
 
-    def _entry_ok(self, angles, trucks=None, s0=None):
-        ok, v_in = super()._entry_ok(angles, trucks, s0)
+    def _entry_check(self, angles, trucks=None, s0=None, arms=None, **kw):
+        checked = super()._entry_check(angles, trucks, s0, arms, **kw)
+        ok = checked[0]
         nl, front, _, _ = self._neighbours_in(self.outer, angles, self.cfg.car_length)
         if nl[0] >= 0 and ok.any():
             k = np.flatnonzero(ok)[0]  # (the first entrance that may go is the one that does)
             own = self.cfg.min_gap if s0 is None else s0[k]
             self.__dict__.setdefault("fronts", []).append((float(front[k]), float(own)))
-        return ok, v_in
+        return checked
 
 
 @pytest.mark.parametrize("entry_rate", [0.0, 0.03])
 def test_an_entrant_needs_room_for_its_own_standstill_gap(entry_rate):
     """A robotaxi queue is let in only with its own standstill gap + 1 m ahead (min_gap + 1.94 + 1 m): let in
     behind a driver's 2.5 m, as before, each braked to a stand at the entry point and the queue discharged at
-    about half the drivers' rate (vc 0), with harsh braking at the entry once there was conflicting traffic."""
+    about half the drivers' rate (vc 0), with harsh braking at the entry once there was conflicting traffic.
+    (robotaxi_entry 1: the drivers' critical gap and follow-up, so that only the room ahead differs.)"""
     runs = {}
-    for label, extra in (("human", {}), ("robotaxi", dict(auto_share=1.0, auto_kind="robotaxi"))):
+    for label, extra in (("human", {}), ("robotaxi", dict(auto_share=1.0, auto_kind="robotaxi", robotaxi_entry=1.0))):
         sim = Entering(capacity_test(3, entry_rate=entry_rate, **extra))
         sim.step(4000)
         runs[label] = sim

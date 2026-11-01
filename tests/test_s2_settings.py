@@ -72,7 +72,10 @@ def test_invalid_values_are_refused(bad):
     ("companies", dict(auto_share=0.5, auto_kind="acc"), "companies alike"),
     ("companies", dict(auto_share=0.5, auto_kind="acc", brand_spread=0.3), ""),
     ("companies", dict(auto_share=0.5, coop_between="none"), ""),
-    ("companies", dict(auto_share=0.5, coop_between="A"), "companies alike"),  # (class A or more: CACC either way)
+    # (B acts since route-conflict anticipation: capped to A between companies they differ, changed on purpose)
+    ("companies", dict(auto_share=0.5, coop_between="A"), ""),
+    ("companies", dict(auto_share=0.5, coop_class="A", coop_between="A"), "companies alike"),
+    ("companies", dict(auto_share=0.5, coop_class="D", coop_between="none"), "companies alike"),  # (D: never capped)
     ("companies", dict(auto_share=0.5, coop_between="none", coop_class="none"), "companies alike"),
 ])
 def test_each_setting_says_why_it_does_nothing(name, config, reason):

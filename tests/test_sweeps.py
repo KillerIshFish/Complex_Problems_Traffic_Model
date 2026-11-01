@@ -338,7 +338,10 @@ def test_sample_without_vary_is_a_latin_hypercube_over_the_plausible_ranges(tmp_
                               "--measure", "0.5", "--workers", "1")
     ranges = presets.plausible_ranges(["Drivers", "Lane chg"])
     names = [v["name"] for v in meta["varied"]]
-    assert names == [n for n in ranges if n != "reaction_time"]  # those groups, but not the --set one
+    # (those groups, but not the --set one, nor the drivers' adaptation to AVs: one value each, never drawn)
+    fixed = [n for n, spec in ranges.items() if isinstance(spec, list) and len(spec) == 1]
+    assert fixed == ["exploit_gap", "follow_adapt"] and all((df[n] == ranges[n][0]).all() for n in fixed)
+    assert names == [n for n in ranges if n != "reaction_time" and n not in fixed]
     assert (df["reaction_time"] == 0.5).all() and "reaction_time keeps the value set with --set" in printed
     assert (df["n_lanes"] == SimConfig().n_lanes).all()  # other groups at the base
     assert list(df.columns[:len(names)]) == names[::-1] and df.columns[len(names)] == "seed"

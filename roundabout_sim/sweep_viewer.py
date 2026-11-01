@@ -54,11 +54,12 @@ import pygame
 import pygame.gfxdraw
 
 from roundabout_sim import cli, palette, state
-from roundabout_sim.config import (NEEDS_COMPANIES, NEEDS_CONTROLLER, NEEDS_COOP, NEEDS_FS, NEEDS_KIND, NEEDS_LANES,
-                                   NEEDS_NONZERO, NEEDS_STRINGS, NEEDS_WEATHER, PARAM_BY_NAME, PARAMS, TEST_FIXED,
-                                   SimConfig, axis_label, changed_settings, coerce, idle_note, inactive_inputs,
-                                   inactive_reason)
-from roundabout_sim.engine import PAIR_TYPES, TTC_CRITICAL
+from roundabout_sim.config import (NEEDS_BELOW_D, NEEDS_COMPANIES, NEEDS_CONTROLLER, NEEDS_COOP, NEEDS_DRIVERLESS,
+                                   NEEDS_ENTRANCES, NEEDS_FS, NEEDS_KIND, NEEDS_LANES, NEEDS_MERGES, NEEDS_NONZERO,
+                                   NEEDS_RECOGNISABLE, NEEDS_SNOW, NEEDS_STRINGS, NEEDS_TEST, NEEDS_WEATHER,
+                                   PARAM_BY_NAME, PARAMS, TEST_FIXED, SimConfig, axis_label, changed_settings, coerce,
+                                   idle_note, inactive_inputs, inactive_reason)
+from roundabout_sim.engine import ENTRANT_CLASSES, FORCED_WINDOW, PAIR_TYPES, PET_CRITICAL, TTC_CRITICAL
 from roundabout_sim.experiments import range_values
 from roundabout_sim.metrics import LOS_LIMITS
 from roundabout_sim.textfmt import base_text, format_number, plural, significant, value_text
@@ -266,7 +267,7 @@ COLUMN_LABELS = {
     "automated": "Automated vehicles on the ring", "human_speed": "Human-driven speed (m/s)",
     "auto_speed": "Automated vehicles' speed (m/s)",
     "cacc_share": "Automated time following by CACC (0-1)",
-    "aeb_per_veh_h": "Safety-layer interventions (per automated veh-h)",
+    "override_per_veh_h": "Safety overrides (per automated veh-h)",
     "harsh_human_per_veh_h": "Harsh braking, human-driven (per veh-h)",
     "harsh_auto_per_veh_h": "Harsh braking, automated (per veh-h)",
     "ttc_per_h": f"TTC ≤ {TTC_CRITICAL:g} s episodes (per h following)",
@@ -275,6 +276,21 @@ COLUMN_LABELS = {
     **{f"tet_{p.lower()}_s_per_h": f"Time at TTC ≤ {TTC_CRITICAL:g} s, {p} (s per h following)" for p in PAIR_TYPES},
     **{f"follow_{p.lower()}_h": f"Car following, {p} (veh-h)" for p in PAIR_TYPES},
     "cutins_ahead_auto_per_h": "Cut-ins ahead of AVs (per h)",
+    **{f"{what}_{c}_s": f"{title}, {who} (s)" for what, title in
+       (("entry_delay", "Entry delay"), ("travel_time", "Travel time"), ("control_delay", "Control delay"))
+       for c, who in zip(ENTRANT_CLASSES, ("human drivers", "cooperating CAVs", "other automated"))},
+    "accepted_lag_s": "Accepted lag at entries (s)",
+    "accepted_lag_h_s": "Accepted lag, ahead of an H vehicle (s)",
+    "accepted_lag_a_s": "Accepted lag, ahead of an AV (s)",
+    "forced_yield_share": f"Forced yields within {FORCED_WINDOW:g} s of an entry (0-1)",
+    "forced_yield_h_share": "Forced yields, H lag vehicle (0-1)",
+    "forced_yield_a_share": "Forced yields, AV lag vehicle (0-1)",
+    "forced_yield_law_share": "Forced yields, its law or driver (0-1)",
+    "forced_yield_override_share": "Forced yields, its safety override (0-1)",
+    "pet_mean_s": "PET at entries, mean (s)", "pet_low_share": f"PET below {PET_CRITICAL:g} s (share)",
+    "pet_h_mean_s": "PET at entries, H vehicle next (s)", "pet_a_mean_s": "PET at entries, AV next (s)",
+    "pet_h_low_share": f"PET below {PET_CRITICAL:g} s, H vehicle next (share)",
+    "pet_a_low_share": f"PET below {PET_CRITICAL:g} s, AV next (share)",
     "detector_flux": "Detector flux (cars/s)", "occupancy": "Area covered (0-1)",
     "jams_following": "Jams, front car following (count)", "jams_merge": "Jams, front car moving out (count)",
     "jams_exit": "Jams, front car exiting (count)", "jams_entry": "Jams, front car just entered (count)",
@@ -929,7 +945,18 @@ IDLE_FIX = {"open mode only": "pick Traffic mode too (with open), or start from 
             "no smoothers": "pick Smoothers too, or start from base settings with smoothers",
             "no FollowerStopper": "pick Smoother law too (with followerstopper), or start from base settings with "
                                   "FollowerStopper smoothers",
-            "one lane": "pick Lanes too, or start from base settings with two or more lanes"}
+            "one lane": "pick Lanes too, or start from base settings with two or more lanes",
+            "class D": "pick Cooperation too (below D), or start from base settings below Cooperation D",
+            "no capacity test": "pick Capacity test too (with on), or start from base settings with it",
+            "no driverless vehicles": "pick AV kind (cav or robotaxi) and Automated share too, or start from base "
+                                      "settings with CAVs or robotaxis",
+            "no recognisable AVs": "pick AV kind (cav or robotaxi) and Automated share, or Smoothers, too, or start "
+                                   "from base settings with recognisable AVs",
+            "no merges": "pick Entrances / exits or Lanes too, or start from base settings with entrances or two "
+                         "lanes",
+            "no snow or ice": "pick Road condition too (with snow or ice), or start from base settings on snow or "
+                              "ice",
+            "no weather effect": "pick Weather effect too, or start from base settings with a weather effect"}
 
 
 def param_help(spec, chosen: bool, idle: str = "") -> str:
@@ -998,7 +1025,10 @@ def help_texts() -> list[str]:
         texts += [param_help(spec, False, reason) for names, reason in
                   ((NEEDS_CONTROLLER, "no ACC cars or CAVs"), (NEEDS_COOP, "no cooperation"),
                    (NEEDS_STRINGS, "no strings"), (NEEDS_COMPANIES, "one company"), (("companies",), "companies alike"),
-                   (NEEDS_FS, "no FollowerStopper"), (NEEDS_LANES, "one lane"))
+                   (NEEDS_FS, "no FollowerStopper"), (NEEDS_LANES, "one lane"), (NEEDS_BELOW_D, "class D"),
+                   (NEEDS_TEST, "no capacity test"), (NEEDS_ENTRANCES, "no entrances"),
+                   (NEEDS_DRIVERLESS, "no driverless vehicles"), (NEEDS_RECOGNISABLE, "no recognisable AVs"),
+                   (NEEDS_MERGES, "no merges"), (NEEDS_SNOW, "no snow or ice"), (NEEDS_WEATHER, "dry road"))
                   if spec.name in names]
     texts.append(idle_text({setting_label(n): "open mode only" for n in ("entry_rate", "demand_imbalance",
                                                                          "demand_profile")}))

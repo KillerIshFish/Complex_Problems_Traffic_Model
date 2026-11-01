@@ -98,9 +98,10 @@ import pandas as pd
 from roundabout_sim import cli, state
 from roundabout_sim.config import (PARAM_BY_NAME, PARAMS, SimConfig, axis_label, changed_settings, idle_note,
                                    inactive_reason, range_text)
-from roundabout_sim.engine import (EMERGENCY_HOLD, LOG_HORIZON, MAX_DECEL, PAIR_TYPES, PEAK_PERIOD, SLOW_FRACTION,
-                                   SUBJECT_ARM, SUBJECT_QUEUE, TTC_CRITICAL, TWO_PI, RingSim, braking_limits,
-                                   mean_demand_factor)
+from roundabout_sim.engine import (CLASS_ARRAYS, EMERGENCY_HOLD, ENTRANT_CLASSES, FORCED_WINDOW, LOG_HORIZON,
+                                   MAX_DECEL, MERGE_ARRAYS, PAIR_TYPES, PEAK_PERIOD, PET_CRITICAL, PET_MAX,
+                                   SLOW_FRACTION, SUBJECT_ARM, SUBJECT_QUEUE, TTC_CRITICAL, TWO_PI, RingSim,
+                                   braking_limits, mean_demand_factor)
 from roundabout_sim.metrics import LOS_LIMITS, RATE_WINDOW, Recorder, entry_vc, level_of_service, los_text
 from roundabout_sim.palette import SERIES_HEX
 from roundabout_sim.textfmt import plain as _plain
@@ -259,18 +260,18 @@ measured columns (CSV) and how to read them
                        a CACC string): mean CACC followers / mean automated
                        (0 for acc and robotaxi runs; empty without automated
                        vehicles)
-  aeb_per_veh_h        SAFETY LAYER interventions per hour an automated vehicle
-                       spends on the ring: episodes in which the IDM with the
-                       vehicle's own time gap and margin asks for more than
-                       comfortable braking and harder braking than its law,
-                       which then brakes as the IDM does (an episode ends after
-                       {EMERGENCY_HOLD:g} s without one). Automated: the auto_kind's
-                       and the smoothers (from smoother_start), together.
-                       Empty without automated vehicles
+  override_per_veh_h   SAFETY OVERRIDE interventions per hour an automated
+                       vehicle spends on the ring: episodes in which the IDM
+                       with its own time gap and margin asks for more than
+                       comfortable braking and lowers its law's command (after
+                       the law's dead time), which then brakes as the IDM does
+                       (an episode ends after {EMERGENCY_HOLD:g} s without one): mostly mild.
+                       Automated: the auto_kind's and the smoothers (from
+                       smoother_start). Empty without automated vehicles
   harsh_human_per_veh_h, harsh_auto_per_veh_h  harsh-braking episodes (those of
                        emergency_per_min) per hour a human-driven / an
-                       automated vehicle (as for aeb_per_veh_h) spends on the
-                       ring (empty without any)
+                       automated vehicle (as for override_per_veh_h) spends on
+                       the ring (empty without any)
   ttc_per_h            SAFETY (surrogate): time-to-collision episodes per hour
                        of car following: a follower closing on the vehicle
                        ahead with gap / closing speed <= {TTC_CRITICAL:g} s (SSAM's
@@ -299,6 +300,35 @@ measured columns (CSV) and how to read them
                        front of a recognisable AV (its new follower, within
                        reaction_distance behind it: a change further ahead of
                        it is no cut-in)
+  accepted_lag_s       ENTRY CONFLICTS: the lag an entrant accepted [s]: the
+                       bumper gap to the vehicle behind its entry point (the
+                       one its lag check judged) / that vehicle's speed, mean
+                       over the entries with a moving one (exact over the
+                       window; the capacity test's entrance included)
+  accepted_lag_h_s, accepted_lag_a_s  the same with an H lag vehicle (a human
+                       driver or an ACC car) / an A one (a recognisable AV)
+  forced_yield_share   share of the entries with a lag vehicle (their {FORCED_WINDOW:g} s
+                       windows closed in the measurement window) whose lag
+                       vehicle braked harder than its comfortable braking within
+                       {FORCED_WINDOW:g} s of the entry (its realised acceleration: driver
+                       noise counts too); an entry onto an empty outer lane has
+                       none and is not counted
+  forced_yield_h_share, forced_yield_a_share  the same with an H / A lag vehicle
+  forced_yield_law_share, forced_yield_override_share  the entries forced so
+                       without / with the lag vehicle's safety override acting
+                       in those {FORCED_WINDOW:g} s (law: its own law or its driver braked so);
+                       the two add up to forced_yield_share
+  pet_mean_s           post-encroachment time [s] at the entry points: from an
+                       entrant's rear clearing its entry point to the front of
+                       the next vehicle on the outer lane reaching it, mean over
+                       the PETs up to {PET_MAX:g} s (a conflict, as Rahmani et al. 2024
+                       count them). A group entering one gap has one PET (the
+                       last one's)
+  pet_low_share        share of those PETs below {PET_CRITICAL:g} s (critical: Peesapati et
+                       al. 2018)
+  pet_h_mean_s, pet_a_mean_s, pet_h_low_share, pet_a_low_share  the same where the
+                       vehicle reaching the point is H (a human driver or an
+                       ACC car) / A (a recognisable AV)
   wave_speed           speed of jam patterns along the ring [m/s]; < 0 = moving
                        backwards against the traffic, as stop-and-go waves do
   wave_speed_kmh       the same jam wave speed in km/h
@@ -320,6 +350,23 @@ measured columns (CSV) and how to read them
                        HCM control delay. Its level of service is entry_los:
                        {los_text("<=")},
                        and F whenever entry_vc > 1
+  entry_delay_human_s, entry_delay_coop_s, entry_delay_other_s  queue wait [s] by
+                       entrant class: human drivers, CAVs that cooperate within
+                       their company (coop_class A or more) and every other
+                       automated vehicle (acc, robotaxi, cav without
+                       cooperation); exact over the entries in the window, the
+                       capacity test's entrance left out. Empty without one
+  travel_time_human_s, travel_time_coop_s, travel_time_other_s  queue wait +
+                       time on the ring [s] of the entrants of each class that
+                       left in the window (vehicles placed by the density
+                       control or at the start, and the capacity test's
+                       entrants, have no queue wait counted: left out)
+  control_delay_human_s, control_delay_coop_s, control_delay_other_s  travel
+                       time - the same trip at free speed [s] (the same
+                       vehicles): the angle each drove, at its desired speed
+                       on the outer lane (cornering
+                       capped). It includes slowing to enter and to exit (the
+                       HCM's control delay leaves that geometric delay out)
   entry_vc             open mode: demand / capacity (v/c) of the busiest
                        entrance = its arrivals per second (blocked ones
                        included) / its entry rate while it had a queue. Above 1
@@ -707,16 +754,64 @@ def _counters(sim: RingSim) -> dict[str, float | np.ndarray]:
             "queue_busy": sim.queue_busy.copy(), "arm_passed": sim.arm_passed.copy(),
             "arm_passed_outer": sim.arm_passed_outer.copy(), "arm_passed_trucks": sim.arm_passed_trucks.copy(),
             "arm_entered_trucks": sim.arm_entered_trucks.copy(), "arm_entry_wait": sim.arm_entry_wait.copy(),
-            # the automated vehicles' observers: safety layer, harsh braking by group, exposure, cut-ins, and per
+            # the automated vehicles' observers: safety override, harsh braking by group, exposure, cut-ins, and per
             # pair type the steps of following, the steps at low TTC and the TTC episodes
-            "aeb": sim.n_aeb, "emergency_auto": sim.n_emergency_auto, "auto_steps": sim.n_auto_steps,
+            "override": sim.n_override, "emergency_auto": sim.n_emergency_auto, "auto_steps": sim.n_auto_steps,
             "human_steps": sim.n_human_steps, "cutins_auto": sim.n_cutins_auto,
             "pair_follow": sim.pair_follow_steps.copy(), "pair_ttc": sim.pair_ttc_steps.copy(),
-            "pair_episodes": sim.pair_ttc_episodes.copy()}
+            "pair_episodes": sim.pair_ttc_episodes.copy(),
+            # the entries' conflicts per pair type (the lag vehicle the follower) and the delays per entrant class
+            **{name: getattr(sim, name).copy() for name in ENTRY_COUNTS}}
+
+
+# The engine's exact counts the entry columns rest on (RingSim: MERGE_ARRAYS, CLASS_ARRAYS).
+ENTRY_COUNTS = (*MERGE_ARRAYS, *CLASS_ARRAYS)
+# Pair types (PAIR_TYPES, follower first) by the lag vehicle's letter: H (a human driver or an ACC car) or A.
+LAG_PAIRS = {"h": [k for k, p in enumerate(PAIR_TYPES) if p[0] == "H"],
+             "a": [k for k, p in enumerate(PAIR_TYPES) if p[0] == "A"]}
+# Summary columns of the entries' conflicts and of the delays by entrant class, in every summary (NaN where they do
+# not apply).
+ENTRY_COLUMNS = (*(f"{what}_{c}_s" for what in ("entry_delay", "travel_time", "control_delay")
+                   for c in ENTRANT_CLASSES),
+                 "accepted_lag_s", *(f"accepted_lag_{t}_s" for t in LAG_PAIRS),
+                 "forced_yield_share", *(f"forced_yield_{t}_share" for t in LAG_PAIRS), "forced_yield_law_share",
+                 "forced_yield_override_share",
+                 "pet_mean_s", "pet_low_share", *(f"pet_{t}_mean_s" for t in LAG_PAIRS),
+                 *(f"pet_{t}_low_share" for t in LAG_PAIRS))
+
+
+def entry_columns(now: dict, start: dict) -> dict:
+    """The entries' conflict columns and the delays by entrant class (ENTRY_COLUMNS) from the engine's exact counts
+    between :func:`_counters` ``start`` and ``now``: means and shares over the entries (or exits, PETs) in the window,
+    overall and by lag type (LAG_PAIRS). A mean or share over none is NaN."""
+    def ratio(key: str, over: str, pairs=None) -> float:
+        num, den = now[key] - start[key], now[over] - start[over]
+        if pairs is not None:
+            num, den = num[pairs], den[pairs]
+        num, den = float(np.sum(num)), float(np.sum(den))
+        return num / den if den > 0 else float("nan")
+
+    row = {}
+    for what, total, count in (("entry_delay", "class_wait", "class_entries"),
+                               ("travel_time", "class_travel", "class_exits"),
+                               ("control_delay", "class_control", "class_exits")):
+        row.update({f"{what}_{c}_s": ratio(total, count, [k]) for k, c in enumerate(ENTRANT_CLASSES)})
+    row["accepted_lag_s"] = ratio("merge_lag_total", "merge_lag_finite")
+    row.update({f"accepted_lag_{t}_s": ratio("merge_lag_total", "merge_lag_finite", p) for t, p in LAG_PAIRS.items()})
+    now, start = ({**counts, "forced": counts["forced_law"] + counts["forced_override"]} for counts in (now, start))
+    row["forced_yield_share"] = ratio("forced", "merge_closed")
+    row.update({f"forced_yield_{t}_share": ratio("forced", "merge_closed", p) for t, p in LAG_PAIRS.items()})
+    row["forced_yield_law_share"] = ratio("forced_law", "merge_closed")
+    row["forced_yield_override_share"] = ratio("forced_override", "merge_closed")
+    row["pet_mean_s"] = ratio("pet_total", "pet_count")
+    row["pet_low_share"] = ratio("pet_low", "pet_count")
+    row.update({f"pet_{t}_mean_s": ratio("pet_total", "pet_count", p) for t, p in LAG_PAIRS.items()})
+    row.update({f"pet_{t}_low_share": ratio("pet_low", "pet_count", p) for t, p in LAG_PAIRS.items()})
+    return {name: row[name] for name in ENTRY_COLUMNS}
 
 
 # Summary columns of the automated vehicles' observers, in every summary (NaN where they do not apply).
-SAFETY_COLUMNS = ("cacc_share", "aeb_per_veh_h", "harsh_human_per_veh_h", "harsh_auto_per_veh_h", "ttc_per_h",
+SAFETY_COLUMNS = ("cacc_share", "override_per_veh_h", "harsh_human_per_veh_h", "harsh_auto_per_veh_h", "ttc_per_h",
                   *(f"ttc_{p.lower()}_per_h" for p in PAIR_TYPES), "tet_s_per_h",
                   *(f"tet_{p.lower()}_s_per_h" for p in PAIR_TYPES), *(f"follow_{p.lower()}_h" for p in PAIR_TYPES),
                   "cutins_ahead_auto_per_h")
@@ -740,7 +835,7 @@ def safety_columns(sim: RingSim, now: dict, start: dict, span: float, mean: dict
     low_s = diff("pair_ttc") * sim.cfg.dt  # [s] at TTC <= TTC_CRITICAL
     episodes = diff("pair_episodes")
     row = {"cacc_share": ratio(mean["in_cacc"], mean["automated"]),
-           "aeb_per_veh_h": ratio(diff("aeb"), auto_h),
+           "override_per_veh_h": ratio(diff("override"), auto_h),
            "harsh_human_per_veh_h": ratio(diff("emergency") - diff("emergency_auto"), human_h),
            "harsh_auto_per_veh_h": ratio(diff("emergency_auto"), auto_h),
            "ttc_per_h": ratio(episodes.sum(), follow_h.sum())}
@@ -769,7 +864,8 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int], tap
     engine's counters, so they count exactly the events inside the window
     (``mean_entry_delay`` too: the queue wait of exactly the cars that entered
     in it, those of the capacity test's entrance left out; and ``entry_vc``;
-    and the capacity test's flows). ``stop_go_onset``
+    and the capacity test's flows; and the entries' conflicts and the delays
+    by entrant class, :func:`entry_columns`). ``stop_go_onset``
     and ``congestion_onset`` are measured from the start of the run.
     ``entry_los`` is the one text column. Metrics that share a parameter's
     name get a ``measured_`` prefix. The capacity test's gap statistics come
@@ -835,6 +931,7 @@ def summarise(sim: RingSim, rec: Recorder, t0: float, start: dict[str, int], tap
         **subject_columns(sim, now, start, t0,
                           tap if tap is not None or not sim.subject else SubjectTap.from_logs(sim, t0)),
         **safety_columns(sim, now, start, span, mean),
+        **entry_columns(now, start),
     }
     # Measurements named like a parameter (density, mean_speed, ...) must not overwrite its setting.
     renames = measured_names(row)
@@ -1190,8 +1287,8 @@ def plan_repeats(design: Design, jobs: list[tuple], configs: list[SimConfig], se
 
 def _sample_groups(args: argparse.Namespace) -> list[str] | None:
     """--sample-groups as the tabs name them, in tab order ("drivers , ROAD" -> ["Road", "Drivers"]), or
-    None for the default groups (presets.DEFAULT_GROUPS: every group but AVs, Coop and Smoothers); ValueError for
-    an unknown one."""
+    None for the default groups (presets.DEFAULT_GROUPS: every group but AVs, Coop, Entries and Smoothers);
+    ValueError for an unknown one."""
     from roundabout_sim import presets
 
     if not args.sample_groups:
@@ -1202,8 +1299,8 @@ def _sample_groups(args: argparse.Namespace) -> list[str] | None:
 def _sample(given: list[tuple[str, str]], base: Base, args: argparse.Namespace,
             parser: argparse.ArgumentParser) -> Design:
     """``--sample N`` points: a Latin hypercube over the --vary ranges, else over the plausible ranges
-    (presets.RANDOM_RANGES) of every parameter (but the AVs, Coop and Smoothers tabs', which only --sample-groups
-    draws: presets.OPT_IN_GROUPS), or of the --sample-groups ones, not set explicitly.
+    (presets.RANDOM_RANGES) of every parameter (but the AVs, Coop, Entries and Smoothers tabs', which only
+    --sample-groups draws: presets.OPT_IN_GROUPS), or of the --sample-groups ones, not set explicitly.
 
     Without --vary every plausible range is cut into N strata, each sampled
     once, and each list of choices (lanes, entrances, road condition, ...) is
@@ -1309,16 +1406,31 @@ def _road(cfg: SimConfig) -> str:
 def _describe(cfg: SimConfig) -> str:
     road = f", {cfg.road_condition} road" if cfg.road_condition != "dry" else ""
     trucks = f", {100 * cfg.truck_share:g} % trucks of {cfg.truck_length:g} m" if cfg.truck_share > 0 else ""
+    if cfg.truck_share > 0 and cfg.truck_follow_up != 1 and cfg.n_arms > 0:
+        trucks += f" (follow-up behind one x {cfg.truck_follow_up:g})"
     if cfg.auto_share > 0:
         brands = f" of {cfg.companies} companies" if cfg.companies > 1 else ""
-        gap = {"robotaxi": f" (time gap x {cfg.robotaxi_headway:g})",
+        entries = cfg.n_arms > 0  # (the entry factors: engine RingSim._entry_check, _follow_up_slack)
+        gap = {"robotaxi": f" (time gap x {cfg.robotaxi_headway:g}"
+                           + (f", entry gap and follow-up x {cfg.robotaxi_entry:g}" if entries else "") + ")",
                "acc": f" (time gap {cfg.acc_headway:g} s, dead time {cfg.acc_delay:g} s)",
                "cav": f" (CACC {cfg.cav_headway:g} s, strings of <= {cfg.platoon_max}, cooperation {cfg.coop_class}"
                       + (f", {cfg.coop_between} between companies" if cfg.companies > 1 and cfg.coop_between != "same"
-                         else "") + ")"}[cfg.auto_kind]
+                         and cfg.coop_class != "D" else "")
+                      + (f", entry gap x {cfg.cav_entry_gap:g}, follow-up x {cfg.cav_follow_up:g}" if entries else "")
+                      + ")"}[cfg.auto_kind]
         if cfg.companies > 1 and cfg.brand_spread > 0 and cfg.auto_kind != "robotaxi":
             brands += f", brand spread {cfg.brand_spread:g}"
+        # (the driverless kinds' weather policy: engine av_road_factors, RingSim._handed_over)
+        if not inactive_reason("av_weather_scale", cfg) and cfg.av_weather_scale != 1:
+            brands += f", AV weather effect {cfg.av_weather_scale:g}"
+        if not inactive_reason("av_handover", cfg) and cfg.av_handover > 0:
+            brands += f", {cfg.av_handover:g} s handover at the yield line"
         trucks += f", {100 * cfg.auto_share:g} % automated: {cfg.auto_kind}{gap}{brands}"
+    # (drivers' adaptation to recognisable AVs: engine RingSim._entry_check, _lane_changes, _car_following)
+    adapt = [text for name, text in (("exploit_gap", f"gap ahead of AVs x {cfg.exploit_gap:g}"),
+                                     ("follow_adapt", f"following AVs {cfg.follow_adapt:g}"))
+             if not inactive_reason(name, cfg) and getattr(cfg, name) != getattr(SimConfig, name)]
     if cfg.smoothers > 0:
         law = {"followerstopper": f"FollowerStopper at {cfg.smoother_speed:g} m/s", "pi": "PI with saturation",
                "quiet": "quiet placebo"}[cfg.smoother_law]
@@ -1326,6 +1438,8 @@ def _describe(cfg: SimConfig) -> str:
             f" in lane {min(cfg.smoother_lane, cfg.n_lanes - 1) + 1}"
         start = f" from {cfg.smoother_start:g} s" if cfg.smoother_start > 0 else ""
         trucks += f", {cfg.smoothers} smoother{'s' * (cfg.smoothers != 1)} ({law}{start}){lane}"
+    if adapt:
+        trucks += f", drivers: {', '.join(adapt)}"
     reaction = f" ± {cfg.reaction_std:g}" if cfg.reaction_std > 0 else ""
     headway = f" ± {cfg.headway_std:g}" if cfg.headway_std > 0 else ""
     return (f"{_road(cfg)}, radius {cfg.radius:g} m{road}, car {cfg.car_length:g} m{trucks} | "
@@ -1340,8 +1454,11 @@ def _demand(cfg: SimConfig) -> str:
     """Open-mode demand in words (the density above is then only the start)."""
     shape = "peak profile" if cfg.demand_profile == "peak" else "constant"
     imbalance = f", imbalance {cfg.demand_imbalance:g}" if cfg.demand_imbalance else ""
+    exiting = f", {100 * cfg.subject_exiting:g} % of its feeding entrants leaving at its exit" \
+        if cfg.subject_arm == "on" and cfg.subject_exiting > 0 else ""
+    test = f", capacity test at the bottom entrance{exiting}" if cfg.subject_arm == "on" and cfg.n_arms > 0 else ""
     return (f"open demand {cfg.entry_rate:g}/s per entrance ({3600 * cfg.entry_rate:.0f} veh/h, {shape}{imbalance}), "
-            f"max queue {cfg.max_queue}, entry gap {cfg.entry_gap:g} s, follow-up {cfg.follow_up:g} s")
+            f"max queue {cfg.max_queue}, entry gap {cfg.entry_gap:g} s, follow-up {cfg.follow_up:g} s{test}")
 
 
 def _open(cfg: SimConfig) -> bool:
@@ -1498,7 +1615,7 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
              if cfg.auto_kind == "cav" else [])]
           if cfg.auto_share > 0 else []),
         # (the safety measures: with any automated vehicle, wave smoothers too, under their controllers)
-        *([("Safety layer (AEB)", _fmt(summary["aeb_per_veh_h"], 1), "interventions per automated vehicle-hour"),
+        *([("Safety override", _fmt(summary["override_per_veh_h"], 1), "interventions per automated vehicle-hour"),
            ("Harsh braking, human / automated",
             f"{_fmt(summary['harsh_human_per_veh_h'], 2)} / {_fmt(summary['harsh_auto_per_veh_h'], 2)}",
             "episodes per vehicle-hour"),
@@ -1506,6 +1623,22 @@ def cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
             " / ".join(_fmt(summary[f"ttc_{p.lower()}_per_h"], 1) for p in PAIR_TYPES),
             "episodes per hour of following (follower first; A = recognisable AV)")]
           if cfg.auto_share > 0 or cfg.smoothers > 0 else []),
+        # (the entries' conflicts and the delays by entrant class: with automated vehicles at entrances)
+        *([("Entry delay, human / coop CAV / other",
+            " / ".join(_fmt(summary[f"entry_delay_{c}_s"], 1) for c in ENTRANT_CLASSES),
+            "s queue wait by entrant class (other: automated, no cooperating CAV)"),
+           ("Control delay, human / coop CAV / other",
+            " / ".join(_fmt(summary[f"control_delay_{c}_s"], 1) for c in ENTRANT_CLASSES),
+            "s (queue wait + ring time - the trip at free speed)"),
+           ("Accepted lag, H / A lag vehicle",
+            f"{_fmt(summary['accepted_lag_h_s'])} / {_fmt(summary['accepted_lag_a_s'])}",
+            "s (bumper gap / its speed; A = recognisable AV)"),
+           ("Forced yields, H / A lag vehicle",
+            f"{_pct(summary['forced_yield_h_share'])} / {_pct(summary['forced_yield_a_share'])}",
+            f"% of entries with a lag vehicle (it braked harder than comfortably within {FORCED_WINDOW:g} s)"),
+           ("PET at the entries", f"{_fmt(summary['pet_mean_s'])} s, {_pct(summary['pet_low_share'])}",
+            f"% below {PET_CRITICAL:g} s (mean over PETs up to {PET_MAX:g} s)")]
+          if (cfg.auto_share > 0 or cfg.smoothers > 0) and cfg.n_arms > 0 else []),
         ("Flux (whole ring)", _fmt(summary["flux"], 3), "cars/s"),
         ("Flux (detector)", _fmt(summary["detector_flux"], 3), "cars/s"),
         ("Jammed cars (congestion)", _pct(summary["jam_fraction"]),
@@ -1592,7 +1725,14 @@ IDLE_FIX = {"open mode only": "add --set traffic_mode=open, or vary traffic_mode
             "companies alike": "set brand_spread above 0 (acc or cav) or coop_between=none (cav), or vary them too",
             "no smoothers": "set smoothers above 0, or vary it too",
             "no FollowerStopper": "set smoother_law=followerstopper, or vary it too",
-            "one lane": "set n_lanes above 1, or vary it too"}
+            "one lane": "set n_lanes above 1, or vary it too",
+            "class D": "set coop_class below D, or vary it too",
+            "no capacity test": "set subject_arm=on (open mode, with entrances), or vary it too",
+            "no driverless vehicles": "set auto_kind to cav or robotaxi and auto_share above 0, or vary them too",
+            "no recognisable AVs": "set auto_kind to cav or robotaxi and auto_share above 0, or smoothers above 0",
+            "no merges": "set n_arms above 0 or n_lanes above 1, or vary them too",
+            "no snow or ice": "set road_condition to snow or ice, or vary it too",
+            "no weather effect": "set weather_scale above 0, or vary it too"}
 
 
 def idle_notes(names, configs: list[SimConfig]) -> list[str]:
@@ -1760,7 +1900,7 @@ def cmd_sweep(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None
         else:
             groups = _sample_groups(args)
             drawn = f"the {and_join(groups)} settings" if groups else \
-                "every setting but the AVs, Coop and Smoothers ones"
+                "every setting but the AVs, Coop, Entries and Smoothers ones"
             how = f"{len(design.points)} random points (Latin hypercube over the plausible ranges of {drawn})"
         kind = "random sample" if design.kind == "sample" else "plan"
         if nothing:

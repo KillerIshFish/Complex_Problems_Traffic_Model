@@ -1,9 +1,10 @@
 """The ACC and CACC controllers (SPEC 2, 4): the PATH ACC law (Milanes & Shladover 2014 Eq. 5) with its speed mode
-(Xiao et al. 2017 Eq. 2), the Xiao 2017 Eqs. 6-7 spacing margins at their breakpoints, PATH CACC (FHWA-OR-RD-22-11
+(Xiao et al. 2017 Eq. 2), the flat spacing margins (Xiao 2017 Eqs. 6-7 at low speed), PATH CACC (FHWA-OR-RD-22-11
 Eqs. 7-3 to 7-6) behind a cooperating CAV and the ACC law at the fallback gap otherwise, against hand-computed
 values; the controllers' settings, dead time and brand factors; CACC gating by cooperation class, company and
 coop_between; string positions with the platoon_max cut (the CAV that would be member platoon_max + 1 keeps 1.5 s)
-and loops; the safety layer and its counter; the CACC law at time steps longer than its update period; and the
+and loops; the clip and the safety override with its counter; the CACC law at time steps longer than its update
+period; and the
 controllers' behaviour in a platoon (an ACC platoon amplifies a leader's speed dip, a CACC string attenuates it)."""
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 
 from roundabout_sim.config import SimConfig
-from roundabout_sim.engine import (ACC, ACC_DEAD_MAX, ACC_GAP_MIN, ACC_K1, ACC_K2, ACC_S0, ACC_SPEED_GAIN, CACC_GAIN_GAP,
+from roundabout_sim.engine import (ACC, ACC_DEAD_MAX, ACC_K1, ACC_K2, ACC_S0, ACC_SPEED_GAIN, CACC_GAIN_GAP,
                                    CACC_KD, CACC_KP, CACC_PERIOD, CACC_S0, CAV, CAV_PLATOON_GAP, COOP_CLASSES, HUMAN,
                                    ROBOTAXI, TRUCK_HEADWAY_FACTOR, RingSim, _chain_depth, road_factors)
 
@@ -47,15 +48,15 @@ def controller_state(sim):
 
 
 # ------------------------------------------------------------------ the spacing margins
-def test_the_xiao_margins_at_their_breakpoints():
-    """Xiao 2017 Eq. 6 (ACC: d0 = 7 m, 75/v, 5 m) and Eq. 7 (CACC: d0 = 6.25 - 0.125 v, 5 m), less the 5 m vehicle
-    length they include."""
-    acc = RingSim.acc_margin(np.array([0.0, 5.0, 10.8, 10.8001, 12.0, 15.0, 20.0, 30.0]))
-    np.testing.assert_allclose(acc, [2.0, 2.0, 2.0, 75 / 10.8001 - 5, 1.25, 0.0, 0.0, 0.0], rtol=1e-12)
-    assert ACC_S0 == 2.0 and acc[3] == pytest.approx(1.944, abs=1e-3)  # (the source's own step at 10.8 m/s)
-    cacc = RingSim.cacc_margin(np.array([0.0, 4.0, 8.0, 10.0, 12.0]))
-    np.testing.assert_allclose(cacc, [1.25, 0.75, 0.25, 0.0, 0.0], atol=1e-12)
-    assert CACC_S0 == 1.25
+def test_the_margins_are_flat_at_xiaos_low_speed_values():
+    """Changed on purpose (the S2 decision on Xiao's margins): ACC 2.0 m (Xiao 2017 Eq. 6's d0 = 7 m for v <= 10.8 m/s
+    less the 5 m vehicle length) and CACC 1.25 m (Eq. 7 at v = 0) at every speed: taken at the car's own speed the
+    full margins acted as time-gap terms (the ACC one made 3.9 % of the reachable settings locally unstable, the CACC
+    one a 0.7 s string amplify below 10 m/s)."""
+    speeds = np.array([0.0, 5.0, 10.8, 10.8001, 12.0, 15.0, 20.0, 30.0])
+    np.testing.assert_array_equal(RingSim.acc_margin(speeds), np.full(speeds.size, 2.0))
+    np.testing.assert_array_equal(RingSim.cacc_margin(speeds), np.full(speeds.size, 1.25))
+    assert ACC_S0 == 2.0 and CACC_S0 == 1.25
 
 
 # ------------------------------------------------------------------ the laws
@@ -81,18 +82,18 @@ def test_the_acc_law_and_its_speed_mode_against_hand_values():
 
 def test_the_cacc_law_against_hand_values():
     """e = gap - s0 - Tc v, edot = (v_lead - v) - Tc a_now, a = (0.45 e + 0.0125 edot) / 0.1 = 4.5 e + 0.125 edot,
-    for a CAV directly behind a cooperating CAV (string position 2), with Xiao's CACC margin at its speed."""
+    for a CAV directly behind a cooperating CAV (string position 2), with the CACC margin (flat 1.25 m)."""
     assert (CACC_KP, CACC_KD, CACC_PERIOD) == (0.45, 0.0125, 0.1)
-    sim, slots = lane_of([HUMAN, CAV, CAV], [0.0, 20.0, 5.0], [6.0, 6.5, 6.0])
+    sim, slots = lane_of([HUMAN, CAV, CAV], [0.0, 20.0, 5.9], [6.0, 6.5, 6.0])
     sim.a_now[slots[2]] = 0.2
     idx, v, ld, g = controller_state(sim)
     k = np.flatnonzero(idx == slots[2])
     assert sim.string_pos[slots].tolist() == [0, 1, 2]  # (behind a human: a string leader, then a member)
-    assert sim.headway[slots[2]] == 0.7 and sim.s0[slots[2]] == pytest.approx(1.25 - 0.125 * 6.0)
-    e = 5.0 - 0.5 - 0.7 * 6.0  # 0.3
+    assert sim.headway[slots[2]] == 0.7 and sim.s0[slots[2]] == 1.25
+    e = 5.9 - 1.25 - 0.7 * 6.0  # 0.45
     edot = (6.5 - 6.0) - 0.7 * 0.2  # 0.36
     a = sim._law_cav(idx[k], v[k], np.array([12.0]), ld[k], g[k], np.zeros(1))
-    assert a[0] == pytest.approx((0.45 * e + 0.0125 * edot) / 0.1) and a[0] == pytest.approx(1.395)
+    assert a[0] == pytest.approx((0.45 * e + 0.0125 * edot) / 0.1) and a[0] == pytest.approx(2.07)
     assert sim._law_cav(idx[k], v[k], np.array([6.5]), ld[k], g[k], np.zeros(1))[0] == pytest.approx(0.2)  # speed
 
 
@@ -109,9 +110,9 @@ def test_a_cav_behind_anything_else_follows_by_the_acc_law_at_its_fallback_gap_w
 
 # ------------------------------------------------------------------ settings, dead time, brands
 def test_the_controllers_settings_dead_time_and_brand_factors():
-    """ACC car: T = ACC time gap x brand x road factor, at least ACC_GAP_MIN (a truck x 1.5 on top), dead time ACC
-    dead time x brand, at most ACC_DEAD_MAX, in the delay buffer, no spread; company k of n gets 1 + spread (2k/(n-1)
-    - 1). A CAV: its ACC-fallback gap the same way, no dead time. Changed live, they follow at once."""
+    """ACC car: T = ACC time gap x brand x road factor, no floor since the flat margin (a truck x 1.5 on top), dead
+    time ACC dead time x brand, at most ACC_DEAD_MAX, in the delay buffer, no spread; company k of n gets 1 + spread
+    (2k/(n-1) - 1). A CAV: its ACC-fallback gap the same way, no dead time. Changed live, they follow at once."""
     cfg = SimConfig(seed=3, auto_share=1.0, auto_kind="acc", companies=3, brand_spread=0.5, truck_share=0.3,
                     acc_delay=0.6, acc_headway=1.2, density=40, headway_std=0.3, reaction_std=0.2, speed_std=1.5)
     sim = RingSim(cfg)
@@ -120,8 +121,8 @@ def test_the_controllers_settings_dead_time_and_brand_factors():
     brand = 1.0 + 0.5 * (2.0 * k / 2 - 1.0)
     assert set(np.round(brand, 12)) == {0.5, 1.0, 1.5}
     np.testing.assert_array_equal(sim._brand(sim.company[live]), brand)
-    gap = np.maximum(1.2 * brand * 1.0, ACC_GAP_MIN)  # (brand 0.5: 0.6 s, kept at 0.7 s)
-    assert ACC_GAP_MIN == 0.7 and ACC_DEAD_MAX == 0.6 and set(np.round(gap, 12)) == {0.7, 1.2, 1.8}
+    gap = 1.2 * brand * 1.0  # (brand 0.5: 0.6 s; the floor of 0.7 s went with Xiao's speed term)
+    assert ACC_DEAD_MAX == 0.6 and set(np.round(gap, 12)) == {0.6, 1.2, 1.8}
     np.testing.assert_array_equal(sim.headway[live], np.where(sim.truck[live], TRUCK_HEADWAY_FACTOR * gap, gap))
     np.testing.assert_array_equal(sim.delay[live], np.rint(np.minimum(0.6 * brand, ACC_DEAD_MAX) / 0.1).astype(int))
     assert set(sim.delay[live]) == {3, 6} and (sim.s0[live] == ACC_S0).all()  # (brand 1.5: 0.9 s, kept at 0.6 s)
@@ -136,7 +137,7 @@ def test_the_controllers_settings_dead_time_and_brand_factors():
     np.testing.assert_allclose(two._brand(np.array([0, 1, -1])), [0.7, 1.3, 1.0])
     cav = RingSim(cfg.updated(auto_kind="cav"))
     c = np.flatnonzero(cav.alive)
-    fb = np.maximum(cav.acc_gap[c] * cav._brand(cav.company[c]), ACC_GAP_MIN)
+    fb = cav.acc_gap[c] * cav._brand(cav.company[c])
     np.testing.assert_array_equal(cav.headway[c], np.where(cav.truck[c], TRUCK_HEADWAY_FACTOR * fb, fb))
     assert (cav.delay[c] == 0).all() and set(np.unique(cav.acc_gap[c])) <= {1.1, 1.6, 2.2}
 
@@ -165,7 +166,7 @@ def test_string_positions_and_the_platoon_max_cut():
     T = sim.headway[slots]
     assert T[1] == 1.1 and (T[2:9] == 0.7).all() and T[9] == 1.5 and (T[10:] == 0.7).all()
     s0 = sim.s0[slots]
-    assert s0[1] == 2.0 and np.allclose(s0[2:], 1.25 - 0.125 * 6.0)  # ACC margin for the leader, CACC behind
+    assert s0[1] == 2.0 and (s0[2:] == 1.25).all()  # ACC margin for the leader, CACC behind
     # platoon_max 1: no strings, every CAV behind a CAV keeps the 1.5 s gap
     assert not sim.set(platoon_max=1)
     controller_state(sim)
@@ -220,10 +221,13 @@ def test_cacc_needs_class_a_or_more_between_the_pair(coop_class, coop_between, c
     assert (level >= COOP_CLASSES.index("A")) == joined
 
 
-# ------------------------------------------------------------------ the safety layer
-def test_the_safety_layer_clips_then_brakes_as_the_idm_and_counts_episodes():
-    """Clip to [-max_decel, accel], then a = min(a, a_idm) where a_idm < -comfortable braking; an activation is
-    a_idm below the law's own command, counted once per episode (per-car hold of 2 s)."""
+# ------------------------------------------------------------------ the clip and the safety override
+def test_the_clip_then_the_safety_override_after_the_dead_time_with_its_episodes():
+    """Changed on purpose (the S2 decision on the safety layer): _automated_limits only clips to [-max_decel, accel]
+    before over_braking and the delay buffer; the override a = min(a, a_idm) where a_idm < -comfortable braking acts
+    after the buffer (_safety_override: no ACC dead time), its demand beyond the braking limit counts as harsh
+    braking, and an activation (a step where it lowers the command it acts on) is counted once per episode
+    (per-car hold of 2 s) as n_override (it was n_aeb)."""
     sim, slots = lane_of([ACC] * 6, [0.0] + [30.0] * 5, [5.0] * 6, auto_kind="acc")
     idx = slots[[1, 2, 3, 4, 5]]
     b, md, a_max = sim.eff.comfort_decel, sim.eff.max_decel, sim.eff.max_accel
@@ -231,34 +235,50 @@ def test_the_safety_layer_clips_then_brakes_as_the_idm_and_counts_episodes():
     law = np.array([1.0, -12.0, 0.5, -5.0, 3.0])
     a_idm = np.array([-3.0, -1.0, -1.5, -10.0, 0.4])
     acc = law.copy()
-    sim._automated_limits(idx, acc, a_idm)
+    pending = sim._automated_limits(idx, acc, a_idm)
+    np.testing.assert_array_equal(acc, [1.0, -9.0, 0.5, -5.0, 1.2])  # (the clip only)
+    np.testing.assert_array_equal(pending[0], np.arange(5))
+    np.testing.assert_array_equal(pending[1], a_idm)
+    over = np.zeros(5, dtype=bool)
+    sim._safety_override(idx, acc, pending, over)
     np.testing.assert_array_equal(acc, [-3.0, -9.0, 0.5, -10.0, 1.2])
-    assert sim.n_aeb == 2 and (sim.aeb_until[idx[[0, 3]]] == sim.time + 2.0).all()
+    assert over.tolist() == [False, False, False, True, False]  # (-10 beyond the 9 m/s2 limit: harsh)
+    assert sim.n_override == 2 and (sim.override_until[idx[[0, 3]]] == sim.time + 2.0).all()
     acc = law.copy()
-    sim._automated_limits(idx, acc, a_idm)  # still under way: no new episode
-    assert sim.n_aeb == 2
+    sim._safety_override(idx, acc, sim._automated_limits(idx, acc, a_idm), over)  # still under way: no new episode
+    assert sim.n_override == 2
     sim.time += 2.5
-    sim._automated_limits(idx, law.copy(), a_idm)
-    assert sim.n_aeb == 4
-    # a robotaxi's law is its IDM: the layer never counts it, and on this road passes it unchanged
+    acc = law.copy()
+    sim._safety_override(idx, acc, sim._automated_limits(idx, acc, a_idm), over)
+    assert sim.n_override == 4
+    # after an ACC car's dead time the override acts on the delayed command: one asking for less braking than the
+    # IDM is lowered (counted), one already braking harder is left alone
+    acc = np.array([-1.0, -4.0])
+    sim.time += 2.5
+    sim._safety_override(idx[:2], acc, (np.arange(2), np.array([-3.0, -3.0])), np.zeros(2, dtype=bool))
+    np.testing.assert_array_equal(acc, [-3.0, -4.0])
+    assert sim.n_override == 5
+    # a robotaxi's law is its IDM: it gets the override in its decision (never lowering it), nothing after the buffer
     robot, rs = lane_of([ROBOTAXI] * 3, [0.0, 30.0, 30.0], [5.0] * 3, auto_kind="robotaxi")
     a = np.array([-3.0, -10.0])
     acc = a.copy()
-    robot._automated_limits(rs[1:], acc, a)
+    assert robot._automated_limits(rs[1:], acc, a) is None
     np.testing.assert_array_equal(acc, a)
-    assert robot.n_aeb == 0
+    assert robot.n_override == 0
     human = np.array([-20.0])
     plain, ps = lane_of([HUMAN, HUMAN], [0.0, 10.0], [5.0, 5.0], auto_kind="acc")
-    plain._automated_limits(ps[1:], human, np.array([-20.0]))
+    assert plain._automated_limits(ps[1:], human, np.array([-20.0])) is None
     assert human[0] == -20.0  # (human drivers: never touched)
 
 
 def test_the_safety_layer_acts_in_a_run_and_robotaxis_pass_it_unchanged_on_a_dry_road():
-    """A dense ring of ACC cars (string-unstable) calls on the safety layer; robotaxi runs are the same with the
-    layer reduced to the clip (on a dry road their commands lie within the limits it keeps)."""
+    """A dense ring of ACC cars (string-unstable) calls on the safety override; robotaxi runs are the same with the
+    layer reduced to the clip (on a dry road their commands lie within the limits it keeps). Changed on purpose (the
+    override after the dead time, the S2 decision): the ring's harsh braking, the override delayed by the ACC dead
+    time before, is gone."""
     acc = RingSim(SimConfig(seed=2, n_lanes=1, n_arms=0, density=70, auto_share=1.0, auto_kind="acc"))
     acc.step(3000)
-    assert acc.n_aeb > 0 and acc.n_emergency_auto == acc.n_emergency > 0
+    assert acc.n_override > 0 and acc.n_emergency_auto == acc.n_emergency == 0
     cfg = SimConfig(seed=5, n_lanes=3, density=60, exit_prob=0.3, auto_share=0.5, auto_kind="robotaxi")
     real, clipped = RingSim(cfg), RingSim(cfg)
     clipped._automated_limits = lambda idx, acc_, a_idm: np.copyto(
@@ -268,7 +288,7 @@ def test_the_safety_layer_acts_in_a_run_and_robotaxis_pass_it_unchanged_on_a_dry
     clipped.step(600)
     np.testing.assert_array_equal(real.theta, clipped.theta)
     np.testing.assert_array_equal(real.v, clipped.v)
-    assert real.n_aeb == 0
+    assert real.n_override == 0
 
 
 # ------------------------------------------------------------------ dt and the CACC update period
@@ -311,7 +331,7 @@ def test_the_cacc_law_at_steps_longer_than_its_update_period():
     idx, gap = sim.bumper_gaps()
     follower = int(np.flatnonzero(idx == slots[1])[0])
     assert sim.string_pos[slots[1]] == 2 and sim.headway[slots[1]] == 1.5
-    assert gap[follower] == pytest.approx(0.0 + 1.5 * 10.0, abs=0.05) and sim.v[slots[1]] == pytest.approx(10.0, abs=1e-3)
+    assert gap[follower] == pytest.approx(1.25 + 1.5 * 10.0, abs=0.05) and sim.v[slots[1]] == pytest.approx(10.0, abs=1e-3)
 
 
 # ------------------------------------------------------------------ behaviour in a platoon
@@ -320,7 +340,7 @@ def platoon(kind: str, v0: float = 20.0, depth: float = 2.0, period: float = 12.
     """A leader whose speed dips smoothly by ``depth`` m/s over ``period`` s, with ``n`` followers of ``kind`` at
     their law's equilibrium gap at ``v0`` (desired speed 25 m/s, so the speed mode stays off), alone on a 1 km
     radius ring. Returns each vehicle's dip (v0 - its lowest speed), leader first, and the simulation.
-    ``law_only``: the safety layer reduced to the clip (the controller alone)."""
+    ``law_only``: the clip only, no safety override (the controller alone)."""
     T = config.get("acc_headway", 1.1) if kind == "acc" else config.get("cav_headway", 0.7)
     s0 = RingSim.acc_margin(v0) if kind == "acc" else RingSim.cacc_margin(v0)
     gap = float(s0 + T * v0)
@@ -343,30 +363,30 @@ def platoon(kind: str, v0: float = 20.0, depth: float = 2.0, period: float = 12.
 def test_an_acc_platoon_amplifies_a_leaders_speed_dip():
     """Milanes & Shladover 2014 (Table 3, Sec. 5): the production ACC law is string-unstable. A 2 m/s dip of the
     leader over 12 s (~0.5 rad/s, near the law's peak gain) at 20 m/s, inside the calibration range, grows down a
-    platoon of 8 ACC cars, by the law alone (0.5 s dead time or none) and with the safety layer on top."""
+    platoon of 8 ACC cars, by the law alone (0.5 s dead time or none) and with the safety override on top."""
     for config in (dict(), dict(acc_delay=0.0)):
         dips, sim = platoon("acc", law_only=True, **config)
         assert dips[-1] > 1.8 * dips[0], (config, dips)
         assert (np.diff(dips[2:]) > 0).all(), dips  # (growing car after car once under way)
     dips, sim = platoon("acc")
-    assert dips[-1] > 1.8 * dips[0] and sim.n_aeb > 0  # (the safety layer steps in, and the dip still grows)
+    assert dips[-1] > 1.8 * dips[0] and sim.n_override > 0  # (the safety override steps in, the dip still grows)
 
 
 def test_a_cacc_string_attenuates_a_leaders_speed_dip():
-    """PATH CACC (string members at 0.7 s) damps the same dip car after car, without the safety layer; faster
+    """PATH CACC (string members at 0.7 s) damps the same dip car after car, without the safety override; faster
     dips more (the law is a low-pass filter, Milanes & Shladover 2014 Table 2)."""
     for depth, period in ((2.0, 12.0), (4.0, 10.0), (2.0, 6.0)):
         dips, sim = platoon("cav", depth=depth, period=period)
         assert (np.diff(dips) < 0).all() and dips[-1] < 0.98 * dips[0], (depth, period, dips)
         # (alone in the lane the platoon is a loop: its leader, the lowest uid, leads it at position 21)
-        assert sim.n_aeb == 0 and sorted(sim.string_pos[sim.alive].tolist()) == [2, 3, 4, 5, 6, 7, 8, 9, 21]
+        assert sim.n_override == 0 and sorted(sim.string_pos[sim.alive].tolist()) == [2, 3, 4, 5, 6, 7, 8, 9, 21]
 
 
-def test_below_10_ms_the_cacc_margin_makes_the_string_mildly_amplify():
-    """Xiao 2017 Eq. 7's margin falls 0.125 m per m/s below 10 m/s, so the gap regulated is (Tc - 0.125 s) v + 1.25
-    m: at Tc 0.7 s the string is then slightly string-unstable at low frequency (*derived*, linearised: peak |G|
-    1.04 per car), as the engine shows for the same dip at 8 m/s; at Tc 0.9 s it damps again."""
+def test_below_10_ms_the_flat_cacc_margin_keeps_the_string_damping():
+    """Changed on purpose (flat margins): Xiao 2017 Eq. 7's margin fell 0.125 m per m/s below 10 m/s, so a 0.7 s string
+    regulated (Tc - 0.125 s) v + 1.25 m and amplified a dip mildly at 8 m/s (x1.065 over 8 cars). Flat, it damps
+    there too (string-stable iff Tc >= sqrt(2 CACC_PERIOD / kp) = 0.667 s, *derived*); at Tc 0.6 s it amplifies."""
     dips, _ = platoon("cav", v0=8.0)
-    assert 1.0 < dips[-1] / dips[0] < 1.15 and (np.diff(dips) > 0).all()
-    dips, _ = platoon("cav", v0=8.0, cav_headway=0.9)
-    assert dips[-1] < dips[0]
+    assert (np.diff(dips) < 0).all() and dips[-1] < dips[0], dips
+    dips, _ = platoon("cav", v0=8.0, cav_headway=0.6)
+    assert dips[-1] > dips[0], dips

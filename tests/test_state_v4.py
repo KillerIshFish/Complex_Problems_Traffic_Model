@@ -22,30 +22,36 @@ from roundabout_sim.metrics import Recorder
 from tests.helpers import frames
 from tests.test_state import assert_exact_resume
 from tests.test_state_migration import as_version_1, trajectory
-from tests.test_state_v3 import as_version_2
+from tests.test_state_v3 import V2_NAMES, V3_NAMES, as_version_2
 
 V4_SETTINGS = {"acc_headway", "acc_delay", "cav_headway", "platoon_max", "coop_class", "coop_between", "brand_spread",
                "smoothers", "smoother_law", "smoother_speed", "smoother_start", "smoother_lane"}  # (+ the smoothers')
-V4_NAMES = V4_SETTINGS | {"string_pos", "aeb_until", "ttc_until", "n_aeb", "n_emergency_auto", "n_auto_steps",
+# (the safety layer's counts under their names since version 5: n_override, override_until; version 4 saved them as
+# n_aeb, aeb_until, engine.RENAMED)
+V4_NAMES = V4_SETTINGS | {"string_pos", "override_until", "ttc_until", "n_override", "n_emergency_auto", "n_auto_steps",
                           "n_human_steps", "n_cutins_auto", "pair_follow_steps", "pair_ttc_steps", "pair_ttc_episodes",
                           "v_cmd", "smoother_on", "speed_count", "speed_hist"}
 OPEN = dict(traffic_mode="open", entry_rate=0.25, n_lanes=2, truck_share=0.1, follow_up=2.5, min_gap=1.5)
 
 
+LATER = set(ADDED) - V2_NAMES - V3_NAMES - V4_NAMES  # (version 5 on: the entries by kind, test_state_v5)
+
+
 def as_version_3(sim_state: dict) -> dict:
-    """``sim_state`` (RingSim.state_dict) as S1 saved it: version 3, without what version 4 added."""
+    """``sim_state`` (RingSim.state_dict) as S1 saved it: version 3, without what versions 4 and on added."""
     meta, arrays = copy.deepcopy(sim_state["meta"]), dict(sim_state["arrays"])
     meta["version"] = 3
-    for name in V4_NAMES:
+    for name in V4_NAMES | LATER:
         meta["config"].pop(name, None)
         meta["counters"].pop(name, None)
+        meta["logs"].pop(name, None)  # (version 5 added event logs: merge_log, merge_pending)
         arrays.pop(name, None)
     return {"meta": json.loads(json.dumps(meta)), "arrays": arrays}
 
 
 def assert_v4_fills(old: RingSim) -> None:
     assert all(getattr(old.cfg, name) == ADDED[name] for name in V4_SETTINGS)
-    assert (old.string_pos == 0).all() and np.isneginf(old.aeb_until).all() and np.isneginf(old.ttc_until).all()
+    assert (old.string_pos == 0).all() and np.isneginf(old.override_until).all() and np.isneginf(old.ttc_until).all()
     assert (old.v_cmd == 0).all() and not old.smoother_on.any() and (old.speed_count == 0).all()
     assert old.speed_hist.shape == (0, old.cap) and not old.smoothing
     assert all(getattr(old, name) == 0 for name in V4_NAMES & set(COUNTERS))
@@ -55,9 +61,9 @@ def assert_v4_fills(old: RingSim) -> None:
 
 # ------------------------------------------------------------------ the registry
 def test_version_4_registers_the_controllers_and_the_safety_counts():
-    assert STATE_VERSION == 4 and state.FORMAT_VERSION == 1
+    assert STATE_VERSION >= 4 and state.FORMAT_VERSION == 1  # (5 since the entries by kind: test_state_v5)
     assert V4_NAMES <= set(ADDED)
-    assert {"string_pos", "aeb_until", "ttc_until"} <= set(CAR_ARRAYS) and set(PAIR_ARRAYS) <= set(ADDED)
+    assert {"string_pos", "override_until", "ttc_until"} <= set(CAR_ARRAYS) and set(PAIR_ARRAYS) <= set(ADDED)
     defaults = SimConfig()
     assert all(ADDED[name] == getattr(defaults, name) for name in V4_SETTINGS)
     assert ADDED["coop_class"] == "B" and ADDED["coop_between"] == "same" and ADDED["platoon_max"] == 8
@@ -169,7 +175,7 @@ def test_a_version_3_file_resumes_in_the_viewer_with_its_charts(new_app, tmp_pat
     rows["arrays"] = {**rows["arrays"], "values": rows["arrays"]["values"][:, keep],
                       "kinds": rows["arrays"]["kinds"][:, keep]}
     meta = {**saved.meta, "sim": v3["meta"], "rec": rows["meta"],
-            "settings": {k: v for k, v in saved.meta["settings"].items() if k not in V4_NAMES}}
+            "settings": {k: v for k, v in saved.meta["settings"].items() if k not in V4_NAMES | LATER}}
     old = tmp_path / "v3_state.npz"
     np.savez(old, meta_json=np.array(json.dumps(meta)), **{f"sim.{k}": v for k, v in v3["arrays"].items()},
              **{f"rec.{k}": v for k, v in rows["arrays"].items()})

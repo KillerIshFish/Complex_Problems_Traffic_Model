@@ -349,10 +349,10 @@ def test_invalid_values_are_refused(bad):
 
 
 def test_random_settings_leave_the_av_tabs_alone_unless_named():
-    """--random / --sample draw every group but AVs and Coop (and Smoothers) by default (human-only designs
+    """--random / --sample draw every group but AVs and Coop (and Entries, Smoothers) by default (human-only designs
     reproduce); named, those are drawn like any other, on their slider steps."""
-    assert presets.OPT_IN_GROUPS == ("AVs", "Coop", "Smoothers") and set(presets.DEFAULT_GROUPS) == \
-        set(presets.GROUPS) - {"AVs", "Coop", "Smoothers"}
+    assert presets.OPT_IN_GROUPS == ("AVs", "Coop", "Entries", "Smoothers") and set(presets.DEFAULT_GROUPS) == \
+        set(presets.GROUPS) - {"AVs", "Coop", "Entries", "Smoothers"}
     av_names = {p.name for p in PARAMS if p.group in ("AVs", "Coop")}  # (the ACC/CACC and cooperation ones too)
     assert {"auto_share", "auto_kind", "robotaxi_headway", "companies", "acc_headway", "coop_class"} <= av_names
     for seed in range(20):

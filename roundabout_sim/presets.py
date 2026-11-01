@@ -15,8 +15,8 @@ single-lane 18.25 m radius, the Etoile's exit chance 0.17); the viewers show
 them exactly.
 
 ``random_changes`` draws a plausible value for every parameter (or for the
-given groups; the automated-vehicle, cooperation and smoother tabs only when
-named, OPT_IN_GROUPS) from ``RANDOM_RANGES``: real-world distributions rather than the
+given groups; the automated-vehicle tabs, OPT_IN_GROUPS: AVs, Coop, Entries and
+Smoothers, only when named) from ``RANDOM_RANGES``: real-world distributions rather than the
 whole slider ranges, linked where real roundabouts link them (the radius
 follows the lane count, the demand the layout's capacity, ...). It is
 reproducible by seed, and its values sit on the sliders' steps.
@@ -59,7 +59,7 @@ DEFAULTS = SimConfig()
 GROUPS: tuple[str, ...] = tuple(dict.fromkeys(p.group for p in PARAMS))  # slider groups, in tab order
 # Groups drawn only when named (random_changes, plausible_ranges; --random and --sample draw the others by
 # default), so human-only random settings and designs stay what they were before automated vehicles (SPEC 0.4).
-OPT_IN_GROUPS = ("AVs", "Coop", "Smoothers")
+OPT_IN_GROUPS = ("AVs", "Coop", "Entries", "Smoothers")
 DEFAULT_GROUPS: tuple[str, ...] = tuple(g for g in GROUPS if g not in OPT_IN_GROUPS)
 FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SimConfig))  # every SimConfig field, also those without a slider
 
@@ -853,6 +853,9 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
     "subject_arm": Choice(("off",), (1.0,),
                           "A measuring instrument (a saturated test entrance), not a feature of real roundabouts: "
                           "never drawn on (model)."),
+    "subject_exiting": Choice((0.0,), (1.0,),
+                              "The capacity test's exiting stream: part of the instrument, which is never drawn on "
+                              "(model)."),
     # Vehicles
     "truck_share": Numeric(0.0, 0.15, 0.05,
                            "Lorries are 1.1 % of the traffic on GB minor roads and 5.0 % on A roads (DfT 2024); "
@@ -862,6 +865,12 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
                             "US SU-30 9.14 m; EU rigid limit and SU-40 12 m; EU articulated 16.5 m; EU road train "
                             "18.75 m (NCHRP RR 1061 Table 1; Directive 96/53/EC). The default when there are no "
                             "trucks."),
+    # (on the Vehicles tab, a default group, but never drawn: random designs with trucks stay what they were)
+    "truck_follow_up": Choice((1.0,), (1.0,),
+                              "The HCM counts a truck as 2 passenger cars at an entrance (E_T = 2.0, HCM 7 Exhibit "
+                              "22-11, as cited; not checked against the HCM text). In the model 2.0 reproduces that "
+                              "with no circulating traffic and 2.4 over 0-820 veh/h (capacity test, 10 % trucks; "
+                              "derived). Never drawn (1 = the model before); vary it by name."),
     # Drivers
     "mean_speed": Numeric(8.0, 14.0, 11.0,
                           "Maximum entry design speeds 30-40 km/h single-lane and 40-50 km/h multilane (NCHRP 672 "
@@ -905,6 +914,16 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
                              "The NCHRP 672 speed-radius relation (Eq. 6-1) implies 3.0 m/s2 at 20 m and 2.4 at "
                              "50 m; the Sugiyama drivers used about 3.4. Drawn as Eq. 6-1 at the drawn radius "
                              "x LATERAL_SPREAD."),
+    # (drivers' adaptation to recognisable AVs: on the Drivers tab, but AV settings, never drawn, so random designs of
+    # the drivers stay what they were; vary them by name)
+    "exploit_gap": Choice((1.0,), (1.0,),
+                          "How drivers judge gaps ahead of recognisable AVs: 0.79 for cut-ins ahead of Waymos "
+                          "(Alhuraish et al. 2026, preprint), above 1 in a simulator (Reddy et al. 2025). An AV "
+                          "setting: never drawn (1 = as ahead of any car); vary it by name."),
+    "follow_adapt": Choice((0.0,), (1.0,),
+                           "How far drivers behind recognisable AVs close up and start sooner (Wang et al. 2023 via "
+                           "Reddy et al. 2025: 1 = the measured change). An AV setting: never drawn (0); vary it by "
+                           "name."),
     # Lane changing
     "lane_change_rate": Numeric(0.05, 0.5, 0.2,
                                 "No source gives how often drivers consider a change (MOBIL defines the decision, "
@@ -958,6 +977,26 @@ RANDOM_RANGES: dict[str, Numeric | Choice] = {
                             "How much brands' ACC settings differ: 0.6 around 1.3 s spans the 0.54-2.05 s time gaps "
                             "Gunter et al. 2019 (Table II) fitted over production cars; 0 = alike (typical "
                             "assumed)."),
+    # Entries by kind (OPT_IN_GROUPS too)
+    "cav_entry_gap": Numeric(0.85, 1.0, 1.0,
+                             "FHWA-OR-RD-22-11 Sec. 7.3.2: CAVs accepted the gaps drivers accept (their lower Raff "
+                             "critical headway came from short rejected gaps): 1, typical; Guerrieri et al. 2024's "
+                             "HCM-calibrated 4.2 against 4.98 s at 100 % CAVs is 0.84 (derived)."),
+    "cav_follow_up": Numeric(0.7, 1.0, 0.74,
+                             "FHWA-OR-RD-22-11 Table 7.1 (single-lane entry): follow-up headway 2.62 s at 0 % and "
+                             "1.93 s at 100 % CAVs, 0.737 (derived), typical; up to 1 for CAVs that do not enter a "
+                             "gap as a group (assumption)."),
+    "robotaxi_entry": Numeric(0.8, 1.6, 1.3,
+                              "No source measures robotaxi gap acceptance: as its time gap, 1.3 (Hu et al. 2023 Sec. "
+                              "III-B: median time headway 3.49 against 2.69 s), from assertive (0.8) to cautious "
+                              "fleets (1.6) (assumption)."),
+    "av_weather_scale": Numeric(0.5, 1.5, 1.0,
+                                "No source gives how CAVs or robotaxis drive on wet, snowy or icy roads: as the "
+                                "drivers (1), typical, from AVs that change their driving half as much (0.5) to half "
+                                "again as much (1.5) (assumption)."),
+    "av_handover": Choice((0.0, 15.0, 30.0, 60.0), (0.4, 0.2, 0.2, 0.2),
+                          "No source gives how long remote assistance takes to confirm a driverless vehicle's entry on "
+                          "snow or ice: none (0), or a confirmation within a minute (assumption; weights assumed)."),
     # Wave smoothers (OPT_IN_GROUPS too)
     "smoothers": Choice((1, 2, 3, 4), (0.4, 0.3, 0.2, 0.1),
                         "One automated car among 21 damped the waves of a 260 m ring (Stern et al. 2018 Sec. 2.1, "

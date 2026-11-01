@@ -39,6 +39,7 @@ def as_version_2(sim_state: dict) -> dict:
         meta["config"].pop(name, None)
         meta["generators"].pop(name, None)
         meta["counters"].pop(name, None)
+        meta["logs"].pop(name, None)  # (version 5 added event logs: merge_log, merge_pending)
         arrays.pop(name, None)
         arrays.pop(f"{name}_count", None)
     log = arrays["conflict_log"]

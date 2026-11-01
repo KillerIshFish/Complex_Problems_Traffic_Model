@@ -126,8 +126,9 @@ BUTTONS = (
                                      "a published experiment, a design guide or traffic counts), keeping the seed. "
                                      "Rebuilds the roundabout and clears the charts; the tabs then change it as usual. "
                                      "On the command line: --preset NAME."),
-    ("randomize", "Randomize all (X)", "Give every setting a plausible random value (the AVs, Coop and Smoothers tabs "
-                                       "only with Shift+X there): real-world ranges, linked as on real roundabouts "
+    ("randomize", "Randomize all (X)", "Give every setting a plausible random value (the AVs, Coop, Entries and "
+                                       "Smoothers tabs only with Shift+X there): real-world ranges, linked as on real "
+                                       "roundabouts "
                                        "(the radius follows the lanes, the demand the capacity, ...). "
                                        "Each press draws a fresh seed, shown in the help box and kept with the "
                                        "settings: --random SEED starts with the same ones (X). Shift+X randomizes only "
@@ -138,7 +139,7 @@ BUTTON_ROWS = (("pause", "step", "reset", "brake"), ("clear", "screenshot", "csv
 # The button at the end of each parameter tab (Shift+X).
 RANDOM_TAB_HELP = ("Give the {group} settings plausible random values, linked to the current settings of the other "
                    "tabs, with a fresh seed shown in the help box (Shift+X). Randomize all (X) draws every setting "
-                   "but those of the AVs, Coop and Smoothers tabs.")
+                   "but those of the AVs, Coop, Entries and Smoothers tabs.")
 PRESET_HELP = ("Preset {i} of {n}: {title}. {description}{source} Click the title or the arrows for another; Apply "
                "preset starts it (details below).")
 PRESET_TEXT_HELP = ("{title}: what it is, its settings (by parameter name, as --set takes them), the notes (caveats, "
@@ -158,8 +159,9 @@ TAB_HELP = {
     "Demand": "Show the demand parameters: a closed ring of cars or open arrivals at the entrances, how many "
               "arrive and when, how long the queues can grow, and the capacity test (a saturated test entrance).",
     "Vehicles": "Show the vehicle parameters: the share and length of trucks (changing them rebuilds the "
-                "roundabout).",
-    "Drivers": "Show the driver parameters: speeds, reactions, following and noise, and how much drivers differ.",
+                "roundabout) and how long the queue waits behind an entering truck.",
+    "Drivers": "Show the driver parameters: speeds, reactions, following and noise, how much drivers differ, and how "
+               "they adapt to recognisable automated vehicles.",
     "Lane chg": "Show the lane-changing parameters.",
     "Start": "Show the initial-state parameters: how the cars are spaced at the start.",
     "AVs": "Show the automated-vehicle parameters: their share of the new vehicles (changing it rebuilds the "
@@ -167,6 +169,9 @@ TAB_HELP = {
     "Coop": "Show the cooperation parameters: how many companies the automated vehicles belong to, how far CAVs "
             "cooperate within and between companies, how much the companies' settings differ and how long a CACC "
             "string may grow.",
+    "Entries": "Show the entry parameters of the automated vehicles: a CAV's critical gap and its shorter follow-up "
+               "behind a cooperating CAV, a robotaxi's critical gap and follow-up, and how driverless vehicles drive "
+               "and enter on wet, snowy or icy roads.",
     "Smoothers": "Show the wave-smoother parameters: how many drivers' cars an automated controller takes over to "
                  "damp stop-and-go waves, its law and set speed, when it switches on and in which lane.",
     PRESETS_TAB: "Show the presets: settings of real roundabouts and ring-road experiments, with their sources and "
@@ -418,7 +423,7 @@ def random_origin(seed: int, groups, values: dict, base: dict | None = None, see
 
 
 def opt_in_values(cfg: SimConfig) -> dict:
-    """``cfg``'s settings of the tabs a draw of every tab leaves alone (presets.OPT_IN_GROUPS: AVs, Coop,
+    """``cfg``'s settings of the tabs a draw of every tab leaves alone (presets.OPT_IN_GROUPS: AVs, Coop, Entries,
     Smoothers). An origin of all tabs holds them too, so that a change to one counts and one not at its default is
     named as given (--random SEED starts with them only with their flags)."""
     return {p.name: getattr(cfg, p.name) for p in PARAMS if p.group in presets.OPT_IN_GROUPS}
@@ -2078,7 +2083,7 @@ class App(Messages):
                 pos, most = int(sim.string_pos[slot]), int(sim.cfg.platoon_max)
                 lines.append("no cooperating CAV ahead: ACC law" if pos <= 1 else
                              f"CACC: string member {pos} of at most {most}" if pos <= most else
-                             "CACC: leads the next string (the one too many), at the gap between strings")
+                             "CACC: heads a string behind the string ahead, at the gap between strings")
             if sim.kind[slot] == SMOOTHER:  # what drives it now (engine RingSim._law_smoother)
                 lines.append(self._smoother_line(slot))
         if np.isfinite(sim.exit_at[slot]):
@@ -2947,7 +2952,8 @@ def origin_from_args(args: argparse.Namespace) -> dict | None:
         return preset_origin(args.preset)
     if getattr(args, "random", None) is not None:
         changes = _flag_settings(args)
-        # (--random leaves the AVs, Coop and Smoothers tabs alone: their values are the defaults or the flags given)
+        # (--random leaves the AVs, Coop, Entries and Smoothers tabs alone: their values are the defaults or the flags
+        # given)
         drawn = {**presets.random_changes(args.random, fixed=changes), **opt_in_values(config_from_args(args))}
         return random_origin(args.random, None, drawn, given=[n for n in drawn if n in changes])
     return None

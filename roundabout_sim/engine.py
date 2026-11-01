@@ -27,7 +27,11 @@ direction) and its speed. Every step:
    mode at most ``MAX_QUEUE`` cars wait per entrance; beyond that a leaver's
    replacement is slotted straight into the ring, so the ring never drains
    into queues. Each queue keeps its cars' arrival times (oldest first), so
-   every entry knows how long the car waited.
+   every entry knows how long the car waited. Automated vehicles enter by their
+   kind's rules (their critical gap, the room their own law needs ahead, a CAV's
+   shorter follow-up behind a cooperating CAV and its route-conflict anticipation:
+   ``_entry_check``, ``_follow_up_slack``); the queue behind an entering truck
+   waits ``truck_follow_up`` times the follow-up.
 
 In closed mode density is held as cars on the ring per km of lane: raising it
 inserts cars into the largest gaps, lowering it removes random cars. In open
@@ -53,7 +57,8 @@ merge: its conflict point) is logged (``conflict_log``) and counted per entrance
 full without arrivals and every car leaves at the first exit after it (with 2+
 lanes the first far enough on to leave from any lane), so each car from the
 other entrances passes it exactly once and its conflicting flow is their entry
-flow, set by the Entrance chance (SUBJECT_*; the experiments' subject_* columns).
+flow, set by the Entrance chance (SUBJECT_*; the experiments' subject_* columns); a ``subject_exiting``
+share of them leaves at its own exit instead, before its entry point (an exiting stream, ``_route_feeding``).
 
 Every vehicle has a ``kind`` (KIND_NAMES: a human driver, or an automated
 vehicle of the run's ``auto_kind``) and, if automated, a ``company``. An
@@ -68,20 +73,33 @@ follow only the car in front, without noise and without a spread between them
 own time gap and standstill gap (``_set_driving``) and command
 (``_automated_command``: the IDM for a robotaxi, the PATH ACC law for an ACC
 car, PATH CACC for a CAV behind a cooperating CAV in strings of at most
-``platoon_max``, else the ACC law), clipped to the braking limit and passed
-through a safety layer (``_automated_limits``); the truck body is independent
+``platoon_max``, else the ACC law), clipped to the braking limit
+(``_automated_limits``) and, after their dead time, passed through a safety
+override (``_safety_override``); the truck body is independent
 of the kind (truck factors apply on top). With ``auto_share`` 0 nothing is
 drawn and every run is the model without kinds, bit for bit. Observers count
 time-to-collision episodes and exposure by follower-leader pair type
-(``_observe_following``), the safety layer's interventions and harsh braking
-by group.
+(``_observe_following``), the safety override's interventions and harsh
+braking by group.
+
+Drivers may adapt to recognisable AVs (CAVs, robotaxis, smoothers): accept
+``exploit_gap`` times their gap in front of one at an entry or a lane change,
+and with ``follow_adapt`` keep a shorter standstill gap behind one, start
+sooner from standstill and enter sooner behind an AV entrant (FOLLOW_*). With
+``av_weather_scale`` the driverless kinds take road factors of their own
+(``av_road_factors``), and with ``av_handover`` a driverless queue head on snow
+or ice waits at the yield line for remote assistance. At every entry the
+observers record the lag the entrant accepted, whether its lag vehicle had to
+brake harder than comfortably (a forced yield) and the post-encroachment time
+at the entry point (``merge_log``, ``_observe_entries``), and the queue wait,
+travel time and control delay of each class of entrant (CLASS_ARRAYS).
 
 Wave smoothers (``smoothers``, a count) are drivers' cars picked without
 chance after the initial placement, at evenly spaced angles (``_sync_smoothers``;
 a live change converts or hands back the nearest). From ``smoother_start`` on
 they drive by FollowerStopper or PI with saturation (Stern et al. 2018), or as
 a noise-free placebo of their driver (``_law_smoother``), through the same clip
-and safety layer; before it their drivers drive them. They never leave, change
+and safety override; before it their drivers drive them. They never leave, change
 lane or get removed by the density control. With ``smoothers`` 0 nothing changes.
 """
 
@@ -163,39 +181,33 @@ ACC_K2 = 0.07  # [1/s]
 # clearance with hysteresis, Liu 2018 pp. 21-22; the minimum needs no stored mode and picks the speed mode far
 # behind a leader and the gap mode close to it).
 ACC_SPEED_GAIN = 0.4  # [1/s]
-# The ACC spacing margin, Xiao 2017 Eq. 6 (its d0 less the 5 m vehicle length it includes, *derived*): ACC_S0 up to
-# ACC_S0_LOW, ACC_S0_K / v - 5 m up to ACC_S0_HIGH, 0 above. It is the ACC car's standstill gap s0. As in Xiao's
-# gap error it is taken at the car's own speed, so between 10.8 and 15 m/s its slope -75/v^2 enters the dynamics:
-# the equilibrium spacing s0(v) + T v grows by only T - 75/v^2 per m/s, the effective time gap (*derived*: 0.46 s
-# just above 10.8 m/s and 0.58 s at 12 m/s for T 1.1 s; 0.77 s at 15 m/s). Linearised (dt 0.1 s), per-car peak
-# string gain at 12 m/s 2.44 without a dead time and 5.64 with 0.5 s, against 1.59 and 2.32 where the margin is flat
-# (*derived*), and the dead time a lone follower tolerates falls (ACC_DEAD_MAX). Below 0.643 s (75 / 10.8^2) the
-# equilibrium spacing would shrink as speed rises just above 10.8 m/s: ACC_GAP_MIN. (Xiao's CACC margin has the same
-# effect, smaller: CACC_S0_SLOPE.)
+# The ACC spacing margin, the ACC car's standstill gap s0: Xiao 2017 Eq. 6's low-speed value (its d0 = 7 m for v <=
+# 10.8 m/s less the 5 m vehicle length it includes, *derived*), FLAT at every speed (*assumption*). Taken at the car's
+# own speed, as in Xiao's gap error, the full margin (75/v - 5 m from 10.8 to 15 m/s, 0 above) acts as a time-gap term
+# -ds0/dv = 75/v^2 there (*derived*: effective time gap 0.46 s just above 10.8 m/s for T 1.1 s), which made 3.9 % of
+# the reachable ACC settings locally unstable (a lone follower oscillating behind a steady leader) and needed a 0.7 s
+# floor on the ACC time gap: an artefact of transplanting a highway margin to roundabout speeds, where its low-speed
+# value applies almost everywhere. With the flat margin the effective time gap is T itself.
 ACC_S0 = 2.0  # [m] (7 m - 5 m)
-ACC_S0_K = 75.0  # [m2/s]
-ACC_S0_LOW, ACC_S0_HIGH = 10.8, 15.0  # [m/s]
-# [s] The shortest time gap the ACC law keeps (an ACC car's ACC time gap, the slider's lowest value, and a CAV's
-# ACC-fallback gap, after the brand and road factors; a truck x TRUCK_HEADWAY_FACTOR on top): *derived*, above 75 /
-# 10.8^2 = 0.643 s, so the effective time gap stays positive across Xiao's band (at least 0.057 s) and the
-# equilibrium spacing grows with speed, and the smallest on 0.05 s steps at which the default ACC settings (1.1 s,
-# 0.5 s) stay locally stable at every brand factor (worst spectral radius 0.99991, at brand factors 0.55-0.6; factors
-# under 0.64 bind it).
-ACC_GAP_MIN = 0.7
 # [s] The longest ACC dead time, the brand factor included (_set_driving): *derived* (linearised follower behind a
-# steady leader as the engine steps it, the whole command delayed by the buffer, dt 0.1 s), the delayed M&S loop
-# goes locally unstable, a lone follower oscillating behind a steady leader, from a dead time of 0.8 s at an
-# effective time gap of 0.6 s, 1.2 s at 1.1 s and 1.5 s at 2-2.4 s, but already from 0.7 s at 0.46 s (T 1.1 s
-# just above 10.8 m/s, Xiao's slope) and 0.3 s at 0. Up to 0.6 s it is locally stable wherever the effective time
-# gap is at least 0.4 s: at every ACC time gap and dead time of the sliders and brand factor the settings can make
-# (companies 2-4 x brand_spread on its 0.05 steps: 41 factors, 0.4-1.6) where the margin is flat (0 of the 10,045
-# combinations unstable), and at ACC time gaps of 1.1 s or more across Xiao's band. *derived* too: just above
-# 10.8 m/s shorter time gaps tolerate less (0.3 s at 0.7 s, 0.4 s at 0.8-0.9 s, 0.5 s at 1.0 s), so 387 of the
-# 10,045 combinations (3.9 %) still oscillate there; a flat margin would remove them. Gunter et al. 2019
-# (Table II) fit dead times up to 0.99 s, but with gains k1 of 0.012-0.071 s^-2; the M&S gains (ACC_K1 = 0.23)
-# were fitted with none (M&S 2014 Table 3: the ACC car's transfer function has no delay), so the longer dead times
-# do not carry over to this law.
+# steady leader as the engine steps it, the whole command delayed by the buffer, dt 0.1 s, flat margin), the delayed
+# M&S loop goes locally unstable from a dead time of 0.6 s at a time gap of 0.3 s, 0.8 s at 0.5-0.6 s, 0.9 s at 0.7 s,
+# 1.2 s at 1.12 s and 1.5 s at 2-2.4 s. Over every reachable setting of a car on a dry road (ACC time gap slider
+# 0.5-2.4 s on its 0.05 steps x ACC dead time slider 0-0.6 s on its 0.1 steps x the 41 brand factors companies 2-4 x
+# brand_spread 0.05-0.6 make, 0.4-1.6; the brand factor scales both) 2 of the 11,193 combinations oscillate without
+# the cap (ACC time gap 0.5 s and dead time 0.6 s at brand factors 1.45-1.6: 0.73-0.8 s against 0.9-1.0 s), none with
+# it (worst spectral radius 0.99896). Gunter et al. 2019 (Table II) fit dead times up to 0.99 s, but with gains k1 of
+# 0.012-0.071 s^-2; the M&S gains (ACC_K1 = 0.23) were fitted with none (M&S 2014 Table 3: the ACC car's transfer
+# function has no delay), so the longer dead times do not carry over to this law. (No floor on the ACC time gap is
+# needed with the flat margin: 0 of those combinations unstable at any time gap of the slider.)
 ACC_DEAD_MAX = 0.6
+# [s2] Beyond about 2.4 s a longer time gap tolerates a SHORTER dead time (*derived*, the same loop: 1.4 s at 3 s, 1.0 s
+# at 5 s, 0.7 s at 8.3 s, 0.5 s at 10 s, 0.4 s at 12-12.7 s), and the truck factor (1.5) and the road's time-gap factor
+# (up to 2.2 on ice at Weather effect 2) take an ACC truck of a slow brand to 12.7 s, where 0.6 s oscillates (spectral
+# radius up to 1.026, bounded only by the acceleration clip). So the dead time is also at most ACC_DEAD_GAP / the car's
+# time gap (*derived*: worst radius 0.9923 over 2.4-13 s); it first binds at 9.1 s (0.55 s rounds to 5 steps), so no
+# car, no dry road and no default changes.
+ACC_DEAD_GAP = 5.0
 # PATH CACC as used for the HCM 7 CAV factors (FHWA-OR-RD-22-11 Eqs. 7-3 to 7-6, Sec. 7.2.2.1 p. 108; Liu et al.
 # 2018 Eqs. 35-38, pp. 21-22): each update v += kp e + kd edot, e = gap - s0 - Tc v, edot = (v_lead - v) - Tc a
 # (a: the follower's own acceleration, a_now), i.e. a = (CACC_KP e + CACC_KD edot) / CACC_PERIOD = 4.5 e + 0.125
@@ -216,14 +228,13 @@ CACC_PERIOD = 0.1
 # CACC_GAIN_GAP the gains fall as CACC_GAIN_GAP / Tc (the per-update speed feedback kp Tc stays at its 2 s value);
 # *derived*: then stable for every Tc of 0.5-8 s at steps up to 1 s (radius <= 0.99), 0.2-8 s up to 0.2 s.
 CACC_GAIN_GAP = 2.0
-# The CACC spacing margin, Xiao 2017 Eq. 7 (d0 = 6.25 - 0.125 v less 5 m, *derived*): CACC_S0 at standstill,
-# falling by CACC_S0_SLOPE per m/s to 0 at 10 m/s. *assumption*: the FHWA law has no standstill term of its own.
-# Below 10 m/s it shortens the regulated gap by 0.125 s x v, so the effective time gap is Tc - 0.125 s: *derived*
-# (linearised, dt 0.1 s), at Tc 0.7 s the string is then mildly string-unstable at low frequency (peak |G| 1.04
-# per car; stable from Tc ~0.8 s), while above 10 m/s it is string-stable (|G| <= 1, tending to 1 at low
-# frequency). Roundabout speeds are below 10 m/s.
+# The CACC spacing margin: Xiao 2017 Eq. 7 at standstill (d0 = 6.25 - 0.125 v less the 5 m vehicle length, *derived*),
+# FLAT at every speed (*assumption*; the FHWA law has no standstill term of its own). Taken at the car's own speed the
+# full margin falls 0.125 m per m/s to 0 at 10 m/s, shortening the regulated time gap to Tc - 0.125 s below 10 m/s,
+# where a 0.7 s string amplified mildly (x1.065 over 8 cars at 8 m/s, *derived* peak |G| 1.04 per car): an artefact
+# at roundabout speeds. Flat, the string is stable iff Tc >= sqrt(2 CACC_PERIOD / CACC_KP) = 0.667 s, whatever kd
+# (*derived*, continuous approximation of the speed law; simulated: |G| 1.000 at 0.7 s, 1.023 at 0.6 s).
 CACC_S0 = 1.25  # [m]
-CACC_S0_SLOPE = 0.125  # [s]
 # The time gap of a CAV that would be member platoon_max + 1 of a CACC string (the gap between strings in
 # FHWA-OR-RD-22-11's roundabout runs, p. 108; Liu 2018 pp. 24-25: t1 = 1.5 s behind a string at its maximum
 # length). It follows by the CACC law and leads the next string.
@@ -271,12 +282,16 @@ PI_SAFE_TIME, PI_SAFE_GAP = 2.0, 4.0  # [s], [m]
 SMOOTHER_CAP_GAP = 120.0  # [m]
 SMOOTHER_CAP_TIME = 6.0  # [s]
 # Cooperation classes, lowest first (SAE J3216: A status-sharing, B intent-sharing, C agreement-seeking, D
-# prescriptive): coop_class within a company, coop_between caps it between companies ("same": as within). What
-# each does here (*assumption*, the capability table): none, no V2X (CAVs follow by the ACC law); A, CACC behind
-# a cooperating CAV (COOP_CACC); B-D add cooperation at the entries (not modelled yet: they act as A).
+# prescriptive): coop_class within a company, coop_between caps it between companies ("same": as within) below D;
+# D, infrastructure-prescribed (SAE J3256), binds every CAV pair whatever the company (*assumption*). What each does
+# here (*assumption*, the capability table): none, no V2X (CAVs follow by the ACC law and enter individually with
+# CAV gaps); A, CACC behind a cooperating CAV (COOP_CACC) and the CAV follow-up behind a cooperating CAV entrant
+# (cav_follow_up, _follow_up_slack); B, + route-conflict anticipation at the entries (COOP_INTENT, _entry_check); C
+# and D add gap creation (not modelled yet: they act as B).
 COOP_CLASSES = ("none", "A", "B", "C", "D")
-COOP_CACC = 1  # the lowest class with CACC strings (A)
+COOP_CACC = 1  # the lowest class with CACC strings and the CAV follow-up (A)
 COOP_INTENT = 2  # the lowest class that shares intent: route-conflict anticipation at the entries (B)
+COOP_PRESCRIPTIVE = 4  # D: binds every CAV pair, coop_between or not
 # Surrogate safety measures (observers, RingSim._observe_following): time to collision TTC = gap / (v - v_lead)
 # of a follower closing on its direct leader; an episode is TTC at or below TTC_CRITICAL (SSAM's default, FHWA
 # Surrogate Safety Assessment Model, Gettman et al. 2008 FHWA-HRT-08-051) with a per-car hold of EMERGENCY_HOLD,
@@ -303,34 +318,84 @@ def pair_type(follower_kind, leader_kind):
 # (Sec. IV-C: the AV-HV pairs are the least string-unstable), which compares each group at its own observed
 # equilibrium, not at equal density. Read fixed-density ring results with robotaxis in that light.
 
+# Drivers behind a recognisable AV (follow_adapt = a, 0-1; RingSim._car_following, _move, _follow_up_slack). Wang et
+# al. 2023 (Waymo Open Dataset at signalised intersections; via Reddy et al. 2025, EJTIR 25(2) p. 3, Wang's paper not
+# read): a driver stops 1.73 m behind an AV against 2.77 m behind a driver, so the standstill gap x (1 - FOLLOW_S0_CUT
+# a) (1 - 1.73 / 2.77 = 0.375, *derived*; Hu et al. 2023 Sec. III-C, Table IV corroborate: jam spacing 6.73 m behind an
+# AV against 7.88 m), and starts 0.49 s after it moves off against 1.04 s, so the reaction delay x (1 -
+# FOLLOW_START_CUT a) when starting from below FOLLOW_START_SPEED (1 - 0.49 / 1.04 = 0.53, *derived*; only then: Hu et
+# al. 2023 Sec. III-D, Table VII find no general change in response time behind AVs, 1.84 against 1.80 s), and a
+# driver entering behind an AV that entered just before goes FOLLOW_UP_CUT a sooner (1.04 - 0.49 s, *derived*: the
+# same start-up). Carrying Wang's signalised-intersection queues over to following on a roundabout, and a start-up
+# reaction over to the entry follow-up, is an *assumption*.
+FOLLOW_S0_CUT = 0.375
+FOLLOW_START_CUT = 0.53
+FOLLOW_START_SPEED = 0.5  # [m/s] *assumption*: a start from standstill (Wang et al. report no threshold)
+FOLLOW_UP_CUT = 0.55  # [s]
+# Conflicts at the entries (observers, RingSim._observe_entries). A forced yield: the lag vehicle (the first behind the
+# entry point, the one the entrant's lag check judged) brakes harder than its comfortable braking within FORCED_WINDOW
+# of the entry (*assumption*). Post-encroachment time PET (Allen et al. 1978; FHWA-HRT-08-051 Ch. 2: from the first
+# vehicle last occupying a point to the second arriving there): from the entrant's rear clearing the entry point to the
+# front of the next vehicle on the outer lane reaching it; critical below PET_CRITICAL (Peesapati et al. 2018, as the
+# criticality-metrics summary gives it: secondary), a conflict up to PET_MAX (Rahmani et al. 2024, arXiv 2410.12538 Sec.
+# 3.3.3, who count PET below 10 s as a conflict; longer gaps are no interaction and are not counted).
+FORCED_WINDOW = 3.0  # [s]
+PET_CRITICAL = 1.5  # [s]
+PET_MAX = 10.0  # [s]
+# Entrants by class for the delays (RingSim._entrant_class): human drivers, CAVs that cooperate within their company
+# (coop_class A or more: CACC strings and the CAV follow-up) and every other automated vehicle (ACC cars, robotaxis,
+# CAVs without cooperation).
+ENTRANT_CLASSES = ("human", "coop", "other")
+
 # Per-car arrays, one value per slot (RingSim._alloc); the acceleration history acc_hist holds one row
 # per step of history on top.
 CAR_ARRAYS = ("alive", "lane", "theta", "travel", "v", "z", "exit_at", "born", "lat", "lc_cool", "noise",
               "brake_until", "uid", "moving", "emergency_until", "stuck", "entered_at", "inserted_at", "truck",
               "length", "z_react", "z_gap", "accel", "headway", "delay", "kind", "company", "acc_gap", "s0",
-              "a_now", "string_pos", "aeb_until", "ttc_until", "v_cmd", "smoother_on", "speed_count")
+              "a_now", "string_pos", "override_until", "ttc_until", "v_cmd", "smoother_on", "speed_count", "waited",
+              "delay_used")
 # Saved states (RingSim.state_dict): the layout version, and what they hold besides the per-car arrays.
-STATE_VERSION = 4  # 1: before the capacity test; 2: + it, conflict points, weather strength and anticipation;
+STATE_VERSION = 5  # 1: before the capacity test; 2: + it, conflict points, weather strength and anticipation;
 # 3: + vehicle kinds and companies (their draws, settings, queue fields and per-car arrays) and conflict_log's kind;
 # 4: + the ACC/CACC settings and string positions, cooperation, the safety layer and the surrogate safety counts,
-# and the wave smoothers (settings, command speeds, start flags and the history of their own speeds, speed_hist)
+# and the wave smoothers (settings, command speeds, start flags and the history of their own speeds, speed_hist);
+# 5: + the entries by kind (settings, each entrance's last entrant, the capacity test's exiting stream), the safety
+# layer's counts renamed (RENAMED), the drivers' adaptation to AVs (settings, each vehicle's reaction delay applied
+# last step) and the AV weather policy (settings), and the conflicts and delays at the entries (merge_log, the
+# forced-yield windows and PET records under way, their counts per pair type, the delays per entrant class and each
+# vehicle's queue wait)
 ARM_ARRAYS = {"queue": int, "entry_cool": np.int64, "arm_arrived": np.int64, "arm_entered": np.int64,
               "queue_busy": float, "arm_passed": np.int64, "arm_passed_outer": np.int64,
               "arm_passed_trucks": np.int64, "arm_entered_trucks": np.int64,
-              "arm_entry_wait": float}  # one value per entrance, and its dtype
+              "arm_entry_wait": float, "last_kind": np.int64, "last_company": np.int64,
+              "last_uid": np.int64, "last_entry": float, "pet_slot": np.int64, "pet_uid": np.int64,
+              "pet_kind": np.int64, "pet_clear": float}  # one value per entrance, and its dtype
 # What each queued vehicle carries besides its arrival time (queue_times), in the same order: saved as one array
 # per field (every entrance's queue in turn) and a count per entrance, read back as Python values of the type.
 QUEUE_FIELDS = {"queue_trucks": bool, "queue_kinds": int, "queue_companies": int, "queue_acc_gaps": float}
 # One value per pair type of a follower and its leader (PAIR_TYPES), and its dtype: the surrogate safety counts
 # (RingSim._observe_following), in time steps.
 PAIR_ARRAYS = {"pair_follow_steps": np.int64, "pair_ttc_steps": np.int64, "pair_ttc_episodes": np.int64}
+# ...and the entries' conflict counts (RingSim._observe_entries), the lag vehicle (or the vehicle reaching the entry
+# point next) the follower, the entrant its leader: entries with a lag vehicle, those of them with a moving one and
+# their accepted lags [s], their forced-yield windows closed and the forced yields in them without and with the lag's
+# safety override acting, and the PETs up to PET_MAX, their sum [s] and those below PET_CRITICAL.
+MERGE_ARRAYS = {"merge_lags": np.int64, "merge_lag_finite": np.int64, "merge_lag_total": float,
+                "merge_closed": np.int64, "forced_law": np.int64, "forced_override": np.int64,
+                "pet_count": np.int64, "pet_total": float, "pet_low": np.int64}
+# One value per entrant class (ENTRANT_CLASSES), and its dtype (RingSim._entries, _exits; the capacity test's entrance
+# left out): entries and their queue waits [s]; exits of those entrants, their travel times (queue wait + time on the
+# ring) [s] and control delays (travel time - the ring trip at free speed) [s].
+CLASS_ARRAYS = {"class_entries": np.int64, "class_wait": float, "class_exits": np.int64, "class_travel": float,
+                "class_control": float}
 COUNTERS = ("n_entered", "n_exited", "n_missed", "n_lane_changes", "n_emergency", "n_stops", "n_arrived",
-            "n_blocked", "n_gave_up", "n_topped_up", "n_aeb", "n_emergency_auto", "n_auto_steps", "n_human_steps",
-            "n_cutins_auto")  # whole numbers
+            "n_blocked", "n_gave_up", "n_topped_up", "n_override", "n_emergency_auto", "n_auto_steps",
+            "n_human_steps", "n_cutins_auto", "n_feeding")  # whole numbers
 FLOAT_TOTALS = ("entry_wait_total",)  # sums of floats (each kept in its own accumulation order)
 EVENT_LOGS = ("detector_log", "exit_log", "lane_change_log", "emergency_log", "stop_log", "arrival_log",
-              "entry_log", "blocked_log", "gave_up_log", "conflict_log")  # tuples starting with the time
-# (lane_change_log: plain times)
+              "entry_log", "blocked_log", "gave_up_log", "conflict_log", "merge_log",
+              "merge_pending")  # tuples starting with the time
+# (lane_change_log: plain times; merge_pending: the entries whose forced-yield window is still open, never pruned)
 GENERATORS = ("rng", "rng_demand", "rng_drivers", "rng_kinds", "rng_kinds_test")  # every random stream
 
 
@@ -349,12 +414,12 @@ class FromState:
 # Everything saved that was added after version 1, with what a state of an older version gets for it (the
 # setting's default, zero counts, an empty log): RingSim._from_state fills only these names, and only into a
 # state of an older version (a state of this version that lacks one is damaged). Settings (SimConfig fields:
-# the value is the default), ARM_ARRAYS (the value per entrance), PAIR_ARRAYS (the value per pair type),
-# QUEUE_FIELDS (the value per queued vehicle), CAR_ARRAYS (the value per slot, or a FromState fill), speed_hist (the
-# value per entry: an older state has no smoothers, so it holds no rows), COUNTERS and FLOAT_TOTALS, EVENT_LOGS (an
-# empty log) and GENERATORS (k: the stream is default_rng([seed, k]); a tuple: default_rng([seed, *k]), a sub-stream).
-# Each stage that changes the saved layout adds its names here and raises STATE_VERSION. (Fields added to the
-# entries of a log: LOG_WIDENED.)
+# the value is the default), ARM_ARRAYS (the value per entrance), PAIR_ARRAYS and MERGE_ARRAYS (the value per pair
+# type), CLASS_ARRAYS (the value per entrant class), QUEUE_FIELDS (the value per queued vehicle), CAR_ARRAYS (the
+# value per slot, or a FromState fill), speed_hist (the value per entry: an older state has no smoothers, so it holds
+# no rows), COUNTERS and FLOAT_TOTALS, EVENT_LOGS (an empty log) and GENERATORS (k: the stream is default_rng([seed,
+# k]); a tuple: default_rng([seed, *k]), a sub-stream). Each stage that changes the saved layout adds its names here
+# and raises STATE_VERSION. (Fields added to the entries of a log: LOG_WIDENED.)
 ADDED: dict[str, object] = {
     # version 2: the capacity test, conflict points, weather strength and anticipation
     "weather_scale": 1.0, "subject_arm": "off", "anticipation": ANTICIPATION,  # settings
@@ -373,15 +438,36 @@ ADDED: dict[str, object] = {
     # version 4: the ACC/CACC controllers, cooperation, the safety layer and the surrogate safety counts
     "acc_headway": 1.1, "acc_delay": 0.5, "cav_headway": 0.7, "platoon_max": 8,  # settings
     "coop_class": "B", "coop_between": "same", "brand_spread": 0.0,
-    "string_pos": 0, "aeb_until": -np.inf, "ttc_until": -np.inf,  # per car (no string, no episode under way)
-    "n_aeb": 0, "n_emergency_auto": 0, "n_auto_steps": 0, "n_human_steps": 0, "n_cutins_auto": 0,  # counters
+    "string_pos": 0, "override_until": -np.inf, "ttc_until": -np.inf,  # per car (no string, no episode under way)
+    "n_override": 0, "n_emergency_auto": 0, "n_auto_steps": 0, "n_human_steps": 0, "n_cutins_auto": 0,  # counters
     "pair_follow_steps": 0, "pair_ttc_steps": 0, "pair_ttc_episodes": 0,  # per pair type
     # ...and the wave smoothers (an older state has none)
     "smoothers": 0, "smoother_law": "followerstopper", "smoother_speed": 7.5, "smoother_start": 0.0,  # settings
     "smoother_lane": -1,
     "v_cmd": 0.0, "smoother_on": False, "speed_count": 0,  # per car (no command, not tracking, no speeds held)
     "speed_hist": 0.0,  # (rows x slots: no rows without smoothers)
+    # version 5: the entries by kind, the follow-up behind an entering truck and the capacity test's exiting stream
+    "cav_entry_gap": 1.0, "robotaxi_entry": 1.3, "cav_follow_up": 0.74, "truck_follow_up": 1.0,  # settings
+    "subject_exiting": 0.0,
+    "last_kind": HUMAN, "last_company": -1, "last_uid": -1,  # per entrance (no automated entrant known)
+    "n_feeding": 0,  # counter
+    # ...the drivers' adaptation to AVs, the AV weather policy, and the conflicts and delays at the entries (an older
+    # state's entries and vehicles are not known: no record under way, no queue wait, counts from 0)
+    "exploit_gap": 1.0, "follow_adapt": 0.0, "av_weather_scale": 1.0, "av_handover": 0.0,  # settings
+    "last_entry": -np.inf, "pet_slot": -1, "pet_uid": -1, "pet_kind": HUMAN, "pet_clear": np.nan,  # per entrance
+    "waited": np.nan,  # per car
+    # (the reaction delay applied last step: an older state's drivers are not starting behind an AV, so their own)
+    "delay_used": FromState(lambda sim: sim.delay.copy(), "each car's reaction delay"),
+    "merge_lags": 0, "merge_lag_finite": 0, "merge_lag_total": 0.0, "merge_closed": 0, "forced_law": 0,  # per pair
+    "forced_override": 0, "pet_count": 0, "pet_total": 0.0, "pet_low": 0,
+    "class_entries": 0, "class_wait": 0.0, "class_exits": 0, "class_travel": 0.0, "class_control": 0.0,  # per class
+    "merge_log": (), "merge_pending": (),  # event logs
 }
+# Names saved under another name before: {name now: (its name before, the version that renamed it)}. A state of an
+# older version holding the old name loads it under the new one (RingSim._from_state); one of this version must use
+# the new name. The safety layer's counts were "AEB" ones until version 5: it acts on mild excess braking too (median
+# IDM demand -2.2 against -2.0 m/s2 on the default roundabout), so "safety override" (_safety_override).
+RENAMED: dict[str, tuple[str, int]] = {"n_override": ("n_aeb", 5), "override_until": ("aeb_until", 5)}
 # Fields added to the entries of an event log since version 1: (the entries' width now, what an older state's
 # shorter entries get on the end). A state of this version must hold entries of the full width.
 LOG_WIDENED: dict[str, tuple[int, tuple]] = {
@@ -390,7 +476,11 @@ LOG_WIDENED: dict[str, tuple[int, tuple]] = {
 
 # Heavy vehicles (trucks): multiples of a car driver's setting. Truck drivers keep a car's standstill gap
 # and comfortable braking (the sources disagree: x1-2 and x0.67-1) and a car's entry gap and follow-up
-# time (field data give x1.7-1.9; here a truck's length and slow start already make it need more room).
+# time (field data give x1.7-1.9). Their length and slow start alone do not make an entering truck cost the
+# entrance more than a car (*derived*, us_single_lane capacity test with 10 % trucks: a passenger-car
+# equivalent of about 1, against the HCM's E_T = 2.0: HCM 7 Exhibit 22-11 and its f_HV = 1 / (1 + P_T (E_T - 1)),
+# Eq. 22-10, as the design review cites them; not checked against the HCM text). So the vehicle queued behind an
+# entering truck waits truck_follow_up x the follow-up (_entries; 1 = as behind a car).
 # max acceleration: IDM a 0.5 vs 1.0 m/s2 (Treiber & Kesting 2013, errata 2017), 0.7 vs 1.4 (EIDM, Kesting 2010)
 TRUCK_ACCEL_FACTOR = 0.5  # and trucks measured at 0.59 m/s2 from a stop (Yang 2016)
 TRUCK_SPEED_FACTOR = 0.7  # desired speed: 80 vs 120 km/h (Treiber & Kesting; MOBIL, Kesting 2007), 85 vs 120 (EIDM)
@@ -480,10 +570,24 @@ class Effective:
     max_decel: float  # [m/s2] physical braking limit (MAX_DECEL on a dry road)
 
 
-def effective(cfg: SimConfig) -> Effective:
-    """The settings ``cfg`` drives with on its road condition (one multiplier each, ROAD_CONDITIONS, the
-    behavioural ones scaled by the weather effect: road_factors)."""
+def av_road_factors(cfg: SimConfig) -> dict[str, float]:
+    """The multiple of each ROAD_SCALED setting for the driverless vehicles (DRIVERLESS) on ``cfg``'s road: each of the
+    drivers' behavioural factors f (road_factors, after the Weather effect) as 1 + av_weather_scale (f - 1), at least
+    WEATHER_FLOOR, the grip limits (lateral_accel, max_decel) the drivers' (*assumption*: an AV's weather policy is a
+    choice of its software, its tyres grip as any car's; *model*: relative to the drivers' factors, so 1 is "as the
+    drivers" whatever the Weather effect). av_weather_scale 1: the drivers' factors themselves (exactly)."""
     k = road_factors(cfg.road_condition, cfg.weather_scale)
+    s = cfg.av_weather_scale
+    if s == 1:
+        return k
+    return {name: max(WEATHER_FLOOR, 1.0 + s * (f - 1.0)) if name in WEATHER_SCALED else f for name, f in k.items()}
+
+
+def effective(cfg: SimConfig, factors: dict[str, float] | None = None) -> Effective:
+    """The settings ``cfg`` drives with on its road condition (one multiplier each, ROAD_CONDITIONS, the
+    behavioural ones scaled by the weather effect: road_factors; ``factors``: other multipliers, e.g. the driverless
+    vehicles' av_road_factors)."""
+    k = road_factors(cfg.road_condition, cfg.weather_scale) if factors is None else factors
     return Effective(**{name: getattr(cfg, name) * k[name] for name in ROAD_SCALED if name != "max_decel"},
                      speed_std=cfg.speed_std * k["mean_speed"], headway_std=cfg.headway_std * k["time_headway"],
                      max_decel=MAX_DECEL * k["max_decel"])
@@ -659,12 +763,14 @@ class RingSim:
         self.n_arrived = self.n_blocked = 0
         self.n_gave_up = 0  # queued cars dropped when Max queue (open) or Density (closed) was lowered live
         self.n_topped_up = 0  # cars added to the subject entrance's queue (subject_arm on): not arrivals
-        # Observers of the automated vehicles: safety-layer episodes (_automated_limits), harsh-braking episodes of
+        # Observers of the automated vehicles: safety-override episodes (_safety_override), harsh-braking episodes of
         # automated vehicles (n_emergency counts every vehicle's), vehicle-steps on the ring of automated vehicles
         # and of human drivers (exposure) and lane changes that cut in ahead of a recognisable AV.
-        self.n_aeb = self.n_emergency_auto = self.n_auto_steps = self.n_human_steps = self.n_cutins_auto = 0
+        self.n_override = self.n_emergency_auto = self.n_auto_steps = self.n_human_steps = self.n_cutins_auto = 0
+        # The capacity test's entrants from the feeding entrances so far: subject_exiting's count (_route_feeding).
+        self.n_feeding = 0
         # Per pair type (PAIR_TYPES): steps of car following, steps at TTC <= TTC_CRITICAL, TTC episodes.
-        for name, dtype in PAIR_ARRAYS.items():
+        for name, dtype in (*PAIR_ARRAYS.items(), *MERGE_ARRAYS.items()):  # (and the entries' conflicts)
             setattr(self, name, np.zeros(len(PAIR_TYPES), dtype=dtype))
         self.entry_wait_total = 0.0  # [s] queue wait summed over every car that entered
         # Per entrance, for its demand / capacity ratio (metrics.entry_vc).
@@ -679,6 +785,21 @@ class RingSim:
         self.arm_passed_trucks = np.zeros(n, dtype=np.int64)
         self.arm_entered_trucks = np.zeros(n, dtype=np.int64)
         self.arm_entry_wait = np.zeros(n)
+        # Its last entrant: kind, company and uid (HUMAN, -1, -1 before any): the follow-up of the next
+        # (_follow_up_slack) and whether that one still enters right behind it (_entries).
+        self.last_kind = np.full(n, HUMAN, dtype=np.int64)
+        self.last_company = np.full(n, -1, dtype=np.int64)
+        self.last_uid = np.full(n, -1, dtype=np.int64)
+        self.last_entry = np.full(n, -np.inf)  # [s] ...and the time of its last entry (av_handover: _handed_over)
+        # Its PET record under way (observer, _observe_entries): the last entrant's slot (-1: none), uid and kind, and
+        # the time its rear cleared the entry point (NaN: not yet).
+        self.pet_slot = np.full(n, -1, dtype=np.int64)
+        self.pet_uid = np.full(n, -1, dtype=np.int64)
+        self.pet_kind = np.full(n, HUMAN, dtype=np.int64)
+        self.pet_clear = np.full(n, np.nan)
+        # Per entrant class (ENTRANT_CLASSES): entries, queue waits, exits, travel times and control delays.
+        for name, dtype in CLASS_ARRAYS.items():
+            setattr(self, name, np.zeros(len(ENTRANT_CLASSES), dtype=dtype))
         # Event logs for rolling rates, oldest first, pruned after LOG_HORIZON.
         self.detector_log: deque[tuple[float, int]] = deque()  # (time, lane) crossings
         self.exit_log: deque[tuple[float, int, float]] = deque()  # (time, arm, trip time)
@@ -691,6 +812,15 @@ class RingSim:
         self.gave_up_log: deque[tuple[float, int]] = deque()  # (time, arm) queued cars that gave up
         # (time, arm, lane, uid, kind) of each vehicle passing an entry point (its conflict point)
         self.conflict_log: deque[tuple[float, int, int, int, int]] = deque()
+        # Each entry once its forced-yield window has closed (_observe_entries): (time, arm, entrant uid, entrant kind,
+        # lag uid, lag kind (-1, -1: no lag vehicle), accepted lag [s] (bumper gap / the lag's speed: inf for a lag
+        # standing, NaN for none), platoon (a CAV entering right behind a cooperating CAV entrant), forced yield, the
+        # lag's safety override acted in the window). Logged FORCED_WINDOW after the entry, in the order of the entries.
+        self.merge_log: deque[tuple] = deque()
+        # The entries whose window is still open: (time, arm, entrant uid, entrant kind, lag slot, lag uid, lag kind,
+        # pair type (PAIR_TYPES: the lag the follower; -1 without a lag), accepted lag, platoon, steps left, the lag's
+        # lowest acceleration since [m/s2], its safety override acted).
+        self.merge_pending: deque[tuple] = deque()
         # Once a second: (time, arm_arrived, arm_entered, queue_busy) copies, for rolling ratios.
         self.entrance_log: deque[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = deque(
             [(0.0, self.arm_arrived.copy(), self.arm_entered.copy(), self.queue_busy.copy())])
@@ -797,7 +927,7 @@ class RingSim:
             self.smoother_on[:] = False
         if any(getattr(new_cfg, k) != getattr(old, k) for k in
                ("mean_speed", "speed_std", "lateral_accel", "turn_speed", "exit_prob", "comfort_decel",
-                "road_condition", "weather_scale")):
+                "road_condition", "weather_scale", "av_weather_scale")):
             # New free speeds: re-baseline who counts as moving, so the change
             # itself is not logged as a wave of stops.
             self.moving[alive] &= self.v[alive] >= SLOW_FRACTION * self.target_speed(alive)
@@ -847,6 +977,7 @@ class RingSim:
         self.accel = np.zeros(cap)  # [m/s2] max acceleration
         self.headway = np.zeros(cap)  # [s] IDM time gap
         self.delay = np.zeros(cap, dtype=np.int64)  # [steps] reaction delay
+        self.delay_used = np.zeros(cap, dtype=np.int64)  # [steps] the delay applied last step (follow_adapt: _move)
         self.s0 = np.zeros(cap)  # [m] standstill gap
         # [m/s2] Acceleration the car realised in the last step ((v_new - v) / dt: after the braking limit, a
         # stop and the no-overlap constraint; *model*): what a CACC law's gap-error derivative and a smoother's
@@ -856,8 +987,11 @@ class RingSim:
         # string leader following by the ACC law, 2 to platoon_max = member at the CACC time gap, platoon_max + 1 =
         # the member that would be one too many, following by the CACC law at CAV_PLATOON_GAP and leading the next.
         self.string_pos = np.zeros(cap, dtype=np.int8)
-        # End of the car's current safety-layer and low-TTC episodes (observers; like emergency_until).
-        self.aeb_until = np.full(cap, -np.inf)
+        # [s] Its queue wait if it came in from an entrance (NaN otherwise, and for the capacity test's entrants): its
+        # travel time and control delay at its exit (observers: _exits, CLASS_ARRAYS).
+        self.waited = np.full(cap, np.nan)
+        # End of the car's current safety-override and low-TTC episodes (observers; like emergency_until).
+        self.override_until = np.full(cap, -np.inf)
         self.ttc_until = np.full(cap, -np.inf)
         # A smoother's command speed [m/s] (_law_smoother: PI with saturation updates it from its last value) and
         # whether its controller tracks it (from Smoother start on, under FollowerStopper or PI; it starts from the
@@ -890,7 +1024,9 @@ class RingSim:
         generation; every per-car array (CAR_ARRAYS), the acceleration history
         and its pointer, the smoothers' speed history; the queues with each queued car's arrival time,
         vehicle type, kind, company and ACC-fallback gap (QUEUE_FIELDS); the
-        entrance cooldowns, counters, event logs and
+        entrance arrays (ARM_ARRAYS), the counts per pair type and per entrant
+        class (PAIR_ARRAYS, MERGE_ARRAYS, CLASS_ARRAYS), the
+        entrance cooldowns, counters, event logs (the entries' windows under way too) and
         once-a-second entrance totals; the uid counter, the fill and prune
         timers and the vehicles the density control still has to place; the
         lane index cache; and the bit-generator state of every random stream
@@ -900,7 +1036,8 @@ class RingSim:
         (ADDED: what was added since takes its fill).
         """
         arrays = {name: getattr(self, name).copy()
-                  for name in (*CAR_ARRAYS, "acc_hist", "speed_hist", *ARM_ARRAYS, *PAIR_ARRAYS)}
+                  for name in (*CAR_ARRAYS, "acc_hist", "speed_hist", *ARM_ARRAYS, *PAIR_ARRAYS, *MERGE_ARRAYS,
+                               *CLASS_ARRAYS)}
         logs = {}
         for name in EVENT_LOGS:
             arrays[name], logs[name] = _pack_log(getattr(self, name))
@@ -962,6 +1099,15 @@ class RingSim:
             """Whether ``name``, missing from ``present``, takes its ADDED fill (in an older state only)."""
             return version < STATE_VERSION and name in ADDED and name not in present
 
+        renamed = {new: old for new, (old, since) in RENAMED.items() if version < since}  # (older states' names)
+        if renamed:  # copies, under the names of now (the caller's state is left as it is)
+            meta = {**meta, "counters": dict(meta["counters"])}
+            arrays = dict(arrays)
+            for new, old in renamed.items():
+                for held in (meta["counters"], arrays):
+                    if old in held and new not in held:
+                        held[new] = held.pop(old)
+
         config, names = dict(meta["config"]), {f.name for f in fields(SimConfig)}
         config.update({name: ADDED[name] for name in sorted(names) if fill(name, config)})
         unknown, missing = sorted(set(config) - names), sorted(names - set(config))
@@ -986,9 +1132,11 @@ class RingSim:
         for name, dtype in ARM_ARRAYS.items():
             setattr(self, name, np.full(n, ADDED[name], dtype=dtype) if fill(name, arrays)
                     else _array(arrays, name, (n,), dtype))
-        for name, dtype in PAIR_ARRAYS.items():
-            setattr(self, name, np.full(len(PAIR_TYPES), ADDED[name], dtype=dtype) if fill(name, arrays)
-                    else _array(arrays, name, (len(PAIR_TYPES),), dtype))
+        for names, size in ((PAIR_ARRAYS, len(PAIR_TYPES)), (MERGE_ARRAYS, len(PAIR_TYPES)),
+                            (CLASS_ARRAYS, len(ENTRANT_CLASSES))):
+            for name, dtype in names.items():
+                setattr(self, name, np.full(size, ADDED[name], dtype=dtype) if fill(name, arrays)
+                        else _array(arrays, name, (size,), dtype))
         self.demand_weight = self._demand_weights()
         for name, dtype in (("queue_times", float), *QUEUE_FIELDS.items()):
             if fill(name, arrays):  # (an older state's queued vehicles: one fill each, whatever count it holds)
@@ -1046,8 +1194,12 @@ class RingSim:
                 getattr(self, name)[:] = _array(arrays, name, (cap,), getattr(self, name).dtype)
         for name in derived:
             getattr(self, name)[:] = ADDED[name].fill(self)
-        if version < 4:  # acc and cav cars saved before their controllers drove a driver's IDM: theirs from now on
-            stale = np.flatnonzero(self.alive & ((self.kind == ACC) | (self.kind == CAV)))
+        # acc and cav cars saved before their controllers drove a driver's IDM: theirs from now on. ACC cars saved by
+        # version 4 hold its margin (Xiao's at their speed then, refreshed every step there) and its 0.7 s floor on the
+        # ACC time gap, which nothing here refreshes: the flat ACC_S0 and no floor from now on (a CAV's time gap and
+        # margin are set every step: _controller_gaps).
+        if version < 5:
+            stale = np.flatnonzero(self.alive & ((self.kind == ACC) | ((self.kind == CAV) & (version < 4))))
             if stale.size:
                 self._set_driving(stale)
         self.acc_hist[:] = _array(arrays, "acc_hist", (self._hist_len, cap), float)
@@ -1163,8 +1315,15 @@ class RingSim:
         (``subject``), whether the automated vehicles are ACC cars or CAVs,
         whose controllers set their margins and time gaps every step
         (``controllers``: _controller_gaps), and the road condition's
-        time-gap factor their fixed time gaps take (``road_gap``). All from the
-        settings, never per step.
+        time-gap factor their fixed time gaps take (``road_gap``). Whether the
+        driverless vehicles drive by road factors of their own (``av_weather``:
+        av_weather_scale not 1 off a dry road, with CAVs or robotaxis), and
+        then their effective settings (``eff_av``) and time-gap factor
+        (``road_gap_av``; else the drivers' ``eff`` and ``road_gap``); whether
+        drivers adapt to recognisable AVs that can be there (``exploiting``:
+        exploit_gap not 1; ``adapting``: follow_adapt above 0); and whether
+        driverless queue heads wait for a handover (``handover``: av_handover
+        above 0 on snow or ice). All from the settings, never per step.
         """
         cfg = self.cfg
         self.eff = effective(cfg)
@@ -1177,6 +1336,60 @@ class RingSim:
         # *assumption*: the ACC and CACC time gaps follow the road condition as a driver's time gap does (an ACC
         # driver picks a longer setting; no source gives a CACC's in rain or snow), as a robotaxi's does. 1 if dry.
         self.road_gap = road_factors(cfg.road_condition, cfg.weather_scale)["time_headway"]
+        driverless = cfg.auto_share > 0 and AUTO_KINDS[cfg.auto_kind] in DRIVERLESS
+        self.av_weather = driverless and cfg.av_weather_scale != 1 and cfg.road_condition != "dry"
+        av = av_road_factors(cfg) if self.av_weather else None
+        self.eff_av = effective(cfg, av) if self.av_weather else self.eff
+        self.road_gap_av = av["time_headway"] if self.av_weather else self.road_gap
+        recognisable = driverless or self.smoothing  # (RECOGNISABLE: the driverless kinds and smoothers)
+        self.exploiting = recognisable and cfg.exploit_gap != 1
+        self.adapting = recognisable and cfg.follow_adapt > 0
+        self.handover = driverless and cfg.av_handover > 0 and cfg.road_condition in ("snow", "ice")
+
+    def _driverless(self, kind) -> np.ndarray:
+        """Which vehicles of these kinds (codes) are driverless (DRIVERLESS: CAVs, robotaxis): no driver to take over
+        (the AV weather policy, av_weather_scale; the handover, av_handover)."""
+        return (kind == CAV) | (kind == ROBOTAXI)
+
+    @staticmethod
+    def _steered(kind) -> np.ndarray:
+        """Which vehicles of these kinds (codes) a driver steers into an entry or a lane change: human drivers and ACC
+        cars, whose drivers enter and change lane as any driver (the ACC law only follows), so they may exploit or be
+        wary of a recognisable AV (exploit_gap)."""
+        return (kind == HUMAN) | (kind == ACC)
+
+    def _comfort(self, slots):
+        """[m/s2] Comfortable braking of the vehicles in ``slots``: the effective Comfortable braking (a number), or,
+        while the driverless vehicles drive by their own road factors (av_weather), aligned with ``slots`` (theirs
+        eff_av's)."""
+        if not self.av_weather:
+            return self.eff.comfort_decel
+        return self._kind_comfort(self.kind[slots])
+
+    def _kind_comfort(self, kind):
+        """[m/s2] _comfort for vehicles of these kinds (codes)."""
+        if not self.av_weather:
+            return self.eff.comfort_decel
+        return np.where(self._driverless(kind), self.eff_av.comfort_decel, self.eff.comfort_decel)
+
+    def _kind_road_gap(self, kind):
+        """The road's time-gap factor of vehicles of these kinds (codes): road_gap, or a driverless vehicle's own
+        (road_gap_av) while av_weather (a number while not)."""
+        if not self.av_weather:
+            return self.road_gap
+        return np.where(self._driverless(kind), self.road_gap_av, self.road_gap)
+
+    def _behind_av(self, idx, ld) -> np.ndarray:
+        """Which of the vehicles ``idx`` a driver drives this step behind a recognisable AV (``ld``: each one's direct
+        leader, aligned; itself if alone in its lane): the drivers who adapt (follow_adapt). Recognisable as the
+        observers count it (_observed_kinds: a smoother from Smoother start on)."""
+        seen = SEEN_AS_AV[self._observed_kinds(self.kind[np.maximum(ld, 0)])]
+        return self._driven(self.kind[idx]) & (ld >= 0) & (ld != idx) & seen
+
+    def _follow_s0_factor(self) -> float:
+        """The standstill gap of a driver behind a recognisable AV as a multiple of its own: 1 - FOLLOW_S0_CUT x
+        follow_adapt."""
+        return 1.0 - FOLLOW_S0_CUT * self.cfg.follow_adapt
 
     def _draw_trucks(self, k: int) -> np.ndarray:
         """Whether each of ``k`` new vehicles is a truck (chance ``truck_share``, from rng_drivers)."""
@@ -1238,15 +1451,16 @@ class RingSim:
         stimulus-to-response time that includes its longer time gap, not a
         slower reaction). The controllers' settings are fixed (no spread),
         times the company's brand factor (_brand) and the road's time-gap
-        factor (``road_gap``): an ACC car keeps ACC time gap (at least
-        ACC_GAP_MIN: _acc_law_gap) and the dead time ACC dead time (at most
-        ACC_DEAD_MAX, the brand factor included); a CAV its ACC-fallback gap
-        (acc_gap, at least ACC_GAP_MIN) and no dead time (its CACC time gap
-        within a string is set every step, _controller_gaps).
+        factor (``road_gap``): an ACC car keeps ACC time gap (_acc_law_gap)
+        and the dead time ACC dead time (at most ACC_DEAD_MAX, the brand
+        factor included, and ACC_DEAD_GAP / its time gap, the truck factor
+        included); a CAV its ACC-fallback gap (acc_gap) and no dead
+        time (its CACC time gap within a string, road factor only, is set
+        every step: _controller_gaps, _cacc_gap).
         A smoother keeps its driver's values, temperaments and all (*model*: it
         was a driver's car, picked after placement, _sync_smoothers): its driver
         drives it before Smoother start, the quiet law is that driver's model,
-        and the driver's IDM is its safety layer's reference and its gap cap's
+        and the driver's IDM is its safety override's reference and its gap cap's
         fallback; its FollowerStopper or PI law has fixed settings, the same for
         every smoother, and tracks without a reaction delay (_move).
         """
@@ -1254,23 +1468,35 @@ class RingSim:
         own_gap = np.maximum(HEADWAY_FLOOR * eff.time_headway, eff.time_headway + self.z_gap[i] * eff.headway_std)
         kind = self.kind[i]
         if self.automated:
+            if self.av_weather:  # (a robotaxi's on its own road factors: av_weather_scale)
+                av = self.eff_av
+                own_gap = np.where(kind == ROBOTAXI, np.maximum(HEADWAY_FLOOR * av.time_headway,
+                                                                av.time_headway + self.z_gap[i] * av.headway_std),
+                                   own_gap)
             own_gap = np.where(kind == ROBOTAXI, cfg.robotaxi_headway * own_gap, own_gap)
         if self.controllers:
             ctrl = (kind == ACC) | (kind == CAV)
             own_gap = np.where(ctrl, self._acc_law_gap(np.where(kind == ACC, cfg.acc_headway, self.acc_gap[i]),
-                                                       self.company[i]), own_gap)
+                                                       self.company[i], self._kind_road_gap(kind)), own_gap)
         truck = self.truck[i]
         self.headway[i] = np.where(truck, TRUCK_HEADWAY_FACTOR * own_gap, own_gap)
-        self.accel[i] = np.where(truck, TRUCK_ACCEL_FACTOR * eff.max_accel, eff.max_accel)
+        accel = eff.max_accel
+        if self.av_weather:  # (a driverless vehicle's on its own road factors)
+            accel = np.where(self._driverless(kind), self.eff_av.max_accel, accel)
+        self.accel[i] = np.where(truck, TRUCK_ACCEL_FACTOR * accel, accel)
         self.s0[i] = self._standstill_gaps(i)
         reaction = np.clip(cfg.reaction_time + self.z_react[i] * cfg.reaction_std, 0.0, MAX_REACTION)
-        if self.controllers:  # the ACC car's dead time (Gunter 2019 Eq. 3's tau, at most ACC_DEAD_MAX), a CAV none
-            dead = np.where(kind == ACC, np.clip(cfg.acc_delay * self._brand(self.company[i]), 0.0, ACC_DEAD_MAX), 0.0)
+        if self.controllers:  # the ACC car's dead time (Gunter 2019 Eq. 3's tau, at most ACC_DEAD_MAX and
+            # ACC_DEAD_GAP / its time gap), a CAV none
+            longest = np.minimum(ACC_DEAD_MAX, ACC_DEAD_GAP / self.headway[i])
+            dead = np.where(kind == ACC, np.clip(cfg.acc_delay * self._brand(self.company[i]), 0.0, longest), 0.0)
             reaction = np.where(ctrl, dead, reaction)
         self.delay[i] = np.rint(reaction / cfg.dt).astype(np.int64)
+        self.delay_used[i] = self.delay[i]  # (settled: no start under way, _move)
 
     def _brand(self, company):
-        """The brand factor of vehicles of these companies on the ACC/CACC time gaps and the ACC dead time:
+        """The brand factor of vehicles of these companies on the ACC time gaps (an ACC car's ACC time gap, a CAV's
+        ACC-fallback gap; not the CACC time gaps, _cacc_gap) and the ACC dead time:
         company k of n gets 1 + brand_spread (2k/(n-1) - 1), evenly spaced around 1 and the same every run (with
         brand_spread 0.6 around a 1.3 s gap, 0.52-2.08 s: Gunter et al. 2019 Table II's 0.54-2.05 s over
         production ACC settings, *derived*). The plain number 1 with one company or no spread; 1 for no company
@@ -1280,38 +1506,37 @@ class RingSim:
             return 1.0
         return np.where(company >= 0, 1.0 + spread * (2.0 * np.maximum(company, 0) / (n - 1) - 1.0), 1.0)
 
-    def _auto_gap(self, gap, company):
-        """[s] A controller's time gap setting ``gap`` (ACC time gap, an ACC-fallback gap, CACC time gap or
-        CAV_PLATOON_GAP) as vehicles of these companies keep it: times the brand factor and the road's time-gap
-        factor (truck body: the caller)."""
-        return gap * self._brand(company) * self.road_gap
+    def _acc_law_gap(self, gap, company, road=None):
+        """[s] The time gap the ACC law keeps for the setting ``gap`` (ACC time gap, or a CAV's ACC-fallback gap) in
+        vehicles of these companies: times the brand factor (_brand) and the road's time-gap factor ``road`` (default
+        road_gap; a CAV's, driverless, road_gap_av) (truck body: the caller). No floor: with the flat margin every
+        reachable setting is locally stable (ACC_DEAD_MAX)."""
+        return gap * self._brand(company) * (self.road_gap if road is None else road)
 
-    def _acc_law_gap(self, gap, company):
-        """[s] The time gap the ACC law keeps for the setting ``gap`` (ACC time gap, or a CAV's ACC-fallback gap):
-        _auto_gap, at least ACC_GAP_MIN (so Xiao's margin never makes the equilibrium spacing shrink with speed;
-        truck body: the caller)."""
-        return np.maximum(self._auto_gap(gap, company), ACC_GAP_MIN)
+    def _cacc_gap(self, gap):
+        """[s] The time gap the CACC law keeps for the setting ``gap`` (CACC time gap or CAV_PLATOON_GAP): times the
+        road's time-gap factor only (a CAV's: road_gap_av) (truck body: the caller). *assumption*: no brand factor
+        (Gunter et al. 2019 measured production ACC cars; a CACC string's time gap is a design parameter of the string,
+        and brand-scaled CACC gaps of 0.28-0.49 s amplified, below the 0.667 s bound of CACC_S0, *derived*)."""
+        return gap * self.road_gap_av
 
     @staticmethod
     def acc_margin(v) -> np.ndarray:
-        """[m] The ACC spacing margin at speed ``v`` (Xiao et al. 2017 Eq. 6, less the vehicle length): ACC_S0 up
-        to ACC_S0_LOW, ACC_S0_K / v - 5 m up to ACC_S0_HIGH (1.94 m just above 10.8 m/s: the source's own step),
-        0 above."""
-        v = np.asarray(v, dtype=float)
-        return np.where(v <= ACC_S0_LOW, ACC_S0,
-                        np.where(v < ACC_S0_HIGH, ACC_S0_K / np.maximum(v, ACC_S0_LOW) - 5.0, 0.0))
+        """[m] The ACC spacing margin at speed ``v``: ACC_S0 at every speed (Xiao et al. 2017 Eq. 6's low-speed
+        value, flat: see ACC_S0)."""
+        return np.full(np.shape(v), ACC_S0)
 
     @staticmethod
     def cacc_margin(v) -> np.ndarray:
-        """[m] The CACC spacing margin at speed ``v`` (Xiao et al. 2017 Eq. 7, less the vehicle length): CACC_S0 at
-        standstill, CACC_S0_SLOPE less per m/s, 0 from 10 m/s."""
-        return np.maximum(CACC_S0 - CACC_S0_SLOPE * np.asarray(v, dtype=float), 0.0)
+        """[m] The CACC spacing margin at speed ``v``: CACC_S0 at every speed (Xiao et al. 2017 Eq. 7 at standstill,
+        flat: see CACC_S0)."""
+        return np.full(np.shape(v), CACC_S0)
 
     def _standstill_gaps(self, i) -> np.ndarray:
         """[m] The standstill gap of the vehicles in ``i``: Standstill gap, ROBOTAXI_S0_EXTRA more for a robotaxi,
-        ACC_S0 (the controllers' margin at standstill) for an ACC car or a CAV (a truck keeps its driver's: see
-        TRUCK_*; the road condition never scales it, ROAD_SCALED). The ACC cars' and CAVs' margins then follow
-        their speed and mode every step (_controller_gaps)."""
+        ACC_S0 (the ACC margin) for an ACC car or a CAV (a truck keeps its driver's: see TRUCK_*; the road
+        condition never scales it, ROAD_SCALED). A CAV's margin then follows its mode every step (CACC_S0 in a
+        CACC string: _controller_gaps)."""
         return self._kind_s0(self.kind[i])
 
     def _kind_s0(self, kind) -> np.ndarray:
@@ -1344,10 +1569,14 @@ class RingSim:
         (or on ``lane`` if given). Trucks want TRUCK_SPEED_FACTOR of their driver's.
 
         Floored at half the mean: a huge spread would otherwise create drivers
-        who barely move, i.e. moving bottlenecks rather than phantom jams.
+        who barely move, i.e. moving bottlenecks rather than phantom jams. A
+        driverless vehicle (no spread) on its own road factors (av_weather) wants
+        their mean speed.
         """
         eff = self.eff
         v0 = np.maximum(0.5 * eff.mean_speed, eff.mean_speed + self.z[idx] * eff.speed_std)
+        if self.av_weather:
+            v0 = np.where(self._driverless(self.kind[idx]), self.eff_av.mean_speed, v0)
         if not self.uniform_length:
             v0 = np.where(self.truck[idx], TRUCK_SPEED_FACTOR * v0, v0)
         lanes = self.lane[idx] if lane is None else lane
@@ -1362,29 +1591,30 @@ class RingSim:
         cfg = self.cfg
         v = self.desired_speed(idx)
         to_exit = (self.exit_at[idx] - self.travel[idx]) * self.r_out
-        approach = np.sqrt(cfg.turn_speed**2 + 2 * self.eff.comfort_decel * np.maximum(to_exit - 5.0, 0.0))
+        approach = np.sqrt(cfg.turn_speed**2 + 2 * self._comfort(idx) * np.maximum(to_exit - 5.0, 0.0))
         slowing = np.isfinite(to_exit) & (self.lane[idx] == self.outer)
         return np.where(slowing, np.minimum(v, approach), v)
 
-    def _free_acc(self, v, v0, a) -> np.ndarray:
-        """IDM free-road acceleration towards ``v0`` for max acceleration ``a`` (a number, or
-        per car). Above the desired speed it brakes gently (improved IDM) instead of the
-        plain IDM's hard (v/v0)^4."""
-        b = self.eff.comfort_decel
+    def _free_acc(self, v, v0, a, b=None) -> np.ndarray:
+        """IDM free-road acceleration towards ``v0`` for max acceleration ``a`` and comfortable braking ``b`` (numbers,
+        or per car; ``b`` by default the effective Comfortable braking). Above the desired speed it brakes gently
+        (improved IDM) instead of the plain IDM's hard (v/v0)^4."""
+        b = self.eff.comfort_decel if b is None else b
         v = np.asarray(v, dtype=float)
         v0 = np.maximum(np.asarray(v0, dtype=float), 0.1)
         free = a * (1 - (v / v0) ** 4)
         over = v > v0
         if over.any():
             a_over = a[over] if np.ndim(a) else a
-            free[over] = -b * (1 - (v0[over] / v[over]) ** (4 * a_over / b))
+            b_over = b[over] if np.ndim(b) else b
+            free[over] = -b_over * (1 - (v0[over] / v[over]) ** (4 * a_over / b_over))
         return free
 
-    def _interaction(self, v, gap, v_lead, a, T, s0=None) -> np.ndarray:
+    def _interaction(self, v, gap, v_lead, a, T, s0=None, b=None) -> np.ndarray:
         """IDM braking towards a leader ``gap`` metres (bumper to bumper) ahead, for drivers
-        with max acceleration ``a``, time gap ``T`` and standstill gap ``s0`` (numbers, or aligned
-        with ``v``; ``s0`` by default Standstill gap)."""
-        b = self.eff.comfort_decel
+        with max acceleration ``a``, time gap ``T``, standstill gap ``s0`` and comfortable braking ``b`` (numbers, or
+        aligned with ``v``; ``s0`` by default Standstill gap, ``b`` the effective Comfortable braking)."""
+        b = self.eff.comfort_decel if b is None else b
         s0 = self.cfg.min_gap if s0 is None else s0
         s_star = s0 + np.maximum(0.0, v * T + v * (v - v_lead) / (2 * np.sqrt(a * b)))
         return a * (s_star / np.maximum(gap, 0.1)) ** 2
@@ -1398,10 +1628,11 @@ class RingSim:
         a, own_T, own_s0 = self._driving(slots)
         T = own_T if T is None else T
         s0 = own_s0 if s0 is None else s0
+        b = self._comfort(slots)
         v = np.asarray(v, dtype=float)
         seen = np.isfinite(gap) & (gap <= self.cfg.reaction_distance)
-        return self._free_acc(v, v0, a) - np.where(seen, self._interaction(v, np.where(seen, gap, 1.0), v_lead,
-                                                                           a, T, s0), 0.0)
+        return self._free_acc(v, v0, a, b) - np.where(seen, self._interaction(v, np.where(seen, gap, 1.0), v_lead,
+                                                                              a, T, s0, b), 0.0)
 
     def _car_following(self, idx, v, v0, ld, g, lead, gap) -> np.ndarray:
         """Car-following acceleration with multi-anticipation (as in Treiber's
@@ -1420,13 +1651,20 @@ class RingSim:
         in between. Automated vehicles react to their direct leader only
         (*model*: what their sensors track; Hu et al. 2023 calibrate the plain
         IDM to Waymo's following, and the ACC and CACC laws use it too), but a
-        smoother its driver drives, or under the quiet law (_anticipates).
+        smoother its driver drives, or under the quiet law (_anticipates). A
+        driver whose direct leader is a recognisable AV (_behind_av) keeps
+        _follow_s0_factor() of its standstill gap (follow_adapt; *model*: in
+        every term, it is the driver's own gap preference while it follows
+        the AV).
         """
         cfg = self.cfg
         a, T, s0 = self._driving(idx)
+        b = self._comfort(idx)
+        if self.adapting:
+            s0 = np.where(self._behind_av(idx, ld), s0 * self._follow_s0_factor(), s0)
         seen = np.isfinite(g) & (g <= cfg.reaction_distance)
         v_lead = np.where(ld >= 0, self.v[np.maximum(ld, 0)], v)
-        braking = np.where(seen, self._interaction(v, np.where(seen, g, 1.0), v_lead, a, T, s0), 0.0)
+        braking = np.where(seen, self._interaction(v, np.where(seen, g, 1.0), v_lead, a, T, s0, b), 0.0)
         weight = seen.astype(float)
         cars_ahead = np.bincount(self.lane[idx], minlength=self.n_lanes)[self.lane[idx]] - 1
         car, gaps = np.maximum(ld, 0), g.copy()
@@ -1444,14 +1682,15 @@ class RingSim:
             if not sees.any():
                 break
             w = 1.0 / j**2
-            braking += np.where(sees, w * self._interaction(v, gaps / j, self.v[car], a, T, s0), 0.0)
+            braking += np.where(sees, w * self._interaction(v, gaps / j, self.v[car], a, T, s0, b), 0.0)
             weight += np.where(sees, w, 0.0)
-        return self._free_acc(v, v0, a) - np.where(weight > 0, braking / np.maximum(weight, 1e-12), 0.0)
+        return self._free_acc(v, v0, a, b) - np.where(weight > 0, braking / np.maximum(weight, 1e-12), 0.0)
 
     def _driven(self, kind) -> np.ndarray:
         """Which vehicles of these kinds (codes) a human drives this step: human drivers, and smoothers before
         Smoother start (each drives as its driver until then: Stern et al. 2018 let the waves form first). The
-        others are under their controller: no noise (_move), the clip and the safety layer (_automated_limits)."""
+        others are under their controller: no noise (_move), the clip (_automated_limits) and the safety override
+        (_safety_override)."""
         driven = kind == HUMAN
         if self.smoothing and self.time < self.cfg.smoother_start:
             driven = driven | (kind == SMOOTHER)
@@ -1483,45 +1722,67 @@ class RingSim:
         :meth:`_car_following` gave every car), each kind by its law in AUTO_LAWS (``_law_<name>``).
         ``v``, ``v0``, ``ld``, ``g``: as there. Called only while automated vehicles are possible; what
         follows in ``_move`` applies on top of each kind's law: cooperative merging (_make_room_to_leave),
-        then :meth:`_automated_limits` (the clip of every command to [-max_decel, accel] and the safety
-        layer: after merging, which can lower a command again), then the reaction (dead) time, the braking
-        limit and the no-overlap constraint as for every car."""
+        then :meth:`_automated_limits` (the clip of every command to [-max_decel, accel]: after merging, which
+        can lower a command again), then the reaction (dead) time, the safety override (_safety_override), the
+        braking limit and the no-overlap constraint as for every car."""
         kind = self.kind[idx]
         for code, law in AUTO_LAWS.items():
             m = np.flatnonzero(kind == code)
             if m.size:
                 acc[m] = getattr(self, f"_law_{law}")(idx[m], v[m], v0[m], ld[m], g[m], acc[m])
 
-    def _automated_limits(self, idx, acc, a_idm) -> None:
-        """The last word on the automated vehicles' commands in ``acc`` (aligned with ``idx``, in place): after
-        cooperative merging, before the harsh-braking check (``over_braking``) and the reaction delay.
-        ``a_idm``: what _car_following gave each car before _automated_command, for an automated car the IDM
-        towards its direct leader with its own T and s0 (its anticipation terms are masked; an ACC car's and a
-        CAV's are the margin and time gap of its law this step, _controller_gaps).
+    def _automated_limits(self, idx, acc, a_idm):
+        """The automated vehicles' commands in ``acc`` (aligned with ``idx``, in place) after cooperative merging,
+        before the harsh-braking check (``over_braking``) and the reaction delay: each is clipped to [-max_decel,
+        accel] (the road's braking limit, the vehicle's acceleration). ``a_idm``: what _car_following gave each car
+        before _automated_command, for an automated car the IDM towards its direct leader with its own T and s0
+        (its anticipation terms are masked; an ACC car's and a CAV's are the margin and time gap of its law this
+        step, _controller_gaps): the safety override's reference.
 
-        Each automated command is clipped to [-max_decel, accel] (the road's braking limit, the vehicle's
-        acceleration), then passes the safety layer: where a_idm asks for more than comfortable braking, a =
-        min(a, a_idm) (*assumption*: an automatic emergency braking layer; Milanes & Shladover 2014 and Xiao et
-        al. 2017 note their laws are not collision-free). An activation is a step where a_idm asks for harder
-        braking than the law's own command (after merging): counted per episode with a per-car hold of
-        EMERGENCY_HOLD (``n_aeb``, ``aeb_until``). The IDM law of a robotaxi never activates it, and on a road
-        whose braking limit is above comfortable braking (any road at the default settings) its commands pass
-        unchanged. Here and not in _automated_command because _make_room_to_leave lowers a leaver's command to
-        as little as -1.5 b and a yielding follower's to -b (b: the effective comfort_decel), which on snow or ice
-        can lie beyond the road's braking limit (a firm Comfortable braking, or a Weather effect below 1).
-        Smoothers pass it from Smoother start on, under every law (the quiet placebo's command is clipped as the
-        others' are); before it their drivers drive them (_driven), as any driver."""
+        Returns what :meth:`_safety_override` applies after the delay buffer: (positions in ``idx``, a_idm there)
+        of the vehicles under a law of their own (ACC cars, CAVs, tracking smoothers), or None. A vehicle whose law
+        is that IDM itself (a robotaxi; a smoother under the quiet law, its driver's model) gets the override here,
+        in its decision (a = min(a, a_idm) where a_idm < -comfortable braking: it never lowers the command, and on a
+        road whose braking limit is above comfortable braking, any at the default settings, its command passes
+        unchanged), and keeps its reaction delay. Here and not in _automated_command because _make_room_to_leave
+        lowers a leaver's command to as little as -1.5 b and a yielding follower's to -b (b: the effective
+        comfort_decel), which on snow or ice can lie beyond the road's braking limit (a firm Comfortable braking, or
+        a Weather effect below 1). Smoothers pass it from Smoother start on, under every law (the quiet placebo's
+        command is clipped as the others' are); before it their drivers drive them (_driven), as any driver."""
         auto = np.flatnonzero(~self._driven(self.kind[idx]))
         if auto.size == 0:
-            return
+            return None
         slots, law, ref = idx[auto], acc[auto], a_idm[auto]
         clipped = np.minimum(np.maximum(law, -self.eff.max_decel), self.accel[slots])
-        unsafe = ref < -self.eff.comfort_decel
-        acc[auto] = np.where(unsafe, np.minimum(clipped, ref), clipped)
-        acting = slots[unsafe & (ref < law)]
+        kind = self.kind[slots]
+        own = kind == ROBOTAXI  # (the vehicles whose law is the reference IDM itself)
+        if self.smoothing and self.cfg.smoother_law == "quiet":
+            own |= kind == SMOOTHER
+        acc[auto] = np.where(own & (ref < -self._comfort(slots)), np.minimum(clipped, ref), clipped)
+        rest = np.flatnonzero(~own)
+        return (auto[rest], ref[rest]) if rest.size else None
+
+    def _safety_override(self, idx, acc, override, over_braking) -> None:
+        """The safety override, after the delay buffer (``acc``: the commands applied this step, aligned with
+        ``idx``, in place; ``override``: what _automated_limits returned): where the IDM with the vehicle's own T and
+        s0 asks for more than comfortable braking, a = min(a, a_idm) (*assumption*: a separate system acting on what
+        it senses now, so without the ACC dead time; Milanes & Shladover 2014 and Xiao et al. 2017 note their laws
+        are not collision-free). Not an emergency brake: it acts on mild excess braking too (median a_idm -2.2 against
+        -2.0 m/s2 on the default roundabout, *derived*). Its demand beyond the braking limit counts as harsh braking
+        (``over_braking``, aligned with ``idx``), as the vehicle's own would. An activation is a step where it lowers
+        the command (the law's, clipped, after its dead time): counted per episode with a per-car hold of
+        EMERGENCY_HOLD (``n_override``, ``override_until``)."""
+        pos, ref = override
+        unsafe = ref < -self._comfort(idx[pos])
+        if not unsafe.any():
+            return
+        cmd = acc[pos]
+        acc[pos] = np.where(unsafe, np.minimum(cmd, ref), cmd)
+        over_braking[pos] |= unsafe & (ref < -self.eff.max_decel)
+        acting = idx[pos[unsafe & (ref < cmd)]]
         if acting.size:
-            self.n_aeb += int((self.aeb_until[acting] < self.time).sum())
-            self.aeb_until[acting] = self.time + EMERGENCY_HOLD
+            self.n_override += int((self.override_until[acting] < self.time).sum())
+            self.override_until[acting] = self.time + EMERGENCY_HOLD
 
     def _law_idm(self, slots, v, v0, ld, g, a_idm) -> np.ndarray:
         """The IDM towards the direct leader with the car's own acceleration, time gap and standstill gap
@@ -1566,7 +1827,7 @@ class RingSim:
         engages (smoother_on was False: at Smoother start, on a switch of law, or a smoother picked later) starts
         from the car's speed. *model*: neither law commands more than the lane's comfortable cornering speed
         (sqrt(cornering limit x radius), as a driver's desired speed: desired_speed). What follows in _move
-        applies as to every automated car: merging, then the clip and the safety layer (_automated_limits)."""
+        applies as to every automated car: merging, then the clip (_automated_limits) and the safety override."""
         if not self._smoothers_track():
             self.smoother_on[slots] = False
             return a_idm
@@ -1648,60 +1909,69 @@ class RingSim:
         """The cooperation class (index into COOP_CLASSES) of pairs of vehicles of kinds ``kind`` and ``other_kind``
         (codes) and companies ``company`` and ``other`` (numbers or aligned arrays): 0 ("none") unless both are
         CONNECTED (CAVs; a human driver's company -1 equals another's, so the kinds must be tested); for two CAVs
-        coop_class within a company, the lower of coop_class and coop_between between two ("same": coop_class).
-        Compare it with COOP_CACC (strings) and COOP_INTENT."""
+        coop_class within a company, the lower of coop_class and coop_between between two ("same": coop_class),
+        except at D (COOP_PRESCRIPTIVE: prescribed by the infrastructure, SAE J3256, for every CAV pair whatever
+        the company, *assumption*). Compare it with COOP_CACC (strings, the CAV follow-up) and COOP_INTENT
+        (route-conflict anticipation)."""
         cfg = self.cfg
         within = COOP_CLASSES.index(cfg.coop_class)
-        between = within if cfg.coop_between == "same" else min(within, COOP_CLASSES.index(cfg.coop_between))
+        capped = cfg.coop_between != "same" and within != COOP_PRESCRIPTIVE
+        between = min(within, COOP_CLASSES.index(cfg.coop_between)) if capped else within
         both = (np.asarray(kind) == CAV) & (np.asarray(other_kind) == CAV)  # (CONNECTED = {CAV})
         return np.where(both, np.where(company == other, within, between), 0)
 
     def _controller_gaps(self, idx, v, ld) -> None:
-        """At the start of a step, before the car following: the ACC cars' and CAVs' spacing margins at their
-        speed ``v`` (s0: acc_margin, cacc_margin), each CAV's place in its CACC string (string_pos:
-        _string_positions) and its time gap (headway): CACC time gap as a string member, CAV_PLATOON_GAP as the
-        member that would be one too many, else its ACC-fallback gap (each x brand x road factor; a truck x
-        TRUCK_HEADWAY_FACTOR; the ACC-fallback gap at least ACC_GAP_MIN). So the laws, and the IDM _car_following
-        gives these cars (the safety layer's reference, _automated_limits), use the margin and time gap the car
-        regulates to behind its leader now. A lane change gives a CAV another leader, and with it another time gap
-        and margin: MOBIL judges each car involved by those it would keep after the change (_gaps_behind). The entry
-        checks (_entry_ok) use the lag vehicle's present ones. ``idx``, ``v``, ``ld``: as in _move."""
+        """At the start of a step, before the car following: each CAV's place in its CACC string (string_pos:
+        _string_positions), its time gap (headway) and margin (s0): CACC time gap as a string member,
+        CAV_PLATOON_GAP as the member that would be one too many (each x road factor), with the CACC margin; else
+        its ACC-fallback gap (x brand x road factor) with the ACC margin; a truck x TRUCK_HEADWAY_FACTOR (_cav_gaps).
+        So the laws, and the IDM _car_following gives these cars (the safety override's reference, _automated_limits),
+        use the margin and time gap the car regulates to behind its leader now. (An ACC car's margin is ACC_S0 at
+        every speed: _set_driving.) A lane change gives a CAV another leader, and with it another time gap and
+        margin: MOBIL judges each car involved by those it would keep after the change (_gaps_behind), as do the
+        density control's insertions and the entry checks (_entry_gaps). ``idx``, ``v``, ``ld``: as in _move."""
         kind = self.kind[idx]
-        acc = np.flatnonzero(kind == ACC)
-        if acc.size:
-            self.s0[idx[acc]] = self.acc_margin(v[acc])
         cav = np.flatnonzero(kind == CAV)
         if cav.size == 0:
             return
         pos = self._string_positions(idx, ld, kind)
         self.string_pos[idx] = pos
-        slots, p, vc = idx[cav], pos[cav], v[cav]
-        self.headway[slots], self.s0[slots] = self._cav_gaps(slots, p, vc)
+        slots = idx[cav]
+        self.headway[slots], self.s0[slots] = self._cav_gaps(slots, pos[cav])
 
-    def _cav_gaps(self, slots, pos, v) -> tuple[np.ndarray, np.ndarray]:
-        """(time gap [s], margin [m]) of the CAVs in ``slots`` at string positions ``pos`` (_string_positions) and
-        speeds ``v`` (aligned): a member (pos >= 2) CACC time gap, or CAV_PLATOON_GAP as the one too many (pos >
-        platoon_max), with the CACC margin; a string leader (pos 1) its ACC-fallback gap (at least ACC_GAP_MIN) with
-        the ACC margin. Each x brand x road factor, a truck x TRUCK_HEADWAY_FACTOR."""
+    def _cav_gaps(self, slots, pos) -> tuple[np.ndarray, np.ndarray]:
+        """(time gap [s], margin [m]) of the CAVs in ``slots`` at string positions ``pos`` (aligned): _cav_values."""
+        return self._cav_values(pos, self.company[slots], self.acc_gap[slots], self.truck[slots])
+
+    def _cav_values(self, pos, company, acc_gap, truck) -> tuple[np.ndarray, np.ndarray]:
+        """(time gap [s], margin [m]) of CAVs of these companies, ACC-fallback gaps and truck bodies at string
+        positions ``pos`` (aligned): a member (pos >= 2) the CACC time gap, or CAV_PLATOON_GAP as the one past
+        platoon_max, x road factor (_cacc_gap), with the CACC margin; a string leader (pos 1; 0: not on the ring
+        yet) its ACC-fallback gap x brand x road factor (_acc_law_gap) with the ACC margin; a truck x
+        TRUCK_HEADWAY_FACTOR."""
         cacc = pos >= 2
-        member = self._auto_gap(np.where(pos > self.cfg.platoon_max, CAV_PLATOON_GAP, self.cfg.cav_headway),
-                                self.company[slots])
-        gap = np.where(cacc, member, self._acc_law_gap(self.acc_gap[slots], self.company[slots]))
-        return (np.where(self.truck[slots], TRUCK_HEADWAY_FACTOR * gap, gap),
-                np.where(cacc, self.cacc_margin(v), self.acc_margin(v)))
+        member = self._cacc_gap(np.where(pos > self.cfg.platoon_max, CAV_PLATOON_GAP, self.cfg.cav_headway))
+        gap = np.where(cacc, member, self._acc_law_gap(acc_gap, company, self.road_gap_av))
+        return np.where(truck, TRUCK_HEADWAY_FACTOR * gap, gap), np.where(cacc, CACC_S0, ACC_S0)
+
+    def _joined_position(self, p_lead) -> np.ndarray:
+        """The string position of a CAV joining a cooperating CAV at position ``p_lead`` (0 or 1: a string leader):
+        the next (after platoon_max, platoon_max + 1, the one past it; after that, 2: it heads a new string)."""
+        pm = int(self.cfg.platoon_max)
+        p_lead = np.maximum(np.asarray(p_lead, dtype=np.int64), 1)  # (a CAV is at least the leader of its own string)
+        return np.where(p_lead > pm, 2, np.where(p_lead == pm, pm + 1, p_lead + 1))
 
     def _gaps_behind(self, cars, leaders, leader_pos=None):
         """(time gap, margin, string position) the vehicles in ``cars`` would keep behind ``leaders`` (aligned
-        slots; -1: none; a car's own slot: alone in its lane), with each leader's string position ``leader_pos``
-        (default its present string_pos), for MOBIL (_lane_changes): a lane change gives a CAV another leader,
-        and the time gap and margin it regulates to follow it (_controller_gaps). A CAV behind a CAV it cooperates
-        with at class COOP_CACC or more joins its string: the next position (after platoon_max, platoon_max + 1,
-        the one too many; after that, 2; a CAV at platoon_max + 1 now keeps leading its string there,
-        _string_positions, whether it would merge into the string ahead left out: the longer gap), so the CACC
-        time gap or CAV_PLATOON_GAP with the CACC margin; behind anything else it leads (position 1) at its
-        ACC-fallback gap with the ACC margin (_cav_gaps). Every other vehicle keeps its present ones (headway,
-        s0; position 0, or its present one). (None, None, None) while no vehicle is a CAV here (each keeps its
-        own: _driving)."""
+        slots; -1: none, or not known yet; a car's own slot: alone in its lane), with each leader's string position
+        ``leader_pos`` (default its present string_pos), for MOBIL (_lane_changes) and the density control's
+        insertions (_insert_into_gaps, _respace_lanes): a new leader gives a CAV another time gap and margin
+        (_controller_gaps). A CAV behind a CAV it cooperates with at class COOP_CACC or more joins its string
+        (_joined_position; a CAV at platoon_max + 1 now keeps leading its string there, _string_positions, whether
+        it would merge into the string ahead left out: the longer gap), so the CACC time gap or CAV_PLATOON_GAP
+        with the CACC margin; behind anything else it leads (position 1) at its ACC-fallback gap with the ACC
+        margin (_cav_gaps). Every other vehicle keeps its present ones (headway, s0; position 0, or its present
+        one). (None, None, None) while no vehicle is a CAV here (each keeps its own: _driving)."""
         if not self.controllers or self.cfg.auto_kind != "cav":
             return None, None, None
         cav = np.flatnonzero(self.kind[cars] == CAV)
@@ -1714,10 +1984,9 @@ class RingSim:
         joined = (lead >= 0) & (lead != c) & (self._coop_class(CAV, self.company[c], self.kind[ahead],
                                                                self.company[ahead]) >= COOP_CACC)
         pm = int(self.cfg.platoon_max)
-        p_lead = np.maximum(p_lead, 1)  # (a CAV is at least the leader of its own string)
-        p = np.where(joined, np.where(p_lead > pm, 2, np.where(p_lead == pm, pm + 1, p_lead + 1)), 1)
+        p = np.where(joined, self._joined_position(p_lead), 1)
         p = np.where(joined & (pos[cav] == pm + 1), pm + 1, p)  # (a cut keeps leading its string)
-        T[cav], s0[cav] = self._cav_gaps(c, p, self.v[c])
+        T[cav], s0[cav] = self._cav_gaps(c, p)
         pos[cav] = p
         return T, s0, pos
 
@@ -1737,7 +2006,8 @@ class RingSim:
         *derived*: 43 of the 54 harsh-braking onsets of CAVs at 100 % on two lanes at density 80, seeds 1-3, 300 s.)
         Such a head merges into the string ahead where both fit in one: the cars from the string ahead's head to
         its own leader, plus itself and the members behind it (up to platoon_max), at most platoon_max, so no car
-        behind it changes its time gap; one merge per chain of strings per step. A string that grows past
+        behind it changes its time gap; it waits while the head of the string ahead merges in the same step (two
+        heads of one chain can merge in one step where a head that stays lies between them). A string that grows past
         platoon_max (a vehicle joining it) is still cut by the count, and a string leader that comes to follow
         another string joins it by the count (two strings meeting: its tail may split off). *model*: membership
         follows the chain of direct leaders whatever the gap (far behind, its law's speed mode governs, as Liu's
@@ -1778,12 +2048,15 @@ class RingSim:
         rest = depth % pm
         return np.where(joined, np.where(rest == 0, pm + 1, rest + 1), pos).astype(np.int8)
 
-    def equilibrium_speed(self, gap, v0, slots=None) -> np.ndarray:
+    def equilibrium_speed(self, gap, v0, slots=None, T=None, s0=None) -> np.ndarray:
         """Steady-state IDM speed for a bumper gap (used to start cars smoothly), for the
         drivers in ``slots`` (aligned with ``gap``; default: the effective Following time gap and
-        Standstill gap), with their own time gap and standstill gap."""
+        Standstill gap), with their own time gap and standstill gap, or ``T`` and ``s0`` in their place
+        (aligned; e.g. those a CAV would keep behind a new leader: _gaps_behind)."""
         cfg = self.cfg
-        T, s0 = (self.eff.time_headway, cfg.min_gap) if slots is None else self._driving(slots)[1:]
+        own_T, own_s0 = (self.eff.time_headway, cfg.min_gap) if slots is None else self._driving(slots)[1:]
+        T = own_T if T is None else T
+        s0 = own_s0 if s0 is None else s0
         gap = np.asarray(gap, dtype=float)
         v0 = np.maximum(np.broadcast_to(np.asarray(v0, dtype=float), gap.shape), 0.1)
         lo, hi = np.zeros_like(gap), v0.copy()
@@ -1898,10 +2171,11 @@ class RingSim:
         self.stuck[i] = 0.0
         self.entered_at[i] = -np.inf
         self.inserted_at[i] = -np.inf
+        self.waited[i] = np.nan  # (an entrant's is set by _entries)
         self.acc_hist[:, i] = 0.0
         self.a_now[i] = 0.0
         self.string_pos[i] = 0
-        self.aeb_until[i] = -np.inf
+        self.override_until[i] = -np.inf
         self.ttc_until[i] = -np.inf
         self.v_cmd[i] = 0.0  # (no smoother: smoothers are picked from the drivers, _sync_smoothers)
         self.smoother_on[i] = False
@@ -2162,6 +2436,8 @@ class RingSim:
             self._move(idx)
             self._exits()
             self._lane_changes(np.flatnonzero(self.alive))
+        elif self.merge_pending:  # (an empty ring: the entries' windows still run out, _observe_entries)
+            self._observe_entries(idx, np.zeros(0), np.zeros(0))
         if open_demand:
             self._arrivals()
         if self.subject:
@@ -2188,7 +2464,8 @@ class RingSim:
             self.entrance_log.append((self.time, self.arm_arrived.copy(), self.arm_entered.copy(),
                                       self.queue_busy.copy()))
         for log in (self.detector_log, self.exit_log, self.emergency_log, self.stop_log, self.arrival_log,
-                    self.entry_log, self.blocked_log, self.gave_up_log, self.entrance_log, self.conflict_log):
+                    self.entry_log, self.blocked_log, self.gave_up_log, self.entrance_log, self.conflict_log,
+                    self.merge_log):
             while log and log[0][0] < cutoff:
                 log.popleft()
         while self.lane_change_log and self.lane_change_log[0] < cutoff:
@@ -2206,13 +2483,17 @@ class RingSim:
             self._controller_gaps(idx, v, ld)
         if self.smoothing:
             self._record_speeds(idx, v)
-        acc_now = self._car_following(idx, v, v0, ld, g, lead, gap)
+        # (the gaps the car following uses: an automated leaver turns off before reaching its leader, _leaving_first;
+        # the no-overlap constraint below keeps the real ones)
+        g_follow = self._leaving_first(idx, g) if self.automated else g
+        acc_now = self._car_following(idx, v, v0, ld, g_follow, lead, gap)
+        override = None
         if self.automated:
             a_idm = acc_now.copy()  # (an automated car's: the IDM towards its direct leader, its own T and s0)
-            self._automated_command(idx, v, v0, ld, g, acc_now)
+            self._automated_command(idx, v, v0, ld, g_follow, acc_now)
         self._make_room_to_leave(idx, v, v0, acc_now)
         if self.automated:
-            self._automated_limits(idx, acc_now, a_idm)
+            override = self._automated_limits(idx, acc_now, a_idm)  # (the clip; the override after the buffer)
         # The driver model asking for more than the brakes can give (on this
         # road): harsh braking, typically over-reaction after a late or delayed response.
         max_decel = self.eff.max_decel
@@ -2225,9 +2506,23 @@ class RingSim:
             delay = self.delay[idx]
             if self.smoothing and self._smoothers_track():  # (a tracking smoother: none, _smoothers_track)
                 delay = np.where(self.kind[idx] == SMOOTHER, 0, delay)
+            if self.adapting:  # (a driver starting from standstill behind a recognisable AV: follow_adapt, FOLLOW_*)
+                start = self._behind_av(idx, ld) & (v < FOLLOW_START_SPEED)
+                if start.any():
+                    quicker = np.rint(delay * (1.0 - FOLLOW_START_CUT * cfg.follow_adapt)).astype(np.int64)
+                    delay = np.where(start, quicker, delay)
+                # Once under way (or the AV gone) its delay grows back by at most a step per step, so the driver holds
+                # its latest decision meanwhile instead of acting again on older ones (*model*: switched back at once,
+                # it re-applied the last delay - quicker decisions, its acceleration dropping for a step and part of
+                # the head start lost, *derived*: 0.77 -> 0.56 m/s2 at a reaction time of 1 s).
+                prev = self.delay_used[idx]
+                delay = np.where(delay > prev, prev + 1, delay)
+                self.delay_used[idx] = delay
         self._hist_ptr = (self._hist_ptr + 1) % self._hist_len
         self.acc_hist[self._hist_ptr, idx] = acc_now
         acc = self.acc_hist[(self._hist_ptr - delay) % self._hist_len, idx].copy()
+        if override is not None:  # (no dead time: a separate system; its demand beyond the limit is harsh braking)
+            self._safety_override(idx, acc, override, over_braking)
 
         braking = self.brake_until[idx] > self.time
         if cfg.driver_noise > 0:
@@ -2304,6 +2599,21 @@ class RingSim:
             self.detector_log.append((self.time, int(lane)))
         if self.n_arms:
             self._log_conflicts(idx, old, dtheta)
+            self._observe_entries(idx, old, dtheta)
+
+    def _leaving_first(self, idx, g) -> np.ndarray:
+        """[m] The bumper gaps ``g`` (aligned with ``idx``) the car following uses: inf for an automated vehicle (not
+        one a human drives this step) on the outer lane whose exit comes before its leader's rear (its distance to
+        the exit below the gap), which then follows its exit approach (target_speed) and not a vehicle beyond its
+        exit (*model*: it turns off first, as it knows; e.g. a CAV lag vehicle that a CAV entrant let pass by
+        route-conflict anticipation, _anticipate_routes, would otherwise brake for that entrant). Human drivers keep
+        following such a leader (the model as it was; their entry rule leaves an entrant at least entry_gap ahead of
+        them)."""
+        auto = (self.lane[idx] == self.outer) & ~self._driven(self.kind[idx])
+        if not auto.any():
+            return g
+        first = auto & ((self.exit_at[idx] - self.travel[idx]) * self.r_out < g)
+        return np.where(first, np.inf, g) if first.any() else g
 
     def _log_conflicts(self, idx, old, dtheta) -> None:
         """Log the circulating vehicles that passed an entrance's entry point this step (its conflict point
@@ -2334,6 +2644,121 @@ class RingSim:
             np.add.at(self.arm_passed_trucks, arms[self.truck[slots]], 1)
             self.conflict_log.extend(zip([self.time] * sub.size, arms.tolist(), lanes.tolist(),
                                          self.uid[slots].tolist(), self.kind[slots].tolist()))
+
+    def _observe_entries(self, idx, old, dtheta) -> None:
+        """Observer of the conflicts at the entries, after this step's move (it reads positions, realised
+        accelerations and the safety override's marks; draws nothing; never calls _index_lanes). ``idx``, ``old``,
+        ``dtheta``: as in _log_conflicts (empty while the ring is).
+
+        Forced yields (_watch_merges): each entry's lag vehicle (the one its lag check judged: _record_entry) is watched
+        for FORCED_WINDOW s, in whole steps: its lowest realised acceleration (a_now) and whether its safety override
+        acted (_safety_override). As the window closes the entry goes into merge_log and, with a lag vehicle, into the
+        counts of its pair type (the lag the follower): merge_closed, and a forced yield (it braked harder than its
+        comfortable braking) in forced_override where its override acted in the window, else in forced_law.
+
+        PET (_watch_pet, per entrance: pet_*): the last entrant's rear clears the entry point once it has driven half
+        its length on the outer lane (*model*: an entrant that leaves the outer lane or the ring first has no PET); the
+        first other vehicle on the outer lane whose front then reaches the point ends it, PET = the time between (each
+        moment interpolated within its step: *derived*, positions linear over a step), counted up to PET_MAX in
+        pet_count, pet_total and pet_low (below PET_CRITICAL) of its pair type (that vehicle the follower, by its
+        observed kind). An entry replaces its entrance's record (*model*: the conflicting stream meets the entrant
+        directly ahead of it, so a group entering one gap has one PET, the last one's)."""
+        if self.merge_pending:
+            self._watch_merges()
+        open_ = np.flatnonzero(self.pet_slot >= 0)
+        if open_.size:
+            self._watch_pet(open_, idx, old, dtheta)
+
+    def _watch_merges(self) -> None:
+        """The forced-yield windows under way (merge_pending; see _observe_entries)."""
+        mark = self.time + EMERGENCY_HOLD  # (override_until where the safety override acted this step)
+        alive, uid, a_now, until = self.alive, self.uid, self.a_now, self.override_until
+        kept: deque[tuple] = deque()
+        for t, arm, who, kind, lag, lag_uid, lag_kind, pair, lag_time, platoon, left, low, acted in self.merge_pending:
+            if lag >= 0 and alive[lag] and uid[lag] == lag_uid:
+                low = min(low, float(a_now[lag]))
+                acted = acted or bool(until[lag] == mark)
+            if left > 1:
+                kept.append((t, arm, who, kind, lag, lag_uid, lag_kind, pair, lag_time, platoon, left - 1, low, acted))
+                continue
+            forced = pair >= 0 and low < -float(self._kind_comfort(lag_kind))
+            if pair >= 0:
+                self.merge_closed[pair] += 1
+                if forced:
+                    (self.forced_override if acted else self.forced_law)[pair] += 1
+            self.merge_log.append((t, arm, who, kind, lag_uid, lag_kind, lag_time, platoon, forced, acted))
+        self.merge_pending = kept
+
+    def _watch_pet(self, open_, idx, old, dtheta) -> None:
+        """The PET records under way (entrances ``open_``; see _observe_entries)."""
+        r, dt = self.r_out, self.cfg.dt
+        waiting = open_[np.isnan(self.pet_clear[open_])]
+        if waiting.size:  # entrants whose rear has not cleared the entry point yet
+            s = self.pet_slot[waiting]
+            here = self.alive[s] & (self.uid[s] == self.pet_uid[waiting]) & (self.lane[s] == self.outer)
+            self.pet_slot[waiting[~here]] = -1
+            w, s = waiting[here], s[here]
+            past = self.travel[s] * r - 0.5 * self.length[s]  # [m] its rear beyond the entry point
+            done = past >= 0
+            if done.any():
+                w, s, past = w[done], s[done], past[done]
+                moved = dtheta[np.searchsorted(idx, s)] * r  # [m] driven this step (each is one of idx, in order)
+                self.pet_clear[w] = self.time + np.clip(1.0 - past / np.maximum(moved, 1e-12), 0.0, 1.0) * dt
+        ready = open_[(self.pet_slot[open_] >= 0) & ~np.isnan(self.pet_clear[open_])]
+        if ready.size == 0 or idx.size == 0:
+            return
+        on = self.lane[idx] == self.outer
+        cars, d = idx[on], dtheta[on]
+        front = old[on] + 0.5 * self.length[cars] / r  # [rad] each front at the start of the step
+        ahead = (self.entry_angle[ready][:, None] - front[None, :]) % TWO_PI  # from each front on to each point
+        hit = (ahead > 0) & (ahead <= d[None, :]) & (self.uid[cars][None, :] != self.pet_uid[ready][:, None])
+        rows = np.flatnonzero(hit.any(axis=1))
+        if rows.size == 0:
+            return
+        frac = np.where(hit[rows], ahead[rows] / np.where(d > 0, d, 1.0)[None, :], np.inf)
+        first = np.argmin(frac, axis=1)
+        arms = ready[rows]
+        pet = self.time + frac[np.arange(rows.size), first] * dt - self.pet_clear[arms]
+        self.pet_slot[arms] = -1
+        counted = pet <= PET_MAX
+        if counted.any():
+            pair = pair_type(self._observed_kinds(self.kind[cars[first[counted]]]), self.pet_kind[arms[counted]])
+            np.add.at(self.pet_count, pair, 1)
+            np.add.at(self.pet_total, pair, pet[counted])
+            np.add.at(self.pet_low, pair, (pet[counted] < PET_CRITICAL).astype(np.int64))
+
+    def _record_entry(self, arm: int, slot: int, lag: int, back: float, platoon: bool) -> None:
+        """Observer of an entry at ``arm`` (the entrant now in ``slot``; ``lag``, ``back``: the lag vehicle its check
+        judged, after route-conflict anticipation, and the bumper gap to it, -1 / inf for none: _entry_check): its
+        accepted lag back / the lag's speed (inf where the lag stands) counted in merge_lags of their pair type (the
+        lag the follower, by its observed kind), the finite ones also in merge_lag_finite and merge_lag_total; its
+        forced-yield window opened (merge_pending) and its entrance's PET record started (_observe_entries).
+        ``platoon``: a CAV entering right behind its entrance's last entrant, a CAV it cooperates with (the group of
+        the CAV follow-up: _follow_up_slack)."""
+        uid, kind = int(self.uid[slot]), int(self.kind[slot])
+        if lag >= 0 and np.isfinite(back):
+            vf = float(self.v[lag])
+            lag_time = float(back) / vf if vf > 0 else np.inf
+            lag_uid, lag_kind = int(self.uid[lag]), int(self.kind[lag])
+            pair = int(pair_type(self._observed_kinds(self.kind[[lag]])[0], kind))
+            self.merge_lags[pair] += 1
+            if np.isfinite(lag_time):
+                self.merge_lag_finite[pair] += 1
+                self.merge_lag_total[pair] += lag_time
+        else:
+            lag, lag_uid, lag_kind, pair, lag_time = -1, -1, -1, -1, np.nan
+        steps = max(1, int(round(FORCED_WINDOW / self.cfg.dt)))
+        self.merge_pending.append((self.time, int(arm), uid, kind, int(lag), lag_uid, lag_kind, pair, lag_time,
+                                   bool(platoon), steps, np.inf, False))
+        self.pet_slot[arm], self.pet_uid[arm], self.pet_kind[arm], self.pet_clear[arm] = slot, uid, kind, np.nan
+
+    def _entrant_class(self, kind):
+        """Index into ENTRANT_CLASSES of entrants of these kinds (codes): 0 a human driver; 1 a CAV that cooperates
+        within its company (coop_class COOP_CACC or more); 2 any other automated vehicle (an ACC car, a robotaxi, a CAV
+        without cooperation). *model*: by the settings at the time (a live change of coop_class moves a vehicle's later
+        travel time to its new class)."""
+        coop = COOP_CLASSES.index(self.cfg.coop_class) >= COOP_CACC
+        return np.where(kind == HUMAN, 0, np.where((kind == CAV) & coop, 1, 2))
 
     def _observe_following(self, idx, v, ld, g) -> None:
         """Observer only (reads the state at the start of the step, draws nothing): the surrogate safety counts
@@ -2404,20 +2829,19 @@ class RingSim:
             return
         own = acc.copy()
         m = np.flatnonzero(must)
-        b = self.eff.comfort_decel
         leavers = idx[m]
         nl, front, nf, back = self._neighbours(self.lane[leavers] + 1, self.theta[leavers],
                                                None if self.uniform_length else self.length[leavers])
         v_front = np.where(nl >= 0, self.v[np.maximum(nl, 0)], v[m])
         follow = self._idm(v[m], v0[m], front, v_front, leavers)
-        acc[m] = np.minimum(acc[m], np.maximum(follow, -1.5 * b))
+        acc[m] = np.minimum(acc[m], np.maximum(follow, -1.5 * self._comfort(leavers)))  # (each its own: _comfort)
         has = nf >= 0
         if has.any():
             pos = np.empty(self.cap, dtype=np.int64)
             pos[idx] = np.arange(idx.size)
             f = pos[nf[has]]
             yield_acc = self._idm(v[f], v0[f], back[has], v[m][has], idx[f])
-            np.minimum.at(acc, f, np.maximum(yield_acc, -b))
+            np.minimum.at(acc, f, np.maximum(yield_acc, -self._comfort(idx[f])))
 
         held = must & (v < 0.5) & (own > 0) & (acc <= 0)
         self.stuck[idx] = np.where(held, self.stuck[idx] + self.cfg.dt, 0.0)
@@ -2445,6 +2869,9 @@ class RingSim:
                                 % TWO_PI - np.pi), axis=1)
         for slot, arm in zip(leaving, arms):
             self.exit_log.append((self.time, int(arm), self.time - self.born[slot]))
+        timed = leaving[np.isfinite(self.waited[leaving])]
+        if timed.size:  # (observer: the travel times and control delays of the entrants by class, CLASS_ARRAYS)
+            self._time_trips(timed)
         self.alive[leaving] = False
         self.n_exited += leaving.size
         if self.open_demand:
@@ -2460,6 +2887,19 @@ class RingSim:
                 self.n_arrived += 1
                 self.arm_arrived[arm] += 1
                 self.arrival_log.append((self.time, int(arm)))
+
+    def _time_trips(self, slots) -> None:
+        """Observer of the leavers ``slots`` that came in from an entrance (waited finite; not the capacity test's): per
+        entrant class (_entrant_class) an exit, its travel time = queue wait + time on the ring, and its control delay =
+        travel time - its ring trip at free speed: the angle it drove at its desired speed on the outer lane (cornering
+        capped: desired_speed). *model*: the free trip has no slowing for the entry and the exit (turn speed), so this
+        control delay includes the geometric delay the HCM's leaves out."""
+        travel = self.waited[slots] + (self.time - self.entered_at[slots])
+        free = self.travel[slots] * self.r_out / np.maximum(self.desired_speed(slots, self.outer), 0.1)
+        c = self._entrant_class(self.kind[slots])
+        np.add.at(self.class_exits, c, 1)
+        np.add.at(self.class_travel, c, travel)
+        np.add.at(self.class_control, c, travel - free)
 
     def _arrivals(self) -> None:
         """Open mode: cars arrive at each entrance at random (Poisson, from the demand
@@ -2585,8 +3025,11 @@ class RingSim:
                                             self.v[lead[c]], os_, T_o, s0_o), 0.0)
         a_o_old = np.where(has_o, acc[os_], 0.0)
         forced = mandatory[k] & (opt < n)  # a leaver must move out
-        # Braking a change may force on anyone: more for a leaver, never beyond what the road allows.
-        b_safe = np.minimum(self.eff.comfort_decel * np.where(mandatory[k], 2.5, 1.5), self.eff.max_decel)
+        # Braking a change may force on anyone: more for a leaver, never beyond what the road allows (each its own
+        # comfortable braking: a driverless vehicle's on its own road factors, av_weather).
+        factor = np.where(mandatory[k], 2.5, 1.5)
+        b_safe = np.minimum(self._comfort(c) * factor, self.eff.max_decel)
+        b_safe_f = np.minimum(self._comfort(f) * factor, self.eff.max_decel) if self.av_weather else b_safe
         # Room kept to the new leader and from the new follower: half the standstill gap of the car behind each
         # gap (the changer's ahead of it, the new follower's behind it), at least SAFE_MARGIN + 0.2 m.
         room_front = room_back = max(0.5 * cfg.min_gap, SAFE_MARGIN + 0.2)
@@ -2594,7 +3037,12 @@ class RingSim:
             room_front = np.maximum(0.5 * (self.s0[c] if s0_c is None else s0_c), SAFE_MARGIN + 0.2)
             room_back = np.where(has_f, np.maximum(0.5 * (self.s0[f] if s0_f is None else s0_f), SAFE_MARGIN + 0.2),
                                  room_back)
-        safe = (front >= room_front) & (back >= room_back) & (a_f_new >= -b_safe) & (a_self >= -b_safe)
+        if self.exploiting:  # a driver changing lane in front of a recognisable new follower (exploit_gap): the room
+            ex = cfg.exploit_gap  # it leaves behind x it (at least the no-overlap margin), the braking forced / it
+            ahead_of_av = has_f & self._steered(self.kind[c]) & SEEN_AS_AV[self._observed_kinds(self.kind[f])]
+            room_back = np.where(ahead_of_av, np.maximum(room_back * ex, SAFE_MARGIN), room_back)
+            b_safe_f = np.where(ahead_of_av, np.minimum(self._comfort(f) * factor / ex, self.eff.max_decel), b_safe_f)
+        safe = (front >= room_front) & (back >= room_back) & (a_f_new >= -b_safe_f) & (a_self >= -b_safe)
         gain = (a_self - acc[c]) + cfg.politeness * ((a_f_new - a_f_old) + (a_o_new - a_o_old))
         if cfg.lane_change_motive == "random":
             wants = np.ones(opt.size, dtype=bool)
@@ -2648,23 +3096,84 @@ class RingSim:
         steps of 0.1 s)."""
         return int(np.floor(self.eff.follow_up / self.cfg.dt + 1e-9)) + 1
 
+    def _av_follow_up_steps(self) -> int:
+        """follow_up_steps() for a driverless queue head: on its own road factors' follow-up while av_weather."""
+        return int(np.floor(self.eff_av.follow_up / self.cfg.dt + 1e-9)) + 1 if self.av_weather \
+            else self.follow_up_steps()
+
+    def _adapt_slack(self) -> int:
+        """[steps] How much sooner a driver may enter behind a recognisable AV entrant still directly ahead
+        (follow_adapt): round(follow_adapt x FOLLOW_UP_CUT / dt)."""
+        return int(np.rint(self.cfg.follow_adapt * FOLLOW_UP_CUT / self.cfg.dt))
+
+    def _follow_up_slack(self, follow_up: int, arms=None) -> tuple[np.ndarray, np.ndarray]:
+        """(slack, behind): for each of these entrances (default all), how many steps of its entry_cool its queue
+        head may still have left and be ready (0: the human rule, entry_cool <= 0; below 0: it waits longer), and
+        whether that holds only while the entrance's last entrant is still directly ahead of the entry point
+        (_entries). ``follow_up``: follow_up_steps(). A head of follow-up factor f is ready when entry_cool <=
+        follow_up - round(f x follow_up), so the REALISED spacing (follow_up_steps() steps: 2.6 s for a Follow-up time
+        of 2.5 s at dt 0.1 s) scales by f, and f = 1 is the human rule exactly. f: cav_follow_up for a CAV behind its
+        entrance's last entrant, a CAV it cooperates with at class COOP_CACC or more, only while that one is still
+        directly ahead (FHWA-OR-RD-22-11 Table 7.1, single-lane entry: follow-up headway 2.62 s at 0 % CAVs to 1.93 s
+        at 100 %, x0.737; 1 / fA = 1 / 1.35 = 0.741, Table 1.7; p. 117: waiting CAVs entering one gap as a CACC
+        group); robotaxi_entry for a robotaxi, whoever entered before (*assumption*, as for its critical gap); 1 for
+        anyone else. A driverless head's realised follow-up is its own while the driverless vehicles drive by their own
+        road factors (_av_follow_up_steps; av_weather_scale). A driver (or an ACC car's) behind a recognisable AV
+        entrant still directly ahead may go _adapt_slack() steps early (follow_adapt: entry_cool <= round(follow_adapt
+        x FOLLOW_UP_CUT / dt), with behind True: its start-up reaction behind an AV, Wang et al. 2023 via Reddy et al.
+        2025 p. 3). (A truck entrant's longer follow-up is set into entry_cool at its entry: _entries.)"""
+        cfg = self.cfg
+        arms = np.arange(self.n_arms) if arms is None else arms
+        kind = self._head_values("queue_kinds", HUMAN, arms)
+        company = self._head_values("queue_companies", -1, arms)
+        behind = (kind == CAV) & (self._coop_class(CAV, company, self.last_kind[arms], self.last_company[arms])
+                                  >= COOP_CACC)
+        f = np.where(behind, cfg.cav_follow_up, np.where(kind == ROBOTAXI, cfg.robotaxi_entry, 1.0))
+        base = np.where(self._driverless(kind), self._av_follow_up_steps(), follow_up) if self.av_weather else follow_up
+        slack = follow_up - np.rint(f * base).astype(np.int64)
+        if self.adapting:
+            after_av = self._steered(kind) & SEEN_AS_AV[self.last_kind[arms]]
+            slack = np.where(after_av, self._adapt_slack(), slack)
+            behind = behind | after_av
+        return slack, behind
+
     def _entries(self) -> None:
-        """Queued cars merge in where the gap allows, at most one per entrance per follow-up time."""
+        """Queued cars merge in where the gap allows, at most one per entrance per follow-up time
+        (by kind: _follow_up_slack, _entry_check)."""
         if self.n_arms == 0 or not self.queue.any():
             return
         self.queue_busy += self.cfg.dt * (self.queue > 0)  # entrances with cars waiting this step
-        ready = np.flatnonzero((self.queue > 0) & (self.entry_cool <= 0))
+        follow_up = self.follow_up_steps()
+        if self.automated:  # (each head by its kind and its entrance's last entrant; none can be earlier than this)
+            fastest = min(1.0, self.cfg.cav_follow_up, self.cfg.robotaxi_entry) * min(follow_up,
+                                                                                       self._av_follow_up_steps())
+            earliest = follow_up - int(np.rint(fastest))
+            if self.adapting:
+                earliest = max(earliest, self._adapt_slack())
+            cand = np.flatnonzero((self.queue > 0) & (self.entry_cool <= earliest))
+            behind = np.zeros(self.n_arms, dtype=bool)
+            if cand.size:
+                slack, behind[cand] = self._follow_up_slack(follow_up, cand)
+                cand = cand[self.entry_cool[cand] <= slack]
+            ready = cand[self._handed_over(cand)] if self.handover and cand.size else cand
+        else:
+            ready = np.flatnonzero((self.queue > 0) & (self.entry_cool <= 0))
         if ready.size == 0:
             return
         # Only the outer lane's index is needed (the others are rebuilt before their next use).
         cars = np.flatnonzero(self.alive & (self.lane == self.outer))
         order = cars[np.argsort(self.theta[cars], kind="stable")]
         self._lanes[self.outer] = (order, self.theta[order])
-        follow_up = self.follow_up_steps()
         arms = self.rng.permutation(ready)
         while arms.size:
             # Check the remaining arms together; after an entry, re-check the ones after it.
-            ok, v_in = self._entry_ok(self.entry_angle[arms], self._head_trucks(arms), self._head_s0(arms))
+            ok, v_in, ahead, lag, back = self._entry_check(self.entry_angle[arms], self._head_trucks(arms),
+                                                           self._head_s0(arms), arms if self.automated else None,
+                                                           lags=True)
+            if self.automated:  # a head ready before the human rule only right behind its entrance's last entrant
+                early = behind[arms] & (self.entry_cool[arms] > 0)
+                if early.any():
+                    ok &= ~early | ((ahead >= 0) & (self.uid[np.maximum(ahead, 0)] == self.last_uid[arms]))
             hits = np.flatnonzero(ok)
             if hits.size == 0:
                 break
@@ -2682,7 +3191,26 @@ class RingSim:
             self.entry_wait_total += wait
             self.arm_entry_wait[arm] += wait
             self.entry_log.append((self.time, int(arm), wait))
-            self.entry_cool[arm] = follow_up
+            # *model*: the queue behind a truck waits truck_follow_up x the follow-up (the realised spacing, as for
+            # _follow_up_slack's factors) for it to clear the yield line (TRUCK_* above: the HCM's E_T).
+            self.entry_cool[arm] = follow_up if not truck or self.cfg.truck_follow_up == 1 else \
+                int(np.rint(self.cfg.truck_follow_up * follow_up))
+            # (observers: the entrant's class and wait, unless the capacity test's standing queue, an instrument; its
+            # conflicts, a CAV entering in its cooperating predecessor's gap counting as a platoon)
+            kind = self.kind[slot[0]]
+            if not (self.subject and arm == SUBJECT_ARM):
+                c = int(self._entrant_class(kind))
+                self.class_entries[c] += 1
+                self.class_wait[c] += wait
+                self.waited[slot] = wait
+            platoon = bool(self.automated and kind == CAV and behind[arm] and ahead[k] >= 0
+                           and self.uid[ahead[k]] == self.last_uid[arm])
+            self._record_entry(int(arm), int(slot[0]), int(lag[k]), float(back[k]), platoon)
+            self.last_entry[arm] = self.time
+            self.last_kind[arm], self.last_company[arm] = self.kind[slot[0]], self.company[slot[0]]
+            self.last_uid[arm] = self.uid[slot[0]]
+            if self.subject and arm != SUBJECT_ARM:
+                self._route_feeding(slot[0])
             self.n_entered += 1
             self.arm_entered[arm] += 1
             # Keep the outer lane's sorted index current for the next arm.
@@ -2690,6 +3218,21 @@ class RingSim:
             pos = np.searchsorted(th, angle)
             self._lanes[self.outer] = (np.insert(order, pos, slot[0]), np.insert(th, pos, angle % TWO_PI))
             arms = arms[k + 1:]
+
+    def _route_feeding(self, slot: int) -> None:
+        """The capacity test: an entrant of a feeding entrance (any but SUBJECT_ARM), number n of them (n_feeding,
+        from 0), leaves at the subject entrance's own exit, which comes before its entry point, iff floor((n + 1)
+        s) > floor(n s), s = subject_exiting: a deterministic count (Bresenham's line rule), no draws, so exactly
+        that share of them, evenly spread, never passes the entry point and the conflicting flow keeps its meaning
+        (the others keep their route past it: _draw_routes). FHWA-OR-RD-22-11 Sec. 7.3.4 added exiting flows of 10,
+        30 and 50 % of the conflicting flow (s = 0.09, 0.23 and 0.33: the exiting flow is s / (1 - s) of it). On a
+        ring of three or more lanes a few of them change lane inward on the way, miss the exit (n_missed) and pass
+        the entry point after all (*derived*, s 0.5, 600 s: 6 of 109 on the 3-lane default, 13 of 194 on 5 lanes,
+        none on one or two lanes): the capacity test is validated on one or two circulating lanes."""
+        n, s = self.n_feeding, self.cfg.subject_exiting
+        self.n_feeding += 1
+        if s > 0 and np.floor((n + 1) * s) > np.floor(n * s):
+            self.exit_at[slot] = self.travel[slot] + (self.exit_angle[SUBJECT_ARM] - self.theta[slot]) % TWO_PI
 
     def _pop_kinds(self, arm: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(kind, company, ACC-fallback gap) of the vehicle at the head of an entrance's queue, as one-element
@@ -2700,12 +3243,27 @@ class RingSim:
                                            ("queue_acc_gaps", "acc_gap"))
                      for fifo in [getattr(self, name)[arm]])
 
+    def _head_values(self, name: str, fill, arms) -> np.ndarray:
+        """What the vehicles at the head of these entrances' queues carry in the queue field ``name``
+        (QUEUE_FIELDS), ``fill`` where a queue is empty or lacks it."""
+        fifos = getattr(self, name)
+        return np.array([fifos[arm][0] if fifos[arm] else fill for arm in arms])
+
     def _head_trucks(self, arms) -> np.ndarray | None:
         """Whether the vehicle at the head of each of these entrances' queues is a truck
         (None when every vehicle is a car)."""
         if self.uniform_length:
             return None
         return np.array([bool(self.queue_trucks[arm][0]) if self.queue_trucks[arm] else False for arm in arms])
+
+    def _handed_over(self, arms) -> np.ndarray:
+        """Whether the queue heads of these entrances may try to enter, while driverless heads wait for a handover
+        (``handover``: av_handover on snow or ice; *assumption*: remote assistance confirms each entry): a driverless
+        head only av_handover s after it became the head (its arrival, or its entrance's last entry if that came later:
+        last_entry), anyone else at once."""
+        kind = self._head_values("queue_kinds", HUMAN, arms)
+        since = np.maximum([self.queue_times[arm][0] for arm in arms], self.last_entry[arms])
+        return ~self._driverless(kind) | (self.time - since >= self.cfg.av_handover - 1e-9)
 
     def _head_s0(self, arms) -> np.ndarray | None:
         """[m] The standstill gap of the vehicle at the head of each of these entrances' queues, by the kind its
@@ -2715,28 +3273,185 @@ class RingSim:
         return self._kind_s0(np.array([self.queue_kinds[arm][0] if self.queue_kinds[arm] else HUMAN for arm in arms]))
 
     def _entry_ok(self, angles: np.ndarray, trucks: np.ndarray | None = None,
-                  s0: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        """Whether a vehicle may enter the outer lane at each of ``angles`` (``trucks``: which are
-        trucks; None = all cars), and at what speed. The room it needs ahead is its own standstill gap
-        (``s0``; None = Standstill gap for all) + 1 m, and behind it the lag vehicle's own + 1 m: an entrant
-        let into less than its own (a robotaxi's is 1.94 m longer) would brake to a stand at the entry point
-        and hold up the next one (the entry rules by kind are S3's)."""
+                  s0: np.ndarray | None = None, *, arms=None) -> tuple[np.ndarray, np.ndarray]:
+        """Whether a vehicle may enter the outer lane at each of ``angles`` (``trucks``: which are trucks; None =
+        all cars; ``s0``: their standstill gaps, None = Standstill gap for all), and at what speed: _entry_check
+        (``arms``: the entrances, whose queue heads then enter by their kinds' rules)."""
+        return self._entry_check(angles, trucks, s0, arms)[:2]
+
+    def _entry_check(self, angles: np.ndarray, trucks: np.ndarray | None = None, s0: np.ndarray | None = None,
+                     arms=None, *, lags: bool = False) -> tuple[np.ndarray, ...]:
+        """(whether a vehicle may enter the outer lane at each of ``angles``, its speed there, the slot of the
+        vehicle it would follow: -1 for none); with ``lags`` also (the slot of the lag vehicle judged, -1 for none,
+        and the bumper gap to it, inf for none), for the observers (_record_entry). ``trucks``: which are trucks (None
+        = all cars). The human rule: the
+        room it needs ahead is its own standstill gap (``s0``; None = Standstill gap for all) + 1 m (an entrant let
+        into less than its own would brake to a stand at the entry point and hold up the next one), behind it the
+        lag vehicle's own + 1 m; the lag vehicle must be at least entry_gap x its speed behind (the critical gap,
+        as a lag) and need brake no harder than comfortably for it (its IDM at the entrant's speed).
+
+        ``arms`` (the entrances, while automated vehicles are possible): each queue head by its kind. Its critical
+        gap is entry_gap x cav_entry_gap for a CAV (FHWA-OR-RD-22-11 Sec. 7.3.2 puts the Raff critical headway's
+        fall, 4.08 to 3.48 s at 0 to 100 % CAVs, Table 7.1, down to short rejected gaps, the accepted ones
+        unchanged: 1.0 by default) and x robotaxi_entry for a robotaxi (*assumption*); entry_gap for a human
+        driver or an ACC car's driver. An automated head also needs room ahead such that the IDM with its own time
+        gap and margin behind the vehicle it would follow (a CAV joins a cooperating CAV's string: _entrant_gaps)
+        at its entry speed asks for no more than comfortable braking (*model*: an AV does not merge into a gap its
+        own safety override would brake hard in; the mirror of the lag vehicle's check), and its room ahead is its
+        margin there + 1 m; one entering before the drivers' follow-up has passed (``arms``' entry_cool above 0: a
+        follow-up factor below 1) and not into a CACC string needs its own steady-state gap ahead (s0 + T x its
+        entry speed, within reaction_distance). A lag vehicle is judged by the time gap and margin it would keep
+        behind the entrant (a CAV may join the entrant's string: _lag_gaps). Route-conflict anticipation
+        (_anticipate_routes) may judge the next vehicle behind instead.
+
+        While the driverless vehicles drive by road factors of their own (av_weather: av_weather_scale), a driverless
+        head's entry speed, critical gap, acceleration, desired speed and comfortable braking are theirs (eff_av), and a
+        driverless lag vehicle may be asked for its own comfortable braking. A driver (or an ACC car's) whose lag
+        vehicle is a recognisable AV (exploit_gap, *assumption*: Alhuraish et al. 2026's cut-ins ahead of Waymos, 0.79;
+        Reddy et al. 2025's wariness, above 1) accepts entry_gap x exploit_gap and asks the AV for up to its
+        comfortable braking / exploit_gap (at most the braking limit), so the AV's longer time gap does not veto the
+        exploit."""
         cfg, eff = self.cfg, self.eff
         if trucks is None:
             length, v_in = cfg.car_length, np.full(angles.size, min(cfg.turn_speed, eff.mean_speed))
         else:
             length = np.where(trucks, cfg.truck_length, cfg.car_length)
             v_in = np.minimum(cfg.turn_speed, eff.mean_speed * np.where(trucks, TRUCK_SPEED_FACTOR, 1.0))
+        if arms is not None and self.av_weather:  # (a driverless head's on its own road factors)
+            drives = self._driverless(self._head_values("queue_kinds", HUMAN, arms))
+            slow = 1.0 if trucks is None else np.where(trucks, TRUCK_SPEED_FACTOR, 1.0)
+            v_in = np.where(drives, np.minimum(cfg.turn_speed, self.eff_av.mean_speed * slow), v_in)
         own = cfg.min_gap if s0 is None else s0
         nl, front, nf, back = self._neighbours_in(self.outer, angles, length)
         if nl[0] < 0:  # empty outer lane: room for anything shorter than the lane
-            return np.broadcast_to(length + own <= self.lane_len[self.outer], angles.shape).copy(), v_in
+            ok = np.broadcast_to(length + own <= self.lane_len[self.outer], angles.shape).copy()
+            return (ok, v_in, nl, nl, np.full(angles.size, np.inf)) if lags else (ok, v_in, nl)
+        v_enter = np.where(front < 15.0, np.minimum(v_in, self.v[nl]), v_in)
+        if arms is None:  # (the human rule for everyone)
+            vf = self.v[nf]
+            lag = cfg.min_gap if s0 is None else self.s0[nf]
+            follower_ok = self._idm(vf, self.desired_speed(nf), back, v_in, nf) >= -eff.comfort_decel
+            ok = ((front >= own + 1.0) & (back >= lag + 1.0)
+                  & (back >= eff.entry_gap * vf) & follower_ok)
+            return (ok, v_enter, nl, nf, back) if lags else (ok, v_enter, nl)
+        kind = self._head_values("queue_kinds", HUMAN, arms)
+        company = self._head_values("queue_companies", -1, arms)
+        acc_gap = self._head_values("queue_acc_gaps", np.nan, arms)
+        truck = np.zeros(angles.size, dtype=bool) if trucks is None else trucks
+        nf, back = self._anticipate_routes(angles, length, kind, company, nf, back)
         vf = self.v[nf]
-        lag = cfg.min_gap if s0 is None else self.s0[nf]
-        follower_ok = self._idm(vf, self.desired_speed(nf), back, v_in, nf) >= -eff.comfort_decel
-        ok = ((front >= own + 1.0) & (back >= lag + 1.0)
-              & (back >= eff.entry_gap * vf) & follower_ok)
-        return ok, np.where(front < 15.0, np.minimum(v_in, self.v[nl]), v_in)
+        T_in, s0_in, p_in = self._entrant_gaps(kind, company, acc_gap, truck, nl)
+        T_lag, s0_lag = self._lag_gaps(nf, kind, company, p_in)
+        auto = kind != HUMAN
+        own = np.where(auto, s0_in, own)
+        av = self.eff_av  # (the drivers' eff unless av_weather)
+        crit = np.where(kind == CAV, av.entry_gap * cfg.cav_entry_gap,
+                        np.where(kind == ROBOTAXI, av.entry_gap * cfg.robotaxi_entry, eff.entry_gap))
+        brake = -self._comfort(nf)  # (the most braking the lag vehicle may be asked for)
+        if self.exploiting:
+            exploits = self._steered(kind) & SEEN_AS_AV[self._observed_kinds(self.kind[nf])]
+            crit = np.where(exploits, eff.entry_gap * cfg.exploit_gap, crit)
+            # (capped at the braking limit; an exploiting driver never asks for less than a plain one would, where
+            # the AV's comfortable braking exceeds the limit: so the setting stays monotone)
+            capped = np.maximum(brake / cfg.exploit_gap, -eff.max_decel)
+            brake = np.where(exploits, np.minimum(brake, capped) if cfg.exploit_gap < 1 else capped, brake)
+        follower_ok = self._idm(vf, self.desired_speed(nf), back, v_in, nf, T_lag, s0_lag) >= brake
+        ok = (front >= own + 1.0) & (back >= s0_lag + 1.0) & (back >= crit * vf) & follower_ok
+        if auto.any():  # the room an automated head needs ahead: its own IDM brakes no harder than comfortably
+            accel, speed = eff.max_accel, eff.mean_speed
+            if self.av_weather:  # (a driverless head's on its own road factors)
+                drives = self._driverless(kind)
+                accel, speed = np.where(drives, av.max_accel, accel), np.where(drives, av.mean_speed, speed)
+            a = accel * np.where(truck, TRUCK_ACCEL_FACTOR, 1.0)
+            v0 = np.minimum(speed * np.where(truck, TRUCK_SPEED_FACTOR, 1.0),
+                            np.sqrt(eff.lateral_accel * self.r_out))  # (a driverless car's desired_speed: no spread)
+            b = self._kind_comfort(kind)
+            seen = front <= cfg.reaction_distance
+            a_in = self._free_acc(v_enter, v0, a, b) - np.where(
+                seen, self._interaction(v_enter, np.where(seen, front, 1.0), self.v[nl], a, T_in, s0_in, b), 0.0)
+            ok &= ~auto | (a_in >= -b)
+            # A head entering before the drivers' follow-up has passed (a factor below 1: _follow_up_slack) also
+            # needs its own steady-state gap ahead, s0 + T x its entry speed (*model*: a shorter follow-up is a
+            # quicker start at the yield line, not a shorter gap on the circle), unless it joins a CACC string (a CAV
+            # behind its cooperating last entrant: the string's law takes it in, FHWA-OR-RD-22-11 p. 117's group
+            # entering one gap). Without it a follow-up spacing inside the entrant's own steady-state gap slows each
+            # entrant, the next enters at its leader's lower speed, and the entering platoon locks: robotaxis (T x
+            # 1.3, s0 + 1.94 m) at robotaxi_entry 0.8-0.9 gave 1,146-1,152 veh/h at 3.55 m/s against 1,386 at 1;
+            # with it 1,476 at 6.17 m/s (*derived*: us_single_lane capacity test, no conflicting flow, seeds 0 and 11).
+            early = auto & seen & (p_in < 2) & (self.entry_cool[arms] > 0)
+            if early.any():
+                ok &= ~early | (front >= s0_in + T_in * v_enter)
+        return (ok, v_enter, nl, nf, back) if lags else (ok, v_enter, nl)
+
+    def _entrant_gaps(self, kind, company, acc_gap, truck, ahead) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(time gap [s], margin [m], string position) of queue heads of these kinds, companies, ACC-fallback gaps
+        and bodies (aligned) once they have entered behind the vehicles ``ahead`` (slots): an ACC car its ACC time
+        gap x brand x road (_acc_law_gap) with ACC_S0; a CAV behind a CAV it cooperates with at COOP_CACC or more
+        joins its string (_joined_position), else it leads one (_cav_values); a robotaxi Robotaxi time gap x the
+        drivers' Following time gap (*model*: its time-gap temperament is drawn only when it enters) with its
+        standstill gap; a truck x TRUCK_HEADWAY_FACTOR. A human driver: the drivers' Following time gap and
+        Standstill gap (unused). Position 0 for any but a CAV."""
+        cfg, eff = self.cfg, self.eff
+        pos = np.zeros(kind.size, dtype=np.int64)
+        cav = kind == CAV
+        if cav.any():
+            lead = np.maximum(ahead, 0)
+            joined = cav & (ahead >= 0) & (self._coop_class(CAV, company, self.kind[lead], self.company[lead])
+                                           >= COOP_CACC)
+            pos = np.where(cav, np.where(joined, self._joined_position(self.string_pos[lead]), 1), 0)
+        T_cav, s0_cav = self._cav_values(pos, company, acc_gap, truck)
+        own = np.where(kind == ACC, self._acc_law_gap(cfg.acc_headway, company),
+                       np.where(kind == ROBOTAXI, cfg.robotaxi_headway * self.eff_av.time_headway, eff.time_headway))
+        T = np.where(cav, T_cav, np.where(truck, TRUCK_HEADWAY_FACTOR * own, own))
+        return T, np.where(cav, s0_cav, self._kind_s0(kind)), pos
+
+    def _lag_gaps(self, lag, kind, company, pos) -> tuple[np.ndarray, np.ndarray]:
+        """(time gap [s], margin [m]) the lag vehicles ``lag`` (slots) would keep behind entrants of these kinds,
+        companies and string positions (aligned; _entrant_gaps): a CAV behind a CAV it cooperates with at COOP_CACC
+        or more joins its string (_joined_position; one at platoon_max + 1 now keeps leading its string), else it
+        leads one at its ACC-fallback gap (_cav_gaps); a driver behind a recognisable entrant its adapted standstill
+        gap (follow_adapt: _follow_s0_factor); any other vehicle keeps its present ones."""
+        T, s0 = self.headway[lag], self.s0[lag]
+        if self.adapting:  # (entrants are never smoothers: their kinds are as observed)
+            s0 = np.where(self._driven(self.kind[lag]) & SEEN_AS_AV[kind], s0 * self._follow_s0_factor(), s0)
+        cav = np.flatnonzero(self.kind[lag] == CAV)
+        if cav.size == 0:
+            return T, s0
+        c = lag[cav]
+        joined = (kind[cav] == CAV) & (self._coop_class(CAV, self.company[c], CAV, company[cav]) >= COOP_CACC)
+        pm = int(self.cfg.platoon_max)
+        p = np.where(joined, np.where(self.string_pos[c] == pm + 1, pm + 1, self._joined_position(pos[cav])), 1)
+        T[cav], s0[cav] = self._cav_gaps(c, p)
+        return T, s0
+
+    def _anticipate_routes(self, angles, length, kind, company, lag, back) -> tuple[np.ndarray, np.ndarray]:
+        """Route-conflict anticipation (FHWA-OR-RD-22-11 Sec. 7.2.2.2, part of the HCM 7 CAV basis): a CAV queue head
+        (``kind``, ``company`` aligned with ``angles``) learns by V2V the route of its lag vehicle (``lag``,
+        ``back``: slot and bumper gap behind the entry point) where that is a CAV it cooperates with at class
+        COOP_INTENT or more, and ignores it where it leaves before reaching the entrant (at this entrance's exit,
+        which comes first, or one before), judging the next vehicle behind it in its place (FHWA checks the closest
+        incoming CAV, so one per entry; nobody if it was the lane's only vehicle). It leaves first where its distance
+        to its exit is at most the bumper gap to the entrant's rear less SAFE_MARGIN (*model*: it turns off before
+        its front comes within the no-overlap constraint's margin of the standing entrant, so it never has to brake
+        for it; and _leaving_first then lets it follow its exit, not the entrant). Cars of the default size always
+        have that room (the exit-to-entry arc, at most 2.4 x lane_width = 8.4 m, less two half car lengths: 4.4 m);
+        a truck lag just before its exit behind a truck entrant has none (8.4 - 12 m: the entrant would stand on
+        it), and is judged as any lag vehicle. Human drivers cannot know who leaves: their lag check counts every
+        vehicle. Returns the lag slots and bumper gaps to use."""
+        cand = (kind == CAV) & (self.kind[lag] == CAV)
+        if not cand.any():
+            return lag, back
+        cand &= self._coop_class(CAV, company, CAV, self.company[lag]) >= COOP_INTENT
+        cand &= (self.exit_at[lag] - self.travel[lag]) * self.r_out <= back - SAFE_MARGIN  # (it turns off first)
+        if not cand.any():
+            return lag, back
+        order, th = self._lanes[self.outer]
+        nxt = order[(np.searchsorted(th, angles) - 2) % order.size]
+        half = self.cfg.car_length if self.uniform_length else 0.5 * (length + self.length[nxt])
+        behind = ((angles - self.theta[nxt]) % TWO_PI) * self.radii[self.outer] - half
+        if order.size == 1:  # (it was the lane's only vehicle: nobody comes after it)
+            behind = np.full(angles.size, np.inf)
+        return np.where(cand, nxt, lag), np.where(cand, behind, back)
 
     def _sync_population(self) -> None:
         """Closed mode: match the number of cars (on the ring and queued) to the density setting."""
@@ -2829,8 +3544,21 @@ class RingSim:
             keep = behind < 0
             if (~keep).any():  # one vectorised check for all the cars behind
                 room = np.array([-0.5 * (entry[0] + longest) - cfg.car_length for entry in cand])[~keep]
-                keep[~keep] = self.equilibrium_speed(room, self.desired_speed(behind[~keep]),
-                                                     behind[~keep]) >= self.v[behind[~keep]]
+                foll = behind[~keep]
+                # (a CAV behind a vehicle not drawn yet: judged at each gap it may keep behind it, _gaps_behind: as a
+                # string leader at its ACC-fallback gap and, a cut string's head (string_pos platoon_max + 1), behind
+                # a cooperating CAV at CAV_PLATOON_GAP; the slower steady state counts)
+                v0 = self.desired_speed(foll)
+                T, s0, _ = self._gaps_behind(foll, np.full(foll.size, -1))
+                eq = self.equilibrium_speed(room, v0, foll, T, s0)
+                if T is not None:
+                    pm = int(cfg.platoon_max)
+                    cut = np.flatnonzero((self.kind[foll] == CAV) & (self.string_pos[foll] == pm + 1))
+                    if cut.size:
+                        T_cut, s0_cut = self._cav_gaps(foll[cut], np.full(cut.size, pm + 1))
+                        eq[cut] = np.minimum(eq[cut], self.equilibrium_speed(room[cut], v0[cut], foll[cut], T_cut,
+                                                                             s0_cut))
+                keep[~keep] = eq >= self.v[foll]
             ok = [entry for entry, fine in zip(cand, keep) if fine]
             if len(ok) >= k:
                 heap = [ok[i] for i in self.rng.choice(len(ok), size=k, replace=False)]
@@ -2866,22 +3594,28 @@ class RingSim:
             return 0, full
         slots = self._spawn(np.array(lanes), np.array(angles), np.zeros(len(lanes)), trucks=trucks[placed])
         self.inserted_at[slots] = self.time
-        # arcs: bumper gap ahead of each new vehicle + a car's length.
-        eq = self.equilibrium_speed(np.array(arcs) - cfg.car_length, self.desired_speed(slots), slots)
+        idx = np.flatnonzero(self.alive)
+        lead, gap = self._index_lanes(idx)
+        # arcs: bumper gap ahead of each new vehicle + a car's length. Each starts at the steady state of the time gap
+        # and margin it keeps behind its leader (_gaps_behind: a new CAV behind a CAV it cooperates with joins its
+        # string at the CACC time gap at once, so its ACC-fallback gap would place it far slower than the traffic
+        # around it, and the follower's override would then brake hard for it).
+        T, s0, _ = self._gaps_behind(slots, lead[slots])
+        eq = self.equilibrium_speed(np.array(arcs) - cfg.car_length, self.desired_speed(slots), slots, T, s0)
         foll = np.array(followers)
         v_f = np.where(foll >= 0, self.v[np.maximum(foll, 0)], eq)
         self.v[slots] = np.minimum(eq, v_f)
         # The car now directly behind each new car (its old follower, or an
         # earlier new car in a gap split twice) slows to suit its new gap, so
         # the insertion does not set off a man-made braking wave.
-        idx = np.flatnonzero(self.alive)
-        lead, gap = self._index_lanes(idx)
         behind = idx[np.isin(lead[idx], slots) & (lead[idx] != idx)]
         # A replacement slotted in now and then: the car behind brakes physically
         # (the driver model does the rest). A bulk density raise from the slider
         # teleports many cars at once: settle their followers at once instead
-        # of setting off a man-made braking wave.
-        self._cap_speed(behind, gap[behind], max_cut=self.eff.max_decel * cfg.dt if small else np.inf)
+        # of setting off a man-made braking wave. Each judged by the time gap and margin it keeps behind its new
+        # leader (_gaps_behind: a CAV in CACC behind its old leader may lead its string behind the new one).
+        T, s0, _ = self._gaps_behind(behind, lead[behind])
+        self._cap_speed(behind, gap[behind], max_cut=self.eff.max_decel * cfg.dt if small else np.inf, T=T, s0=s0)
         return len(lanes), full
 
     def _near_exit(self, gap_entry: tuple[float, int, float, int, float]) -> bool:
@@ -2893,14 +3627,15 @@ class RingSim:
         before = (self.exit_angle - mid) % TWO_PI * self.radii[lane]
         return bool((before < 15.0).any())
 
-    def _cap_speed(self, slots, gap, max_cut: float = np.inf) -> None:
+    def _cap_speed(self, slots, gap, max_cut: float = np.inf, T=None, s0=None) -> None:
         """Slow ``slots`` to the steady-state speed for ``gap`` (by at most
-        ``max_cut`` m/s; the driver model brakes the rest), without logging stops.
+        ``max_cut`` m/s; the driver model brakes the rest), without logging stops;
+        with time gaps ``T`` and margins ``s0`` (aligned) in place of their own (None: their own).
 
         Slowed cars are marked as touched by the density control, so a jam they
         head is counted as "other", not "following".
         """
-        eq = self.equilibrium_speed(gap, self.desired_speed(slots), slots)
+        eq = self.equilibrium_speed(gap, self.desired_speed(slots), slots, T, s0)
         if np.isfinite(max_cut):
             eq = np.maximum(eq, self.v[slots] - max_cut)
         slowed = slots[self.v[slots] > eq]
@@ -2984,5 +3719,6 @@ class RingSim:
             self.inserted_at[new] = self.time
             self.v[new] = np.inf  # capped to the steady-state speed below
             even_gap = step * self.radii[lane] - cfg.car_length - extra.mean()  # every bumper gap
-            self._cap_speed(sequence, np.full(n_new, even_gap))
+            T, s0, _ = self._gaps_behind(sequence, np.roll(sequence, -1))  # (each behind the next: its new leader)
+            self._cap_speed(sequence, np.full(n_new, even_gap), T=T, s0=s0)
         return True

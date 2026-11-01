@@ -2,9 +2,10 @@
 time exposed (TET, Minderhoud & Bovy 2001) by follower-leader pair type HH/HA/AH/AA (FOLLOWER letter first, as Hu
 et al. 2023; H = a human driver or an ACC car, A = a recognisable AV), each per hour of following exposure (a
 leader within the reaction distance); harsh braking of human-driven and automated vehicles per vehicle-hour; the
-safety layer's interventions per automated vehicle-hour; cut-ins ahead of recognisable AVs; the share of the
-automated vehicles' time in CACC. Exact counters, observers only (they change nothing), summary columns with
-DEFINITIONS named unlike any setting, the in_cacc snapshot key and the run printout."""
+safety override's interventions per automated vehicle-hour (renamed from AEB by the S2 decision); cut-ins ahead of
+recognisable AVs; the share of the automated vehicles' time in CACC. Exact counters, observers only (they change
+nothing), summary columns with DEFINITIONS named unlike any setting, the in_cacc snapshot key and the run
+printout."""
 
 from __future__ import annotations
 
@@ -75,14 +76,14 @@ def test_the_safety_columns_from_the_exact_counts():
     """safety_columns: rates over vehicle-hours of exposure (steps x dt / 3600), NaN over none."""
     sim = RingSim(SimConfig(seed=1, auto_share=0.5))
     start = {k: (np.zeros(4, dtype=np.int64) if k.startswith("pair") else 0) for k in
-             ("auto_steps", "human_steps", "aeb", "emergency", "emergency_auto", "cutins_auto", "pair_follow",
+             ("auto_steps", "human_steps", "override", "emergency", "emergency_auto", "cutins_auto", "pair_follow",
               "pair_ttc", "pair_episodes")}
-    now = dict(auto_steps=36000, human_steps=72000, aeb=5, emergency=7, emergency_auto=3, cutins_auto=4,
+    now = dict(auto_steps=36000, human_steps=72000, override=5, emergency=7, emergency_auto=3, cutins_auto=4,
                pair_follow=np.array([36000, 18000, 0, 3600]), pair_ttc=np.array([100, 50, 0, 36]),
                pair_episodes=np.array([4, 2, 0, 1]))
     row = experiments.safety_columns(sim, now, start, 1800.0, {"in_cacc": 3.0, "automated": 12.0})
     assert list(row) == list(experiments.SAFETY_COLUMNS)
-    expect = dict(cacc_share=0.25, aeb_per_veh_h=5.0, harsh_human_per_veh_h=2.0, harsh_auto_per_veh_h=3.0,
+    expect = dict(cacc_share=0.25, override_per_veh_h=5.0, harsh_human_per_veh_h=2.0, harsh_auto_per_veh_h=3.0,
                   ttc_per_h=7 / 1.6, ttc_hh_per_h=4.0, ttc_ha_per_h=4.0, ttc_aa_per_h=10.0, tet_s_per_h=18.6 / 1.6,
                   tet_hh_s_per_h=10.0, tet_ha_s_per_h=10.0, tet_aa_s_per_h=36.0, follow_hh_h=1.0, follow_ha_h=0.5,
                   follow_ah_h=0.0, follow_aa_h=0.1, cutins_ahead_auto_per_h=8.0)
@@ -90,7 +91,7 @@ def test_the_safety_columns_from_the_exact_counts():
         assert row[name] == pytest.approx(value), name
     assert np.isnan(row["ttc_ah_per_h"]) and np.isnan(row["tet_ah_s_per_h"])  # no AH following at all
     none = experiments.safety_columns(sim, start, start, 1800.0, {"in_cacc": 0.0, "automated": 0.0})
-    assert all(np.isnan(none[k]) for k in ("cacc_share", "aeb_per_veh_h", "harsh_auto_per_veh_h", "ttc_per_h"))
+    assert all(np.isnan(none[k]) for k in ("cacc_share", "override_per_veh_h", "harsh_auto_per_veh_h", "ttc_per_h"))
     assert none["cutins_ahead_auto_per_h"] == 0.0
 
 
@@ -107,7 +108,7 @@ def test_exposure_and_harsh_braking_by_group_in_runs():
         assert sim.n_auto_steps + sim.n_human_steps == cars
         assert 0 <= sim.n_emergency_auto <= sim.n_emergency
         if share == 0:
-            assert sim.n_auto_steps == 0 and sim.n_emergency_auto == 0 and sim.n_aeb == 0
+            assert sim.n_auto_steps == 0 and sim.n_emergency_auto == 0 and sim.n_override == 0
             assert sim.pair_follow_steps[1:].sum() == 0 and sim.pair_follow_steps[0] > 0
         if share == 1:
             assert sim.n_human_steps == 0 and sim.n_emergency_auto == sim.n_emergency
@@ -190,7 +191,7 @@ def test_the_safety_columns_are_defined_and_named_unlike_any_setting(tmp_path, c
         assert name in sv.definitions(), name
         assert sv.column_label(name) != name, name
     off, on = df.iloc[0], df.iloc[1]
-    assert np.isnan(off["cacc_share"]) and np.isnan(off["aeb_per_veh_h"]) and np.isnan(off["harsh_auto_per_veh_h"])
+    assert np.isnan(off["cacc_share"]) and np.isnan(off["override_per_veh_h"]) and np.isnan(off["harsh_auto_per_veh_h"])
     assert off["follow_hh_h"] > 0 and off["follow_aa_h"] == 0 and np.isnan(off["ttc_aa_per_h"])
     assert 0 < on["cacc_share"] <= 1 and on["follow_aa_h"] > 0 and on["follow_ah_h"] > 0
     assert on["ttc_per_h"] >= 0 and on["tet_s_per_h"] >= 0
@@ -202,9 +203,9 @@ def test_the_run_printout_shows_the_safety_measures_with_automated_vehicles(tmp_
     experiments.main(["run", "--set", "auto_share=0.5", "--set", f"auto_kind={kind}", "--duration", "40",
                       "--out", str(tmp_path / "run")])
     printed = capsys.readouterr().out
-    assert "Safety layer (AEB)" in printed and "TTC <= 1.5 s, HH / HA / AH / AA" in printed
+    assert "Safety override" in printed and "TTC <= 1.5 s, HH / HA / AH / AA" in printed
     assert ("Following by CACC" in printed) == (kind == "cav")
     assert ("CACC 0.7 s, strings of <= 8, cooperation B" in printed) == (kind == "cav")
     assert ("time gap 1.1 s, dead time 0.5 s" in printed) == (kind == "acc")
     experiments.main(["run", "--duration", "20", "--out", str(tmp_path / "plain")])
-    assert "Safety layer" not in capsys.readouterr().out
+    assert "Safety override" not in capsys.readouterr().out
