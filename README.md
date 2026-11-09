@@ -29,10 +29,22 @@ On top of that:
   the view, and the next launch carries on exactly where it stopped.
 - **Sweeps of one or many settings** (full grids, plans from a CSV, Latin
   hypercube samples) and a **sweep viewer** to browse them or run new ones.
+- **Automated vehicles** (this `autonomous-vehicles` branch; `main` holds the
+  model without them): cruise-control (ACC) cars, connected automated vehicles
+  (CAVs) that drive in cooperative strings, robotaxis and wave smoothers. The
+  CAVs belong to companies that cooperate with each other only as far as the
+  settings allow. See [Automated vehicles](#automated-vehicles).
+
+**Reading the code.** [Where the model is in the code](#where-the-model-is-in-the-code)
+maps each part of the model to the function that runs it, and the
+[Glossary](#glossary) defines the terms and the source labels the comments
+use. In `roundabout_sim/engine.py`, start at `RingSim._step`.
 
 ![The viewer: a closed ring at density 80 - phantom jams appear as orange stripes moving backwards in the space-time diagram](docs/viewer.png)
 
 ## Quick start
+
+Tested with Python 3.14 and the package versions pinned in `requirements.txt`.
 
 ```powershell
 python -m venv .venv
@@ -46,7 +58,7 @@ python -m roundabout_sim --fresh      # ignore the saved session
 python -m roundabout_sim.experiments run --baseline   # one headless run -> dashboard figure + CSVs
 python -m roundabout_sim.experiments sweep --x density=10:150:10 --series n_lanes=1,2,3
 python -m roundabout_sim.experiments view             # the sweep viewer: browse sweep CSVs or run new sweeps
-python -m pytest -q                   # test suite (~3 min)
+python -m pytest -q                   # test suite (about 8 min)
 ```
 
 Every parameter can also be set from the command line, for example
@@ -86,7 +98,8 @@ The **ring view** draws every vehicle to scale; trucks are longer and wider,
 and bend along their lane.
 Car colour shows speed relative to the car's free speed: orange is stopped,
 grey is half speed and blue is free flow. **C** switches to colouring by the
-driver's desired speed, by lane or by vehicle type (car or truck). Hover over
+driver's desired speed, by lane, by vehicle type (car or truck) or by kind
+(human driver, ACC car, CAV, robotaxi or smoother). Hover over
 a car to see its type, length, speed, time gap, reaction time and exit.
 
 - A thin inner band shows how much of each sector of the road is covered.
@@ -105,7 +118,8 @@ a car to see its type, length, speed, time gap, reaction time and exit.
 - A detector line counts cars passing a point.
 
 The **controls** are in tabs: Presets, Road, Traffic, Demand, Vehicles,
-Drivers, Lane chg and Start (on two rows). Sliders marked *rebuilds* restart the
+Drivers, Lane chg, Start, and the automated vehicles' AVs, Coop, Entries and
+Smoothers (on as many rows as the window needs). Sliders marked *rebuilds* restart the
 roundabout when you release them; all others change every driver live, and
 each change is marked on the charts. Controls marked *open mode only*,
 *no entrances* (on a ring without entrances, such as the ring-road experiments)
@@ -138,7 +152,7 @@ Keys:
 | R | Restart with a new seed |
 | B | Brake a random car |
 | + / - | Simulation speed |
-| C | Car colours (speed, desired speed, lane, vehicle type) |
+| C | Car colours (speed, desired speed, lane, vehicle type, kind) |
 | S | Save a screenshot to `results/` |
 | D | Save the chart data (last 10 min) as CSV, plus a settings file listing the settings, where they come from (preset or random seed), the live changes and the equivalent `experiments run` command (with `--preset` or `--random` when the settings come from one) |
 | X | Random settings for every parameter, with a fresh seed shown in the help box (also *Randomize all* on the Presets tab) |
@@ -261,12 +275,13 @@ the experiments CLI and the CSV columns. The tables follow the viewer's tabs.
 | Ring radius (`radius`) | 80 m | 10-300 m, 1 m steps | Centreline radius of the innermost lane. Real single-lane roundabouts are about 12-21 m (28-46 m across), two-lane ones 18-28 m, the ring-road jam experiments 37-50 m. Presets keep their published radius between the steps (18.25 m, 36.6 m). |
 | Car length (`car_length`) | 4 m | 1-8 m | Space each car takes up along the lane. |
 | Road condition (`road_condition`) | dry | dry / wet / snow / ice | The road surface. Wet, snow and ice scale what the drivers do by factors from weather studies (see [How the model works](#how-the-model-works)): lower desired speed, acceleration, comfortable braking, cornering limit and braking limit, longer time gap, entry gap and follow-up time. The other sliders keep showing the dry values. |
+| Weather effect (`weather_scale`) | 1 | 0-2 | How strongly the road condition changes driving: each behavioural factor (desired speed, acceleration, comfortable braking, time gap, entry gap, follow-up) becomes 1 + this × (factor − 1). 1 = the studies, 0 = as if dry, 2 = twice the change. The grip limits (cornering, braking) apply in full. |
 
 **Traffic tab**
 
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
-| Density (`density`) | 50 veh/km/lane | 1-300 veh/km/lane | Cars on the ring per km of lane, capped at jam density. Raising it slots cars into gaps; lowering it removes cars. On a closed ring, waves appear from about 75-80. In open mode it sets only the cars at the start (and, moved live, the cars on the ring once, at that moment). |
+| Density (`density`) | 50 veh/km/lane | 1-300 veh/km/lane | Cars per km of lane, capped at jam density (in closed mode the ring and the entrance queues together, so the ring holds slightly fewer). Raising it slots cars into gaps; lowering it removes cars. On a closed ring, waves appear from about 75-80. In open mode it sets only the cars at the start (and, moved live, the cars on the ring once, at that moment). |
 | Exit chance (`exit_prob`) | 0.1 | 0-1 | Chance that a car leaves at each exit it passes. In closed mode each leaver is replaced by a car at a random entrance, or slotted into the ring if that queue is full (2 cars); in open mode leavers are gone for good. |
 | Entry gap (`entry_gap`) | 2 s | 1.5-6 s | Smallest time gap to circulating traffic that an entering car accepts (the critical gap; see [Real-world presets](#real-world-presets) for how it relates to the HCM's critical headway). |
 | Follow-up time (`follow_up`) | 1 s | 1-5 s | Shortest time between two cars entering from the same entrance (the follow-up headway). Real roundabouts show about 2.5-3.2 s. The next car may go on the first time step after it has passed, so the spacing is the follow-up time plus one step (1 s gives 1.1 s at the 0.1 s step); the default of 1 s keeps the model's original behaviour. Applies in both modes. |
@@ -281,6 +296,8 @@ the experiments CLI and the CSV columns. The tables follow the viewer's tabs.
 | Demand profile (`demand_profile`) | constant | constant / peak | Open mode. *peak*: the entrance chance follows 1 − 0.5 cos(2πt / 600 s), rising smoothly from half to 1.5 times its value and back every 10 minutes. Its mean is the entrance chance over each whole 10-minute cycle, not over shorter windows: the sweep's default 120-420 s window catches the rise to a peak and averages 1.3 times it. `run` and `sweep` print a note then, and `demand_per_min` gives the demand actually offered. |
 | Demand imbalance (`demand_imbalance`) | 0 | 0-1 | Open mode: 0 = every entrance gets the same demand. Higher puts more on a main road through the bottom entrance (and the top one): an entrance's demand is scaled by 1 + imbalance × cos(2 × its angle from the bottom entrance), normalised so the mean per entrance stays the entrance chance. At 1, entrances at right angles to the main road get none. |
 | Max queue (`max_queue`) | 50 cars | 1-200 cars | Open mode: cars that can wait at each entrance. Arrivals that find the queue full are turned away and counted as blocked (spill-back). Lowered live, the latest arrivals of longer queues give up (counted as given up, not as blocked). |
+| Capacity test (`subject_arm`) | off | off / on | Open mode. *on*: the bottom entrance is a capacity test. Its queue is kept full (not counted as arrivals) and every car leaves at the first exit after it (Exit chance is ignored), so its conflicting flow is the other entrances' entry flow, set by the Entrance chance. Experiments report its capacity (`subject_*` columns), and `experiments capacity` fits the HCM form to it. Changing it rebuilds the roundabout. |
+| Test exiting share (`subject_exiting`) | 0 | 0-0.5 | Capacity test: this share of the other entrances' entrants leaves at the test entrance's own exit, before its entry point (every n-th entrant, not by chance). Drivers cannot tell these leavers from the conflicting flow; CAVs at Cooperation B can. Use it on one or two circulating lanes, where it was validated. |
 
 **Vehicles tab** (changing these rebuilds the roundabout, because a vehicle's length is set when it appears; Truck length only while there are trucks)
 
@@ -288,6 +305,7 @@ the experiments CLI and the CSV columns. The tables follow the viewer's tabs.
 |---|---|---|---|
 | Truck share (`truck_share`) | 0 | 0-0.3 | Share of the vehicles that are trucks: each new vehicle is one by chance, also the ones queuing at the entrances. Trucks are 2.55 m wide, accelerate at 0.5× a car's rate, want 0.7× their driver's desired speed and keep a 1.5× longer time gap. Real shares are about 1-5 % in towns and 5-15 % on main roads. |
 | Truck length (`truck_length`) | 12 m | 6-23 m | 9 m single unit, 12 m rigid lorry (the EU limit), 16.5 m articulated, 18.75 m road train, 22.4 m US WB-67. Capacity and jam density use the mean vehicle length; Density still counts vehicles. |
+| Truck follow-up (`truck_follow_up`) | 1 | 1-3 | The queued vehicle behind an entering truck waits this many times the follow-up while the truck clears the yield line. At 1 an entering truck costs about one car; 2 gives the HCM's 2 passenger cars with no circulating traffic, 2.4 over 0-820 veh/h of it. Applies at once. |
 
 **Drivers tab**
 
@@ -298,6 +316,7 @@ the experiments CLI and the CSV columns. The tables follow the viewer's tabs.
 | Reaction time (`reaction_time`) | 0.4 s | 0-2 s | Delay between perceiving the traffic and acting on it. |
 | Reaction time spread (std) (`reaction_std`) | 0 s | 0-0.5 s | How much reaction times differ between drivers. Each driver's own is drawn once around Reaction time, kept within 0-2 s and rounded to the 0.1 s step. Real drivers differ by about 0.2 s. |
 | Reaction distance (`reaction_distance`) | 25 m | 10-100 m | How far ahead drivers pay attention. They react to every car within this distance (up to 5), so looking further ahead lets them ease off early and damps stop-and-go waves. Very short (10-15 m) and they notice the car in front too late and brake violently. |
+| Anticipation (`anticipation`) | 5 cars | 1-5 | Most cars ahead a driver reacts to within Reaction distance, the j-th weighted 1/j² (Treiber's Human Driver Model); 1 = the plain IDM. Both limits apply: at the default 25 m a driver sees a second car ahead only at gaps under about 10.5 m and a third under about 5.7 m, so in practice 1-3 cars count. |
 | Following time gap (`time_headway`) | 1.2 s | 0.5-3 s | Desired time gap to the car in front. |
 | Time gap spread (std) (`headway_std`) | 0 s | 0-0.8 s | How much the following time gap differs between drivers. Each driver's own is drawn once around Following time gap (at least half of it; trucks keep 1.5× theirs). Observed spread: about 0.3 s. |
 | Standstill gap (`min_gap`) | 2 m | 0.5-5 m | Bumper-to-bumper gap kept in a stopped queue. |
@@ -305,6 +324,8 @@ the experiments CLI and the CSV columns. The tables follow the viewer's tabs.
 | Comfortable braking (`comfort_decel`) | 2 m/s² | 0.5-5 m/s² | Braking drivers are happy to use. |
 | Driver noise (`driver_noise`) | 0.35 m/s² | 0-1.5 m/s² | Random fluctuations in each driver's acceleration. More noise brings waves on earlier. |
 | Cornering limit (`lateral_accel`) | 4 m/s² | 1-10 m/s² | Comfortable sideways acceleration; it makes tight inner lanes slower. |
+| Gap ahead of AVs (`exploit_gap`) | 1 | 0.5-1.5 | Drivers entering or changing lane in front of a recognisable AV (CAV, robotaxi, smoother) accept this many times their usual gap, and may force up to 1 / this times the usual braking on it. Below 1 they exploit cautious AVs (0.79: cut-ins ahead of Waymos, Alhuraish et al. 2026); above 1 they are wary (Reddy et al. 2025). |
+| Following AVs (`follow_adapt`) | 0 | 0-1 | How far drivers behind a recognisable AV adapt as in Waymo data (Wang et al. 2023): at 1 a standstill gap of 1.73 instead of 2.77 m, a start from standstill 0.49 instead of 1.04 s after it moves off, and a follow-up 0.55 s shorter behind an AV that entered just before. 0 = as behind any car. |
 
 Each driver keeps one draw for each spread (a temperament, as for the desired
 speed), so moving a spread, a driver setting or the road condition live changes
@@ -318,6 +339,47 @@ every driver at once, and each keeps their place in the spread.
 | Lane-change motive (`lane_change_motive`) | advantage | advantage / random | *advantage*: change only when it is faster (the MOBIL model); *random*: change into any safe gap. |
 | Politeness (`politeness`) | 0.3 | 0-1 | How much drivers weigh the braking they force on others. |
 | Initial spacing (`init_spacing`, Start tab) | uniform | uniform / random / clustered | The average gap is set by Density. *uniform*: evenly spaced; *random*: random gaps; *clustered*: one packed queue across all lanes. Near the jam threshold an uneven start can lock in jams; elsewhere the effect fades within 1-2 min. Changing it rebuilds the roundabout. |
+
+**AVs tab** (the share and the kind rebuild the roundabout; the others apply at once). How the automated vehicles drive is in [Automated vehicles](#automated-vehicles).
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| Automated share (`auto_share`) | 0 | 0-1 | Share of the new vehicles that are automated, all of the AV kind. At the same seed a higher share automates the same vehicles and more; at 0 the model runs exactly as without automated vehicles. |
+| AV kind (`auto_kind`) | cav | cav / robotaxi / acc | *cav*: connected and automated, in CACC strings behind cooperating CAVs, otherwise by the ACC law. *robotaxi*: driverless, by the IDM at a longer time gap and a 1.94 m longer standstill gap (Hu et al. 2023, Waymo data). *acc*: a driver-supervised car on adaptive cruise control (the PATH ACC law with a dead time), which looks like any car to other drivers. |
+| Robotaxi time gap (`robotaxi_headway`) | 1.3 | 1.0-1.6 | Robotaxis' time gap as a multiple of a driver's (Waymo's median time headway, 3.49 s against 2.69 s for drivers: Hu et al. 2023). |
+| ACC time gap (`acc_headway`) | 1.1 s | 0.5-2.4 s | Time gap T of the ACC law, a = 0.23 (gap − 2 m − T v) + 0.07 (leader's speed − v), at most 0.4 (target speed − v) (Milanés & Shladover 2014). |
+| ACC dead time (`acc_delay`) | 0.5 s | 0-0.6 s | How long ago an ACC car measured what it acts on (production cars 0.15-0.99 s: Gunter et al. 2019). Capped at 0.6 s, beyond which this law makes a car oscillate behind a steady leader. |
+| CACC time gap (`cav_headway`) | 0.7 s | 0.5-1.5 s | Time gap of a CAV behind a cooperating CAV, by the PATH CACC law behind the HCM 7 CAV factors (FHWA-OR-RD-22-11). Strings amplify disturbances below 0.67 s. |
+
+**Coop tab** (Companies rebuilds the roundabout; the others apply at once)
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| Companies (`companies`) | 1 | 1-4 | Companies the automated vehicles belong to; each new one joins one at random, all equally likely. |
+| Cooperation (`coop_class`) | B | none / A / B / C / D | How far CAVs of one company cooperate (the SAE J3216 classes). *none*: no communication, the ACC law. *A* (status sharing): CACC strings and a shorter follow-up behind a CAV entrant. *B* (intent sharing, the HCM 7 basis): also route-conflict anticipation at entries. *C* and *D*: gap creation, not modelled yet, so they act as B; D binds every pair, whatever the company. |
+| Between companies (`coop_between`) | same | same / none / A-D | Most cooperation between CAVs of different companies: *same* = as within a company; a class caps it (*none*: they never form strings together). |
+| Brand spread (`brand_spread`) | 0 | 0-0.6 | How much the companies' ACC settings differ: company k of n multiplies its ACC time gaps and ACC dead time by 1 + spread × (2k/(n − 1) − 1). CACC time gaps are not scaled. |
+| Max string length (`platoon_max`) | 8 cars | 1-20 | Most CAVs in one CACC string (FHWA-OR-RD-22-11); the next keeps a 1.5 s gap and leads a new string. |
+
+**Entries tab** (all apply at once)
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| CAV entry gap (`cav_entry_gap`) | 1 | 0.6-1.2 | A CAV's critical gap as a multiple of Entry gap. 1: in the runs behind the HCM 7 CAV factors, CAVs accepted the same gaps as drivers (FHWA-OR-RD-22-11 Sec. 7.3.2). |
+| CAV follow-up (`cav_follow_up`) | 0.74 | 0.7-1.0 | Follow-up of a CAV behind a cooperating CAV that entered just before it and is still directly ahead, as a multiple of the drivers' (FHWA-OR-RD-22-11: 2.62 s at 0 % and 1.93 s at 100 % CAVs). |
+| Robotaxi entry (`robotaxi_entry`) | 1.3 | 0.8-1.6 | A robotaxi's critical gap and follow-up as multiples of the drivers'. An *assumption* (its time-gap factor): no source measures robotaxi gap acceptance. |
+| AV weather effect (`av_weather_scale`) | 1 | 0-2 | How strongly a wet, snowy or icy road changes how driverless vehicles (CAVs, robotaxis) drive and enter: each of the drivers' behavioural factors becomes 1 + this × (factor − 1) for them. 1 = as the drivers, 0 = as if dry, 2 = twice as cautious. |
+| AV handover (`av_handover`) | 0 s | 0-120 s | On snow or ice a driverless vehicle at the head of a queue waits this long for remote assistance before it may enter (an *assumption*: no source gives a time). 0 = off. |
+
+**Smoothers tab** (all apply at once)
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| Smoothers (`smoothers`) | 0 | 0-20 | Automated cars that damp stop-and-go waves (one among 21 cut the speed spread by 81 %: Stern et al. 2018). They are the human-driven cars (not trucks) nearest evenly spaced points round the ring, and never leave, change lane or get removed. |
+| Smoother law (`smoother_law`) | followerstopper | followerstopper / pi / quiet | FollowerStopper or PI with saturation (Stern et al. 2018). *quiet* is a placebo: the car's own driver model without noise. |
+| Smoother speed (`smoother_speed`) | 7.5 m/s | 2-15 m/s | FollowerStopper's set speed U, which it never exceeds (Stern et al. 2018 settled the waves best at 7.5 m/s). |
+| Smoother start (`smoother_start`) | 0 s | 0-600 s | When the controllers switch on; until then each car's human driver drives it. |
+| Smoother lane (`smoother_lane`) | −1 | −1 to 4 | Lane the smoothers are picked in: −1 = spread round the lanes, the innermost first. |
 
 Three settings have no slider and keep their defaults unless set with
 `--set` in experiments: lane width 3.5 m (`lane_width`), car width 1.8 m
@@ -915,7 +977,11 @@ lane, its angle on the ring and its speed. Each 0.1 s step works as follows:
      see below), and add correlated random noise.
    - A hard no-overlap constraint keeps cars from ever driving into each
      other. Every gap is a bumper gap: the distance between two vehicles'
-     centres less half of each one's length.
+     centres less half of each one's length. The constraint is a backstop: at
+     the defaults it never acted in 1.8 million vehicle-steps, so the IDM
+     keeps the gaps by itself.
+   - Automated vehicles replace the IDM by their own control law (see
+     [Automated vehicles](#automated-vehicles)).
 2. **Exits.**
    - A car's route ends at an exit, chosen by giving it the *exit chance* at
      every exit it passes.
@@ -949,7 +1015,8 @@ lane, its angle on the ring and its speed. Each 0.1 s step works as follows:
    served, when the gap to circulating traffic is at least the *entry gap*
    and more than the *follow-up time* has passed since the previous car from
    that entrance (the first time step after it). Each queue keeps its cars' arrival times, so every entry
-   knows how long its car waited.
+   knows how long its car waited. Automated vehicles enter by their kind's
+   rules (see [Automated vehicles](#automated-vehicles)).
 
 **Vehicles, drivers and the road.**
 
@@ -992,17 +1059,18 @@ lane, its angle on the ring and its speed. Each 0.1 s step works as follows:
   on ice.
 
 The engine ([`engine.py`](roundabout_sim/engine.py)) is vectorised with numpy.
-On a desktop PC it steps about 80 cars at over 250× real time and about
-1,900 cars at over 100× real time (drawing the viewer comes on top), so the
-viewer stays smooth with thousands of cars.
+On the PC used for this README (November 2026) it steps 80 cars on a
+single-lane ring at about 700× real time, the default roundabout (77 cars)
+at about 240× and about 1,900 cars at about 40× (drawing the viewer comes on
+top), so the viewer stays smooth with thousands of cars.
 
 **Known simplifications.**
 
 - Entrances and exits always come in pairs (one arm = one entrance + one exit);
   their numbers cannot be set separately.
 - In closed mode (the default) each leaver is replaced at a random entrance,
-  so arrivals always match departures and density is set as cars on the
-  ring. Open mode has random arrivals instead, but they are a Poisson process
+  so arrivals always match departures, and density counts the cars on the ring
+  plus those waiting at the entrances (at most 2 each). Open mode has random arrivals instead, but they are a Poisson process
   at a set rate (optionally with a cosine "peak" profile), not real counts;
   no platoons arrive from upstream signals.
 - Lane changes are instant in the model; the viewer animates them.
@@ -1088,6 +1156,214 @@ viewer stays smooth with thousands of cars.
   versions know, and the simulation starts afresh. The window size is not part
   of the session.
 
+### Automated vehicles
+
+Automated vehicles (AVs) share the road with the human drivers above. Their
+rules differ from the drivers' only where a source or a stated assumption says
+they should. At the default settings there are none, and the model runs
+exactly as it does without them.
+
+**Kinds.** A share of the new vehicles (*Automated share*) is automated, all of
+one kind (*AV kind*); wave smoothers come on top, as a count. Any kind can
+have a truck body, and the truck factors then apply on top.
+
+| Kind | Longitudinal control | Reacts to | Delay | Noise | Drivers see an AV | Communicates |
+|---|---|---|---|---|---|---|
+| Human driver | IDM with multi-anticipation | up to 5 vehicles within the reaction distance | reaction time | yes | – | no |
+| ACC car | PATH ACC law | the vehicle in front | ACC dead time | no | no: it looks like any car | no |
+| CAV | PATH CACC behind a cooperating CAV, otherwise PATH ACC | the vehicle in front | none | no | yes | yes |
+| Robotaxi | IDM at 1.3 × the driver's time gap, standstill gap 1.94 m longer (Hu et al. 2023, Waymo data) | the vehicle in front | reaction time | no | yes | no |
+| Wave smoother | FollowerStopper, PI with saturation, or its driver's model without noise (Stern et al. 2018) | the vehicle in front (the placebo: as its driver) | none while FollowerStopper or PI runs | no | yes | no |
+
+An AV runs one software: it drives with the settings themselves, with no
+spread between vehicles (robotaxis keep the drivers' time-gap spread, as Hu et
+al. 2023 found for Waymo). Each new vehicle draws its kind, company and ACC
+fallback gap from a random stream of its own, the same three numbers whatever
+it turns out to be. So at the same seed a higher share automates the same
+vehicles and more, runs at different shares are paired, and every other
+random draw stays as it is without AVs.
+
+**Control laws** (`_law_acc`, `_law_cav`, `_law_smoother` in `engine.py`).
+
+- PATH ACC (Milanés & Shladover 2014): a = 0.23 (s − 2 m − T v) + 0.07
+  (v_lead − v), never above the cruising command 0.4 (v0 − v), with T the
+  *ACC time gap* (1.1 s) times the company's brand factor. Its strings amplify
+  disturbances unless 0.23 T² + 0.14 T ≥ 2, i.e. T ≥ 2.66 s, as found on the
+  test track.
+- PATH CACC, the law behind the HCM 7 CAV factors (FHWA-OR-RD-22-11): every
+  0.1 s, v ← v + 0.45 e + 0.0125 ė, with e = s − 1.25 m − T_c v,
+  ė = (v_lead − v) − T_c a and T_c the *CACC time gap* (0.7 s). It is
+  string-stable for T_c ≥ 0.67 s.
+- A CAV that is not directly behind a cooperating CAV falls back to the ACC
+  law at its own time gap: 1.1, 1.6 or 2.2 s, in the shares PATH's test
+  drivers chose (50.4, 18.5 and 31.1 %; mean 1.53 s).
+- Both laws were fitted at 15-34 m/s on freeways and test tracks, so at
+  roundabout speeds (3-12 m/s) they are an extrapolation.
+- Every automated command is clipped to the road's braking limit and the
+  vehicle's acceleration. For ACC cars, CAVs and running smoothers a **safety
+  override** then acts, without delay: where the IDM with the vehicle's own
+  time gap and standstill gap asks for more than comfortable braking, the
+  vehicle brakes as the IDM does (`_safety_override`; counted as override
+  episodes). A robotaxi's law is that IDM itself.
+
+**CACC strings and companies** (`_coop_class`, `_string_positions`).
+
+- A CAV drives by CACC only directly behind a CAV it cooperates with, at any
+  gap. A string holds at most *Max string length* CAVs (8); the next one keeps
+  a 1.5 s gap and leads a new string. String positions are worked out afresh
+  every step.
+- Each AV belongs to one of the *Companies*, all equally likely. The
+  cooperation class of a pair (SAE J3216) decides what two CAVs share:
+  *Cooperation* within a company, at most *Between companies* across
+  companies (class D binds every pair).
+  - **none**: no communication; each CAV follows by the ACC law and enters on
+    its own.
+  - **A, status sharing**: CACC strings, and a CAV entering right behind a
+    cooperating CAV entrant goes after 0.74 × the follow-up (CAVs entering one
+    gap as a group, FHWA-OR-RD-22-11).
+  - **B, intent sharing**: also route-conflict anticipation. A CAV at the head
+    of a queue learns whether the cooperating CAV approaching on the outer
+    lane will leave before the entry point, and if so judges the next vehicle
+    behind it instead.
+  - **C and D**: gap creation, which is not modelled, so they act as B.
+- Without cooperation between companies, a CAV's leader is a partner with
+  probability about p / (number of companies), with p the share of AVs; for
+  unequal company shares, p × HHI (the Herfindahl index of the shares). The
+  engine draws equal shares only.
+
+**Entries by kind** (`_entry_check`, `_follow_up_slack`). An AV at the head of
+a queue enters by the drivers' rule with these changes: its critical gap is
+*CAV entry gap* (1) or *Robotaxi entry* (1.3) times the drivers'; its own law
+must not have to brake harder than comfortably behind the vehicle it would
+follow; the vehicle behind is judged at the gap it would keep behind the
+entrant (a CAV may join the entrant's string); and its follow-up is *CAV
+follow-up* behind a cooperating CAV entrant, or *Robotaxi entry* times the
+drivers' for a robotaxi. An ACC car's driver accepts the drivers' entry gap.
+
+**Human drivers and AVs** (off by default). With *Gap ahead of AVs* drivers
+entering or changing lane in front of a recognisable AV accept a different
+gap than usual (0.79 of it: cut-ins ahead of Waymos). With *Following AVs*
+drivers behind one keep a shorter standstill gap, start sooner from standstill
+and enter sooner behind an AV entrant (Wang et al. 2023, Waymo data).
+
+**Weather.** AVs take the road condition's factors as drivers do, their ACC
+and CACC time gaps included (an *assumption*: no source gives CACC settings
+in rain or snow). *AV weather effect* scales the driverless kinds' factors on
+their own, and *AV handover* makes a driverless queue head on snow or ice wait
+for remote assistance.
+
+**Measurements.** `experiments run` and `sweep` add, among others:
+`cacc_share` (the AVs' share of time in CACC strings); `override_per_veh_h`
+and `harsh_human_per_veh_h` / `harsh_auto_per_veh_h` (safety-override and
+harsh-braking episodes per vehicle-hour); `ttc_*` and `tet_*` (time-to-collision
+episodes and time exposed at TTC ≤ 1.5 s, SSAM's threshold, by follower-leader
+pair type); `cutins_ahead_auto_per_h`; at the entries `forced_yield_*` and
+`pet_*` (post-encroachment time); and entry delay, travel time and control
+delay by entrant class (`entry_delay_*_s`, `travel_time_*_s`,
+`control_delay_*_s`). `python -m roundabout_sim.experiments run --help`
+defines every column.
+
+**Validated range.** Human entry capacity matches HCM 6 (c = 1380
+e^(−0.00102 v_c) veh/h on a single lane) for conflicting flows up to about
+820 veh/h. In a check at 0-608 veh/h it was within 5 %; at 912 veh/h it was
+0.81 of HCM and at 1,205 veh/h 0.42, because the model's circulating stream
+holds too few long gaps. Report AV capacity results within that range.
+
+**Known simplifications of the AV layer.**
+
+- No messages are simulated. Cooperation is represented by parameters (who
+  may join whose string, who shares routes), with no latency, packet loss or
+  range limit, and the CACC law uses the leader's speed, not a broadcast
+  acceleration. The gains from cooperation are therefore a best case.
+- A CAV is in a string whenever its direct leader is a cooperating CAV, however
+  far ahead (far behind, its cruising command governs).
+- Cooperation classes C and D act as B.
+- AVs change lane by the drivers' MOBIL rules; smoothers keep their lane.
+- Companies have equal market shares. The unequal markets (HHI) in the
+  Fragmented Fleets work ran an engine subclass from analysis scripts that are
+  not in this repository.
+
+## Where the model is in the code
+
+Everything is in [`roundabout_sim/engine.py`](roundabout_sim/engine.py), as
+methods of `RingSim`, unless another file is named. Start at `_step`: its
+docstring lists the update order, and `_move`, `_exits` and `_lane_changes`
+number their stages in comments. Section banners (`# ---- name`) divide
+`engine.py` by model part, and everything above `class RingSim` is constants
+(each with its source) and saved-state helpers.
+
+| Model part | Where in the code |
+|---|---|
+| Update order of one time step | `_step`, `_move` |
+| Car following (IDM) and multi-anticipation | `_free_acc`, `_interaction`, `_car_following` |
+| Reaction delay, driver noise, motion, no-overlap constraint | `_move`, stages 7-9 |
+| Lane changes (MOBIL) | `_lane_changes` (safety and incentive in stages 4-5) |
+| Exits and the merging that gets leavers out | `_draw_routes`, `_exits`, `_make_room_to_leave` |
+| Arrivals and entries | `_arrivals`, `_entries`, `_entry_check` |
+| Closed-ring density control | `_sync_population`, `_insert_into_gaps` |
+| Driver and truck differences | `_spawn`, `_set_driving` |
+| Road condition and weather | `ROAD_CONDITIONS`, `road_factors`, `effective` |
+| ACC, CACC and smoothers | `_law_acc`, `_law_cav`, `_law_smoother` |
+| Cooperation between companies | `_coop_class`, `_string_positions`, `_anticipate_routes` |
+| Safety override | `_automated_limits`, `_safety_override` |
+| Human drivers reacting to AVs | `_behind_av`; `exploit_gap` in `_entry_check` and `_lane_changes` |
+| Capacity test | `_top_up`, `_route_feeding`; `capacity_analysis` in [`experiments.py`](roundabout_sim/experiments.py) |
+| Measurements | `snapshot` in [`metrics.py`](roundabout_sim/metrics.py); `summarise` and `wave_speed` in `experiments.py`; time to collision in `_observe_following`, post-encroachment time in `_observe_entries` |
+| Parameters: defaults, ranges, help text | `SimConfig` and `PARAMS` in [`config.py`](roundabout_sim/config.py) |
+| Unequal company shares (HHI) | Not in this repository: an engine subclass in the uncommitted analysis scripts (`results/coop_sharing/scripts/hhi.py`) |
+
+## Glossary
+
+**Source labels.** Every number in the code cites its source in a comment or
+carries one of these labels:
+
+- *derived*: computed from sourced numbers, or from runs of this model; the
+  comment gives the arithmetic or the runs.
+- *assumption*: a value or rule chosen without a direct source.
+- *model*: a choice about how the simulation works, not a measured value.
+
+Several *derived* figures come from one-off runs that are not in the
+repository (the ACC dead-time scan, for one); the CACC stability check is in
+`tests/test_controllers.py`.
+
+**Terms.**
+
+| Term | Meaning |
+|---|---|
+| ACC, CACC | Adaptive cruise control; cooperative ACC, which needs communication between the vehicles. |
+| Anticipation | How many vehicles ahead a driver reacts to (within the reaction distance). |
+| Arm | One entrance and its exit; they always come in pairs. |
+| AV | Automated vehicle: an ACC car, CAV, robotaxi or smoother. |
+| Bumper gap (s) | From a vehicle's front bumper to the rear bumper of the vehicle ahead. |
+| Capacity test | `subject_arm` on: entrance 0 keeps a full queue so its entry capacity can be measured against the conflicting flow. Also called the subject entrance; the others feed it. |
+| CAV | Connected and automated vehicle, the only kind that communicates. |
+| Closed / open mode | Closed: the number of vehicles is held and each leaver is replaced. Open: vehicles arrive at random and leave for good. |
+| Company, brand factor | The firm an AV belongs to; with *Brand spread*, each firm's ACC settings are scaled by its brand factor. |
+| Conflicting flow | Circulating vehicles passing an entrance's entry point per hour. |
+| Cooperation class | What two CAVs share (SAE J3216): none, A status, B intent, C agreement-seeking, D prescriptive. |
+| Critical gap (Entry gap) | Here a lag: the vehicle behind the entry point on the outer lane must be at least Entry gap × its speed away. Not the HCM critical headway (see [Real-world presets](#real-world-presets)). |
+| Density | Vehicles per km of lane. In closed mode the ring and the entrance queues together are held at it, so the ring itself holds slightly fewer (76.8 veh/km/lane at a setting of 80 on the default roundabout). |
+| Driverless, recognisable | CAVs and robotaxis have nobody to take over; CAVs, robotaxis and smoothers are recognisable to drivers as AVs, ACC cars are not. |
+| Entry point | Where an entrance's cars merge onto the outer lane, just after the arm's exit; also the conflict point. |
+| Follow-up time | The shortest time between two cars entering from the same queue. |
+| Harsh braking | An episode in which a vehicle asks for more braking than the road allows (9 m/s² dry), or the no-overlap constraint stops it harder than that. |
+| IDM | Intelligent Driver Model (Treiber, Hennecke & Helbing 2000): the drivers' car-following law. |
+| Jammed car | One below 30 % of its free speed. |
+| Lag vehicle | The first vehicle behind an entry point on the outer lane: the one an entering car must not cut off. |
+| Leader, follower | The vehicle directly ahead in the same lane, and the one directly behind. |
+| Leaver | A vehicle whose exit is coming up. Inside its lane-change zone it must move out to the outer lane. |
+| MOBIL | The lane-change model (Kesting, Treiber & Helbing 2007): change if it is safe and the gain, counting the followers' losses times the politeness, beats a threshold. |
+| Pair type (HH, HA, AH, AA) | A follower and its leader, follower first: H looks like a human-driven car, A is a recognisable AV. |
+| PET | Post-encroachment time: from an entering car's rear clearing the entry point to the next vehicle's front reaching it. |
+| Safety override | A separate system on ACC cars, CAVs and smoothers that brakes as the IDM would when their law brakes too little. |
+| Smoother | A wave-smoothing automated car (Stern et al. 2018), picked from the human-driven cars. |
+| Standstill gap (s0, margin) | The bumper gap kept when stopped (`min_gap` for drivers; the ACC and CACC laws call it a margin). |
+| Stop-and-go index | Stops per car per minute: how often a moving car is forced to (nearly) stop. |
+| String (platoon) | CAVs following each other by CACC; its first CAV is the string leader. |
+| Temperament | A driver's fixed random draw that sets their place in a spread (desired speed, time gap, reaction time). |
+| Time gap (T, headway) | The time a follower wants between itself and its leader (`time_headway`; per vehicle `headway`). |
+| TTC, TET | Time to collision, gap / closing speed; time exposed to TTC ≤ 1.5 s. |
+
 ## Project layout
 
 ```
@@ -1102,17 +1378,24 @@ roundabout_sim/
   cli.py          command-line pieces shared by the viewer, the experiments CLI and the sweep viewer
   ui.py           pygame pieces shared by both viewers (window set-up, help box and its messages, tabs)
   app.py          pygame viewer (python -m roundabout_sim)
-  experiments.py  run / sweep / view CLI (python -m roundabout_sim.experiments)
+  experiments.py  run / sweep / view / capacity / compare CLI (python -m roundabout_sim.experiments)
   sweep_viewer.py pygame sweep viewer and new-sweep runner (python -m roundabout_sim.sweep_viewer)
   plots.py        matplotlib dashboard, sweep, heatmap and sample figures
 tests/            pytest suite:
   test_engine.py, test_metrics.py, test_config.py, test_review_fixes.py   engine invariants, metrics, regressions
   test_open_demand.py, test_vehicles_drivers.py                            open demand; trucks, driver spread, road
-  test_state.py                                                            saved states, sessions, exact resume
-  test_presets.py                                                          presets, random settings, Latin hypercube
-  test_experiments.py, test_sweeps.py                                      run / sweep CLI, designs, meta file, figures
+  test_state.py, test_state_migration.py, test_state_v3/v4/v5.py           saved states, sessions, exact resume, older versions
+  test_presets.py, test_ring_calibration.py                                presets, random settings, Latin hypercube; the stern2018 ring
+  test_experiments.py, test_sweeps.py, test_capacity_analysis.py           run / sweep / capacity CLI, designs, meta file, figures
+  test_capacity_test.py, test_conflicts.py                                 the capacity test; conflicts and delays at the entries
+  test_kinds.py, test_kinds_outputs.py, test_robotaxi.py                   AV kinds and companies and what they show; robotaxis
+  test_controllers.py, test_s2_settings.py, test_s3_decisions.py           ACC and CACC laws, cooperation and strings
+  test_entries.py, test_adaptation.py, test_av_weather.py                  AV entries; drivers adapting to AVs; the AV weather policy
+  test_smoothers.py, test_safety_measures.py                               wave smoothers; safety override, TTC and cut-in measures
+  test_s0_fixes.py, test_s0_settings.py, test_s1_fixes.py, test_s2_fixes.py  regressions and settings from the reviews of build stages S0-S2
   test_app.py, test_sweep_viewer.py                                        viewer and sweep viewer (headless)
   test_integration.py                                                      presets / random / sweep button in the viewer
   conftest.py, helpers.py                                                  headless set-up, viewer factory, event helpers
 docs/             images used in this README
+results/          outputs, saved sessions and analysis scripts (not in the repository)
 ```

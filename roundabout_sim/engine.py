@@ -101,6 +101,16 @@ they drive by FollowerStopper or PI with saturation (Stern et al. 2018), or as
 a noise-free placebo of their driver (``_law_smoother``), through the same clip
 and safety override; before it their drivers drive them. They never leave, change
 lane or get removed by the density control. With ``smoothers`` 0 nothing changes.
+
+Reading guide. Start at ``RingSim._step``, which runs one time step and calls the
+stages in order: ``_move`` (car following, the automated vehicles' laws, reaction
+delay, noise and motion), ``_exits``, ``_lane_changes``, ``_arrivals`` and
+``_entries``. ``_step``, ``_move``, ``_exits`` and ``_lane_changes`` number their
+stages in comments, and section banners (``# ---- name``) divide the class by
+model part. Everything above
+``class RingSim`` is constants (each with its source) and helpers for saved
+states. The README's "Where the model is in the code" maps each part of the model
+description to its function, and its Glossary defines the terms used here.
 """
 
 from __future__ import annotations
@@ -1602,6 +1612,7 @@ class RingSim:
         b = self.eff.comfort_decel if b is None else b
         v = np.asarray(v, dtype=float)
         v0 = np.maximum(np.asarray(v0, dtype=float), 0.1)
+        # a_free = a (1 - (v / v0)^4) up to v0; above it -b (1 - (v0 / v)^(4 a / b)) (improved IDM, Treiber & Kesting)
         free = a * (1 - (v / v0) ** 4)
         over = v > v0
         if over.any():
@@ -1616,6 +1627,8 @@ class RingSim:
         aligned with ``v``; ``s0`` by default Standstill gap, ``b`` the effective Comfortable braking)."""
         b = self.eff.comfort_decel if b is None else b
         s0 = self.cfg.min_gap if s0 is None else s0
+        # The IDM's interaction term a (s* / s)^2 with the desired gap s* = s0 + max(0, v T + v (v - v_lead) /
+        # (2 sqrt(a b))) (Treiber, Hennecke & Helbing 2000); the bumper gap s is floored at 0.1 m.
         s_star = s0 + np.maximum(0.0, v * T + v * (v - v_lead) / (2 * np.sqrt(a * b)))
         return a * (s_star / np.maximum(gap, 0.1)) ** 2
 
@@ -1686,6 +1699,7 @@ class RingSim:
             weight += np.where(sees, w, 0.0)
         return self._free_acc(v, v0, a, b) - np.where(weight > 0, braking / np.maximum(weight, 1e-12), 0.0)
 
+    # ----------------- automated vehicles: control laws and safety override
     def _driven(self, kind) -> np.ndarray:
         """Which vehicles of these kinds (codes) a human drives this step: human drivers, and smoothers before
         Smoother start (each drives as its driver until then: Stern et al. 2018 let the waves form first). The
@@ -1905,6 +1919,7 @@ class RingSim:
         own = age[:, None] < count[None, :]
         return np.where(own, self.speed_hist[:, slots], 0.0).sum(axis=0) / np.maximum(count, 1)
 
+    # ---------------------- cooperation between CAVs: strings and companies
     def _coop_class(self, kind, company, other_kind, other) -> np.ndarray:
         """The cooperation class (index into COOP_CLASSES) of pairs of vehicles of kinds ``kind`` and ``other_kind``
         (codes) and companies ``company`` and ``other`` (numbers or aligned arrays): 0 ("none") unless both are
@@ -2048,6 +2063,7 @@ class RingSim:
         rest = depth % pm
         return np.where(joined, np.where(rest == 0, pm + 1, rest + 1), pos).astype(np.int8)
 
+    # ------------------------- steady-state speed (start-up and insertions)
     def equilibrium_speed(self, gap, v0, slots=None, T=None, s0=None) -> np.ndarray:
         """Steady-state IDM speed for a bumper gap (used to start cars smoothly), for the
         drivers in ``slots`` (aligned with ``gap``; default: the effective Following time gap and
@@ -2423,31 +2439,46 @@ class RingSim:
             "company": self.company[idx],  # -1: none
         }
 
-    # ------------------------------------------------------------ dynamics
+    # ------------------------------ dynamics: the time step and the motion
     def step(self, n: int = 1) -> None:
         for _ in range(int(n)):
             self._step()
 
     def _step(self) -> None:
+        """One time step of ``dt`` seconds (0.1 s by default): the model's update order.
+
+        1. ``_move``: every vehicle's acceleration (car following, the automated vehicles' laws, merging,
+           reaction delay, noise) and its motion.
+        2. ``_exits``: vehicles that reached their exit on the outer lane leave; the others go round again.
+        3. ``_lane_changes``: leavers move out towards their exit, other drivers change lane by MOBIL.
+        4. ``_arrivals`` (open mode): random arrivals join the entrance queues.
+        5. ``_top_up`` (capacity test only): the test entrance's queue is kept full.
+        6. ``_entries``: queue heads merge into the outer lane where the gap allows.
+        7. ``_sync_population`` (closed mode): vehicles are added or removed to hold the Density setting.
+        8. Clocks: lane-change and entry cooldowns, the lane-change animation, the time, the log pruning.
+
+        Each stage sees what the ones before it left: a vehicle leaving in stage 2 frees its place for an
+        entry in stage 6 of the same step.
+        """
         dt = self.cfg.dt
         open_demand = self.open_demand
         idx = np.flatnonzero(self.alive)
         if idx.size:
-            self._move(idx)
-            self._exits()
-            self._lane_changes(np.flatnonzero(self.alive))
+            self._move(idx)  # 1. accelerations and motion
+            self._exits()  # 2. exits
+            self._lane_changes(np.flatnonzero(self.alive))  # 3. lane changes
         elif self.merge_pending:  # (an empty ring: the entries' windows still run out, _observe_entries)
             self._observe_entries(idx, np.zeros(0), np.zeros(0))
         if open_demand:
-            self._arrivals()
+            self._arrivals()  # 4. arrivals
         if self.subject:
-            self._top_up()
-        self._entries()
+            self._top_up()  # 5. the capacity test's standing queue
+        self._entries()  # 6. entries
         if not open_demand:
-            # Last, so that after every step the population matches the density
+            # 7. Density control. Last, so that after every step the population matches the density
             # setting (density changes, and leavers that found their queue full).
             self._sync_population()
-        # Whole arrays: cheaper than masking, and _spawn resets free slots.
+        # 8. Clocks. Whole arrays: cheaper than masking, and _spawn resets free slots.
         self.lc_cool -= dt
         self.entry_cool -= 1
         self.lat += np.clip(self.lane - self.lat, -dt / LC_DURATION, dt / LC_DURATION)
@@ -2472,34 +2503,75 @@ class RingSim:
             self.lane_change_log.popleft()
 
     def _move(self, idx) -> None:
+        """Accelerations and motion of the live vehicles ``idx`` for one step (stage 1 of _step), in this order:
+
+        1. Neighbours: each vehicle's leader in its lane, the bumper gap s to it (_index_lanes) and its target
+           speed v0 (its desired speed, slowing to the turn speed before its exit: target_speed).
+        2. Observers and controllers: the time-to-collision counts (_observe_following), each CAV's place in
+           its CACC string with the time gap and margin that go with it (_controller_gaps), the smoothers'
+           speed history (_record_speeds).
+        3. Car following for everyone (_car_following), the Intelligent Driver Model:
+               a = a_max [1 - (v / v0)^4 - (s* / s)^2],  s* = s0 + max(0, v T + v (v - v_lead) / (2 sqrt(a_max b)))
+           (_free_acc, _interaction), its braking term averaged over up to ``anticipation`` vehicles ahead
+           within reaction_distance (multi-anticipation).
+        4. Automated vehicles replace it by their kind's law (_automated_command: PATH ACC, PATH CACC, a
+           smoother's law, or the IDM for a robotaxi).
+        5. Cooperative merging: a leaver that must reach the outer lane follows the car beside it there, and
+           that car's follower eases off (_make_room_to_leave).
+        6. Automated commands are clipped to [-braking limit, a_max] (_automated_limits). Any vehicle asking for
+           more braking than the road allows is marked for harsh braking.
+        7. Reaction delay: each vehicle applies the acceleration it decided ``delay`` steps ago (its reaction
+           time, or an ACC car's dead time, in whole steps; none for a tracking smoother; shorter for a driver
+           starting behind a recognisable AV, follow_adapt). Then the safety override (_safety_override), a
+           separate system acting on what it senses now, so without delay.
+        8. Driver noise for the vehicles humans drive, an Ornstein-Uhlenbeck process (correlation time NOISE_TAU):
+               xi <- f xi + driver_noise sqrt(1 - f^2) N(0, 1),  f = exp(-dt / NOISE_TAU),  a <- a + xi;
+           then the road's braking limit (a car the user braked brakes at PERTURB_DECEL).
+        9. Motion: v' = max(v + a dt, 0) over a distance dx = v dt + a dt^2 / 2 (v^2 / (2 |a|) if it stops within
+           the step). No-overlap constraint: nobody ends the step closer than SAFE_MARGIN behind where its leader
+           ends it, dx <= max(s + dx_leader - SAFE_MARGIN, 0), repeated until nothing changes; a vehicle held
+           back takes v' = min(v', dx / dt). The IDM keeps the gaps by itself (*derived*: the constraint acted in
+           0 of 1,830,097 vehicle-steps at the defaults, seeds 1-4, 600 s; in 0.35 % at a 10 m reaction
+           distance).
+        10. Counts: harsh braking (more braking than the road's limit, asked for or forced by the constraint)
+            and stops (below SLOW_FRACTION of the target speed after being above RESUME_FRACTION), each counted
+            per episode.
+        11. New angles and speeds; the observers of the detector line, the entry points and the entries.
+        """
         cfg, dt = self.cfg, self.cfg.dt
+        # 1. Neighbours and target speeds.
         lead, gap = self._index_lanes(idx)
         v = self.v[idx]
         ld = lead[idx]
         g = gap[idx]
         v0 = self.target_speed(idx)
+        # 2. Observers (they only read) and the CAVs' string positions, time gaps and margins for this step.
         self._observe_following(idx, v, ld, g)
         if self.controllers:
             self._controller_gaps(idx, v, ld)
         if self.smoothing:
             self._record_speeds(idx, v)
+        # 3. Car following (IDM with multi-anticipation) for every vehicle.
         # (the gaps the car following uses: an automated leaver turns off before reaching its leader, _leaving_first;
         # the no-overlap constraint below keeps the real ones)
         g_follow = self._leaving_first(idx, g) if self.automated else g
         acc_now = self._car_following(idx, v, v0, ld, g_follow, lead, gap)
         override = None
         if self.automated:
+            # 4. Automated vehicles: their kind's law in place of the IDM.
             a_idm = acc_now.copy()  # (an automated car's: the IDM towards its direct leader, its own T and s0)
             self._automated_command(idx, v, v0, ld, g_follow, acc_now)
+        # 5. Cooperative merging of leavers that must move out.
         self._make_room_to_leave(idx, v, v0, acc_now)
         if self.automated:
+            # 6. The automated vehicles' clip.
             override = self._automated_limits(idx, acc_now, a_idm)  # (the clip; the override after the buffer)
         # The driver model asking for more than the brakes can give (on this
         # road): harsh braking, typically over-reaction after a late or delayed response.
         max_decel = self.eff.max_decel
         over_braking = acc_now < -max_decel
 
-        # Reaction time: act on the acceleration decided ``delay`` steps ago (each driver their own).
+        # 7. Reaction time: act on the acceleration decided ``delay`` steps ago (each driver their own).
         if self.alike:
             delay = int(round(min(cfg.reaction_time, MAX_REACTION) / dt))
         else:
@@ -2524,6 +2596,7 @@ class RingSim:
         if override is not None:  # (no dead time: a separate system; its demand beyond the limit is harsh braking)
             self._safety_override(idx, acc, override, over_braking)
 
+        # 8. Driver noise (correlated: an Ornstein-Uhlenbeck process), then the road's braking limit.
         braking = self.brake_until[idx] > self.time
         if cfg.driver_noise > 0:
             f = np.exp(-dt / NOISE_TAU)
@@ -2536,6 +2609,7 @@ class RingSim:
         # Physical braking limit; a car told to brake brakes hard, but no harder than the road allows.
         acc = np.where(braking, -min(PERTURB_DECEL, max_decel), np.maximum(acc, -max_decel))
 
+        # 9. Motion: a ballistic step (constant acceleration over the step; a car that would reverse stops).
         v_new = v + acc * dt
         stops = v_new < 0
         ds = np.where(stops, v * v / (2 * np.maximum(-acc, 1e-9)), v * dt + 0.5 * acc * dt * dt)
@@ -2558,7 +2632,7 @@ class RingSim:
         v_new = np.where(clamped, np.minimum(v_new, ds / dt), v_new)
         self.a_now[idx] = (v_new - v) / dt  # the acceleration each car realised this step (_alloc)
 
-        # Harsh braking ("emergency"): the driver model asks for more than
+        # 10. Harsh braking ("emergency"): the driver model asks for more than
         # the braking limit, or the no-overlap constraint has to stop the car
         # harder than that. Counted per episode, which ends after EMERGENCY_HOLD s.
         emergency = over_braking | ((v - v_new) / dt > max_decel + 1e-6)
@@ -2582,6 +2656,7 @@ class RingSim:
             self.n_stops += n_stopped
             self.stop_log.append((self.time, n_stopped))
 
+        # 11. New angles (a lane's arc length / its radius) and speeds, then the observers of this step's moves.
         dtheta = ds / self.radii[self.lane[idx]]
         old = self.theta[idx]
         new = old + dtheta
@@ -2615,6 +2690,7 @@ class RingSim:
         first = auto & ((self.exit_at[idx] - self.travel[idx]) * self.r_out < g)
         return np.where(first, np.inf, g) if first.any() else g
 
+    # --------- observers (measurements only: they never change the traffic)
     def _log_conflicts(self, idx, old, dtheta) -> None:
         """Log the circulating vehicles that passed an entrance's entry point this step (its conflict point
         with the entering cars): ``conflict_log`` (time, arm, lane, uid, kind) and the counts ``arm_passed``
@@ -2801,6 +2877,7 @@ class RingSim:
             self.pair_ttc_episodes += np.bincount(pair[onset], minlength=len(PAIR_TYPES))
         self.ttc_until[idx[hit]] = self.time + EMERGENCY_HOLD
 
+    # ---------- exits (and the merging that gets leavers to the outer lane)
     def must_move_out(self, idx) -> np.ndarray:
         """Leavers not yet on the outer lane that are inside their lane-change zone."""
         to_go = self.outer - self.lane[idx]
@@ -2852,16 +2929,31 @@ class RingSim:
             self.stuck[give_up] = 0.0
 
     def _exits(self) -> None:
+        """Vehicles that have reached their exit leave the ring (stage 2 of _step). Every exit is on the outer lane.
+
+        A vehicle's exit is set when it appears (_draw_routes): it leaves at each exit it passes with chance
+        exit_prob, so the number of exits it passes is geometric with mean 1 / exit_prob, stored as the distance
+        (``exit_at``, an angle) it must drive. Once it has driven that far (``travel`` >= ``exit_at``):
+
+        1. on an inner lane it has missed its exit and goes round again (``exit_at`` + 2 pi; ``n_missed``);
+        2. on the outer lane it leaves: its trip time goes into ``exit_log`` and, if it came in from an
+           entrance, its travel time and control delay into the counts by entrant class (_time_trips);
+        3. in closed mode each leaver is replaced by a car joining the queue of a random entrance, or, where that
+           queue already holds MAX_QUEUE cars, by a car _sync_population slots into the ring at the end of the
+           step, so the number of vehicles stays at the Density setting. In open mode leavers are gone for good.
+        """
         if self.n_arms == 0:
             return
         idx = np.flatnonzero(self.alive)
         due = idx[self.travel[idx] >= self.exit_at[idx]]
         if due.size == 0:
             return
+        # 1. Missed exits.
         on_outer = self.lane[due] == self.outer
         missed = due[~on_outer]
         self.exit_at[missed] += TWO_PI  # not on the outer lane in time: go round again
         self.n_missed += missed.size
+        # 2. The others leave, at the exit nearest to where they are.
         leaving = due[on_outer]
         if leaving.size == 0:
             return
@@ -2876,7 +2968,7 @@ class RingSim:
         self.n_exited += leaving.size
         if self.open_demand:
             return  # leavers are gone for good; new cars come from _arrivals
-        # Each leaver is replaced at a random entrance; if that queue is full the
+        # 3. Closed mode: each leaver is replaced at a random entrance; if that queue is full the
         # replacement is slotted into the ring instead (by _sync_population).
         for arm in self.rng.integers(self.n_arms, size=leaving.size):
             if self.queue[arm] < MAX_QUEUE:  # (one that finds it full is created when it is slotted in)
@@ -2901,6 +2993,7 @@ class RingSim:
         np.add.at(self.class_travel, c, travel)
         np.add.at(self.class_control, c, travel - free)
 
+    # ------------------- arrivals (open mode) and the capacity test's queue
     def _arrivals(self) -> None:
         """Open mode: cars arrive at each entrance at random (Poisson, from the demand
         stream) and join its queue; those that find it full are turned away (blocked).
@@ -2957,10 +3050,35 @@ class RingSim:
             self.n_gave_up += k
             self.gave_up_log.extend([(self.time, int(arm))] * k)
 
+    # ------------------------------------------------- lane changes (MOBIL)
     def _lane_changes(self, idx) -> None:
+        """Lane changes of the live vehicles ``idx`` (stage 3 of _step): MOBIL (Kesting, Treiber & Helbing 2007),
+        with mandatory moves for leavers. A change is instant (the viewer animates it over LC_DURATION).
+
+        1. Who considers a change: a vehicle whose LC_COOLDOWN has run out and that the user is not braking, if
+           it is a leaver inside its lane-change zone (must_move_out: it must move out), or else with chance
+           lane_change_rate x dt this step. Smoothers keep their lane.
+        2. Options: one lane out, and one lane in while the exit is still far enough away, each with its new
+           leader and new follower in the target lane (_neighbours).
+        3. Accelerations by the IDM towards one leader, for the changer c, its new follower n and its old
+           follower o (who then follows c's old leader): a_c, a_n, a_o now and a_c', a_n', a_o' after the
+           change. A CAV is judged at the time gap it would keep behind its new leader (_gaps_behind: it may
+           join or leave a CACC string there).
+        4. Safety: a_n' >= -b_safe and a_c' >= -b_safe, b_safe = min(1.5 b, the road's braking limit) with b the
+           comfortable braking (2.5 b for a leaver that must move out), and room to the new leader and from the
+           new follower of at least half the standstill gap of the vehicle behind (at least SAFE_MARGIN + 0.2 m).
+           A driver changing in front of a recognisable AV accepts exploit_gap x the room behind it and may force
+           up to b_safe / exploit_gap on the AV.
+        5. Incentive (lane_change_motive "advantage", MOBIL):
+               (a_c' - a_c) + politeness [(a_n' - a_n) + (a_o' - a_o)] > LC_THRESHOLD.
+           A leaver that must move out needs none; "random" takes any safe change.
+        6. Each vehicle takes its better direction; the changes are made in random order, at most one per group
+           of changer, new leader, new follower and old follower in a step.
+        """
         cfg = self.cfg
         if self.n_lanes < 2 or idx.size == 0:
             return
+        # 1. Who considers a change this step.
         ready = idx[(self.lc_cool[idx] <= 0) & (self.brake_until[idx] <= self.time)]
         if ready.size == 0:
             return
@@ -2982,7 +3100,7 @@ class RingSim:
         others = ld != idx
         follower[ld[others]] = idx[others]
 
-        # Every (car, direction) option at once: outwards for cars[k] at k, inwards at n + k.
+        # 2. Every (car, direction) option at once: outwards for cars[k] at k, inwards at n + k.
         n = cars.size
         target = np.concatenate((self.lane[cars] + 1, self.lane[cars] - 1))
         allowed = (target >= 0) & (target < self.n_lanes)
@@ -3001,6 +3119,8 @@ class RingSim:
         o = follower[c]
         has_o = o >= 0
         os_ = np.maximum(o, 0)
+        # 3. Accelerations. Here f is the new follower n and os_ the old follower o; a_self, a_f_new and a_o_new
+        # are a_c', a_n' and a_o' (after the change), acc[c], a_f_old and a_o_old are a_c, a_n and a_o (now).
         # Desired speeds and current accelerations of everyone involved.
         need = np.concatenate((c, f, os_))
         v0 = np.zeros(self.cap)
@@ -3025,8 +3145,8 @@ class RingSim:
                                             self.v[lead[c]], os_, T_o, s0_o), 0.0)
         a_o_old = np.where(has_o, acc[os_], 0.0)
         forced = mandatory[k] & (opt < n)  # a leaver must move out
-        # Braking a change may force on anyone: more for a leaver, never beyond what the road allows (each its own
-        # comfortable braking: a driverless vehicle's on its own road factors, av_weather).
+        # 4. Safety. Braking a change may force on anyone: more for a leaver, never beyond what the road allows
+        # (each its own comfortable braking: a driverless vehicle's on its own road factors, av_weather).
         factor = np.where(mandatory[k], 2.5, 1.5)
         b_safe = np.minimum(self._comfort(c) * factor, self.eff.max_decel)
         b_safe_f = np.minimum(self._comfort(f) * factor, self.eff.max_decel) if self.av_weather else b_safe
@@ -3042,7 +3162,11 @@ class RingSim:
             ahead_of_av = has_f & self._steered(self.kind[c]) & SEEN_AS_AV[self._observed_kinds(self.kind[f])]
             room_back = np.where(ahead_of_av, np.maximum(room_back * ex, SAFE_MARGIN), room_back)
             b_safe_f = np.where(ahead_of_av, np.minimum(self._comfort(f) * factor / ex, self.eff.max_decel), b_safe_f)
+        # MOBIL's safety criterion: room on both sides, and neither the new follower nor the changer brakes harder
+        # than b_safe after the change.
         safe = (front >= room_front) & (back >= room_back) & (a_f_new >= -b_safe_f) & (a_self >= -b_safe)
+        # 5. MOBIL's incentive: the changer's gain plus politeness x the two followers' gains (losses are negative),
+        # (a_c' - a_c) + p [(a_n' - a_n) + (a_o' - a_o)], which must exceed LC_THRESHOLD.
         gain = (a_self - acc[c]) + cfg.politeness * ((a_f_new - a_f_old) + (a_o_new - a_o_old))
         if cfg.lane_change_motive == "random":
             wants = np.ones(opt.size, dtype=bool)
@@ -3052,6 +3176,7 @@ class RingSim:
         else:
             wants = gain > LC_THRESHOLD
             s = gain
+        # 6. Choose a direction per vehicle and make the changes.
         ok = safe & (wants | forced)
         score = np.full(2 * n, -np.inf)
         score[opt] = np.where(ok, np.where(forced, np.inf, s), -np.inf)
@@ -3090,6 +3215,7 @@ class RingSim:
             if self.automated and nf >= 0 and seen_av[nf] and behind <= cfg.reaction_distance:
                 self.n_cutins_auto += 1
 
+    # ------------------------------- entries (gap acceptance and follow-up)
     def follow_up_steps(self) -> int:
         """Steps an entrance waits after letting a car in: the next car may go on the
         first step after ``follow_up`` (scaled by the road condition) has passed (1 s takes 11
@@ -3453,6 +3579,7 @@ class RingSim:
             behind = np.full(angles.size, np.inf)
         return np.where(cand, nxt, lag), np.where(cand, behind, back)
 
+    # ----------------- density control (closed mode; a live Density change)
     def _sync_population(self) -> None:
         """Closed mode: match the number of cars (on the ring and queued) to the density setting."""
         target = self.target_cars()
