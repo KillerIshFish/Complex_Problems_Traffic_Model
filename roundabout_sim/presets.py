@@ -329,9 +329,10 @@ PRESETS: dict[str, Preset] = {p.name: p for p in (
         "(5.6 m/s); a 5-car jam shows in the 3-minute snapshot (a snapshot time, not a measured onset). "
         "Check of the research and this version (seeds 1-3, 600 s; a wave = speed std across cars above 2.5 "
         "m/s, Stern's detector): waves at 63, 156 and 339 s, then speed std 2.6-2.8 m/s at a mean speed of "
-        "3.2-3.4 m/s. Car length keeps the 4 m default (assumption: the paper gives no vehicle "
-        "size). The cornering cap sqrt(4.0 x 36.6) = 12.1 m/s stays above the 11.1 m/s free speed; keep "
-        "Cornering limit >= 3.4 (the drivers' own 11.1^2 / 36.6). " + DRIVERS_NOTE,
+        "3.2-3.4 m/s. The waves move backward at about 12 km/h (3.4 m/s; 11-14 km/h over seeds 1-8, "
+        "2-10 min), slower than the measured 20 km/h. Car length keeps the 4 m default (assumption: the "
+        "paper gives no vehicle size). The cornering cap sqrt(4.0 x 36.6) = 12.1 m/s stays above the 11.1 m/s "
+        "free speed; keep Cornering limit >= 3.4 (the drivers' own 11.1^2 / 36.6). " + DRIVERS_NOTE,
         cite="Sugiyama et al. 2008, New J. Phys. 10, 033001"),
 
     # Tadaki et al. 2013, the same group's larger circuit in the Nagoya Dome with a sweep of car numbers.
@@ -358,8 +359,9 @@ PRESETS: dict[str, Preset] = {p.name: p for p in (
         "(127 veh/km) 'homogeneous again' run as a target: a cautious first-day session left out of the "
         "analysis. Research check (3 seeds, 600 s): 20 and 25 cars stay free, 28-34 cars form waves (after "
         "55-339 s), so the model's transition falls where it was measured; its jammed mean speeds (3.4 m/s at "
-        "30 cars) are low. This version: 30 cars form waves at 83, 55 and 89 s (seeds 1-3); 20 and 25 cars "
-        "keep the speed std below 1.4 m/s (seeds 1-5, 300 s). " + DRIVERS_NOTE,
+        "30 cars) are low, and its waves move backward at about 12 km/h (3.4 m/s; seeds 1-8, 2-10 min), "
+        "slower than the measured 20 km/h. This version: 30 cars form waves at 83, 55 and 89 s (seeds 1-3); "
+        "20 and 25 cars keep the speed std below 1.4 m/s (seeds 1-5, 300 s). " + DRIVERS_NOTE,
         cite="Tadaki et al. 2013, New J. Phys. 15, 103034"),
 
     # Stern et al. 2018, the US ring experiment (Tucson, Arizona) on which one automated car damped the waves.

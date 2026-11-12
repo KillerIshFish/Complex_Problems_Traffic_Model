@@ -44,7 +44,9 @@ use. In `roundabout_sim/engine.py`, start at `RingSim._step`.
 
 ## Quick start
 
-Tested with Python 3.14 and the package versions pinned in `requirements.txt`.
+Needs Python 3.12 or newer (the pinned numpy 2.5 does not install on older
+versions). Tested with Python 3.12 and 3.14 and the package versions pinned in
+`requirements.txt`.
 
 ```powershell
 python -m venv .venv

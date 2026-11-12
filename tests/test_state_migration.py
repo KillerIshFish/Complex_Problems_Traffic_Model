@@ -237,7 +237,8 @@ def test_the_states_saved_on_main_resume_with_their_charts(path):
     if not path.exists():
         pytest.skip(f"{path} is not here (results/ is not in the repository)")
     saved = state.load(path)
-    assert saved.meta["sim"]["version"] == 1
+    if saved.meta["sim"]["version"] != 1:  # the viewer saves its session over results/session/state.npz
+        pytest.skip(f"{path} has been saved again since main (version {saved.meta['sim']['version']})")
     sim = saved.simulation()
     assert all(getattr(sim.cfg, n) == ADDED[n] for n in ADDED if n in CONFIG_FIELDS)
     rec = Recorder(sim, 0.5)
